@@ -6,8 +6,33 @@
 k230_realtime_a4_standalone.py
 ```
 
+新增的 `puzzle-vision-simulator` 兼容规划入口是：
+
+```text
+k230_realtime_a4_simulator_standalone.py
+```
+
+它和原实时入口共享 A4 标定、视觉识别、稳定冻结、搬运提示与最终验收，只替换冻结
+后的拼接规划后端。该单文件不依赖 NumPy/OpenCV；生成时已经把
+`puzzle_simulator_planner.py` 展开到脚本中，适用于 CanMV MicroPython。原单文件
+仍保留 `outer_first`，便于同一现场输入直接 A/B。
+
 不要在 `>>>` 后输入命令。CanMV IDE 不自动同步本地依赖，因此首轮实机测试应使用上述
 单文件版。
+
+两个单文件的生成命令分别是：
+
+```bash
+python3 k230_realtime_a4/build_standalone.py
+python3 k230_realtime_a4/build_standalone.py --planner simulator
+```
+
+模拟器后端默认 `SIMULATOR_PLANNER_VALIDATION="local"`：先按上游语义产生拼法，再
+通过本项目的 gap、overlap、outside 和尺寸 Gate，失败时不会进入机械放置阶段。
+`"upstream"` 只应用于仿真对照；它会保留 `local_gate_failures` 警告，但仍把上游
+提案标成有效，不应直接驱动硬件。可用
+`--simulator-validation upstream --output /tmp/simulator_proposal.py` 生成临时对照
+脚本，不要把该模式作为板端正式入口。
 
 ## 手动标定
 
@@ -46,7 +71,7 @@ A4_CORNERS_PX = [
    拟合。共识建立期间每 4 次检测执行一次低对比重试。多边形
    收尾会把相距不足 7 mm 的相邻假顶点拟合成一个角，并删除夹角接近 180°、偏离
    邻点连线不超过 3 mm 的假顶点；每次修改同时受面积和简单多边形校验保护。
-5. 2～4 块稳定后，实时配置优先调用候选图 `outer_first` 规划器，但把已知
+5. 2～4 块稳定后，常规单文件优先调用候选图 `outer_first` 规划器，但把已知
     100×60 mm 原型尺寸作为硬约束：角点路径只搜索 100×60/60×100 两种方向，
     最终结果还必须通过固定尺寸、score、gap、overlap、outside 五项 Gate。宽松模式
     只放宽接缝测量，不能放宽最终矩形。这样不运行板端耗时很高的固定尺寸 beam，
@@ -54,6 +79,8 @@ A4_CORNERS_PX = [
     `PREFER_OUTER_FIRST_PLANNER=False` 恢复固定规划；相同冻结输入不会反复搜索。
     由于完整拼图面积已知为 6000 mm²，搜索前会用碎片总面积校正不超过 4% 的统一
     轮廓尺度偏差；超过范围则拒绝校正，防止缺块或额外 blob 被掩盖。
+    模拟器单文件则完整经过兼容后端的全边候选、T 形部分边候选、连通匹配集、
+    刚体传播、闭环 pose-graph 优化和全局矩形归一化，最后复用同一安全 Gate。
 6. 有效方案生成后冻结参考轮廓、ID、目标、操作顺序与总面积；A4 四角始终使用
     手动配置。程序进入
     `WAIT_FOR_MOTION`
@@ -164,6 +191,19 @@ FINAL_SCENE_METRICS,...
 FINAL_ACCEPTED,...
 PLACEMENT_COMPLETE,frame=...,elapsed_ms=...,count=...
 ```
+
+模拟器单文件还输出：
+
+```text
+PLANNING_START,frame=...,planner=simulator,count=...
+SIMULATOR_PLAN_PERF,frame=...,cut_mode=auto,validation=local,
+candidates=...,full=...,partial=...,sets=...,selected=...,
+selected_partial=...,actual_size=...x...,local_gate_failures=...
+```
+
+其 `PLAN_FAIL_DETAIL.class` 分为 `search_limit`、`no_edge_candidates`、
+`no_connected_topology` 和 `local_geometry_gate`。最后一种表示上游兼容算法已经
+得到完整拼法，但该拼法的实际矩形、重叠、外溢或缺口未通过本地执行门限。
 
 实时配置默认每 2000 ms 最多输出一条 `PLAN_DEBUG`。时钟只在已有的搜索批次/
 `exitpoint` 边界读取，不在每次多边形相交时读取。常见 `stage`：

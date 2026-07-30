@@ -453,6 +453,45 @@ def _print_plan(plan, pieces, frame_index):
                 ),
             )
         )
+        if str(stats.get("engine", "")).startswith(
+            "lvreng/puzzle-vision-simulator"
+        ):
+            print(
+                "SIMULATOR_PLAN_PERF,frame={},cut_mode={},"
+                "validation={},candidates={},full={},partial={},"
+                "sets={},selected={},selected_partial={},"
+                "limit_hit={},timed_out={},actual_size={}x{},"
+                "dimension_error_mm={},local_gate_failures={}".format(
+                    frame_index,
+                    stats.get("cut_mode", "auto"),
+                    stats.get("validation", "local"),
+                    stats.get("candidate_count", 0),
+                    stats.get("full_candidate_count", 0),
+                    stats.get("partial_candidate_count", 0),
+                    stats.get("matching_sets_evaluated", 0),
+                    stats.get("selected_match_count", 0),
+                    stats.get("selected_partial_match_count", 0),
+                    int(bool(stats.get("limit_hit"))),
+                    int(bool(stats.get("timed_out"))),
+                    (
+                        "{:.1f}".format(stats["actual_width_mm"])
+                        if stats.get("actual_width_mm") is not None
+                        else "na"
+                    ),
+                    (
+                        "{:.1f}".format(stats["actual_height_mm"])
+                        if stats.get("actual_height_mm") is not None
+                        else "na"
+                    ),
+                    (
+                        "{:.1f}".format(stats["dimension_error_mm"])
+                        if stats.get("dimension_error_mm") is not None
+                        else "na"
+                    ),
+                    "|".join(stats.get("local_gate_failures", ()))
+                    or "none",
+                )
+            )
     if not plan.valid:
         print(
             "PLAN_INVALID,frame={},reason={}".format(
@@ -530,6 +569,37 @@ def _print_plan(plan, pieces, frame_index):
                     stats.get("corner_max_depth", 0),
                     stats.get("corner_complete_state_count", 0),
                     stats.get("corner_pruned_overlap", 0),
+                )
+            )
+        elif str(stats.get("engine", "")).startswith(
+            "lvreng/puzzle-vision-simulator"
+        ):
+            if stats.get("timed_out") or stats.get("limit_hit"):
+                failure_class = "search_limit"
+            elif not stats.get("candidate_count"):
+                failure_class = "no_edge_candidates"
+            elif not stats.get("selected_match_count"):
+                failure_class = "no_connected_topology"
+            else:
+                failure_class = "local_geometry_gate"
+            print(
+                "PLAN_FAIL_DETAIL,frame={},class={},candidates={},"
+                "full={},partial={},sets={},selected={},"
+                "selected_partial={},actual_size={}x{},"
+                "dimension_error_mm={},local_gate_failures={}".format(
+                    frame_index,
+                    failure_class,
+                    stats.get("candidate_count", 0),
+                    stats.get("full_candidate_count", 0),
+                    stats.get("partial_candidate_count", 0),
+                    stats.get("matching_sets_evaluated", 0),
+                    stats.get("selected_match_count", 0),
+                    stats.get("selected_partial_match_count", 0),
+                    stats.get("actual_width_mm", "na"),
+                    stats.get("actual_height_mm", "na"),
+                    stats.get("dimension_error_mm", "na"),
+                    "|".join(stats.get("local_gate_failures", ()))
+                    or "none",
                 )
             )
         for piece in pieces:

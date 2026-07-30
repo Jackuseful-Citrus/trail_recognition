@@ -183,6 +183,22 @@ OUTER_FIRST_PARTIAL_BOUND_SLACK_MM = 12.0
 OUTER_FIRST_CORNER_MAX_SEARCH_NODES = 3000
 OUTER_FIRST_CORNER_BEAM_WIDTH = 128
 OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE = 32
+
+# ``lvreng/puzzle-vision-simulator`` compatible planner.  The K230 port keeps
+# the upstream candidate semantics (full-edge and T-junction partial matches),
+# but replaces NumPy/OpenCV masks with the local pure-Python polygon geometry.
+# ``local`` validation is fail-closed for real placement; ``upstream`` can be
+# selected explicitly for simulator-only A/B experiments.
+PLANNER_BACKEND = "outer_first"
+SIMULATOR_PLANNER_CUT_MODE = "auto"
+SIMULATOR_PLANNER_VALIDATION = "local"
+SIMULATOR_MATCH_REL_TOLERANCE = 0.12
+SIMULATOR_PARTIAL_MIN_RATIO = 0.22
+SIMULATOR_PARTIAL_MAX_RATIO = 0.88
+SIMULATOR_PARTIAL_MATCH_PENALTY = 0.15
+SIMULATOR_MAX_CANDIDATES = 80
+SIMULATOR_MAX_MATCHING_SETS = 4000
+SIMULATOR_POSE_OPTIMIZATION_STEPS = 20
 OUTER_FIRST_MAX_SEARCH_NODES = 1200
 OUTER_FIRST_BRANCH_LIMIT = 48
 MAX_RECTANGLE_HYPOTHESES = 12

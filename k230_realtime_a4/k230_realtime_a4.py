@@ -37,6 +37,7 @@ from puzzle_geometry import (
     plan_outer_first_rectangle,
     plan_rectangle_assembly,
 )
+from puzzle_simulator_planner import plan_simulator_rectangle
 from puzzle_placement import PlacementMonitor
 from puzzle_placement import (
     final_rectangle_consensus,
@@ -78,6 +79,19 @@ PLACEMENT_PHASES = (
     "FINAL_VERIFY",
     "COMPLETE",
 )
+
+
+def _planner_selection():
+    backend = getattr(cfg, "PLANNER_BACKEND", "outer_first")
+    if backend == "simulator":
+        return "simulator", plan_simulator_rectangle, True
+    prefer_unknown = (
+        cfg.TARGET_RECT_SIZE_MM is None
+        or cfg.PREFER_OUTER_FIRST_PLANNER
+    )
+    if prefer_unknown:
+        return "outer_first", plan_outer_first_rectangle, True
+    return "fixed_rectangle", plan_outer_first_rectangle, False
 
 
 def _draw_quad(frame, corners, color, thickness=3):
@@ -1051,14 +1065,7 @@ def main():
                 cfg.A4_DETECT_INTERVAL_ACQUIRE,
                 cfg.PIECE_DETECT_EVERY_N_FRAMES,
                 int(cfg.DEBUG_SHOW_CAMERA),
-                (
-                    "outer_first"
-                    if (
-                        cfg.TARGET_RECT_SIZE_MM is None
-                        or cfg.PREFER_OUTER_FIRST_PLANNER
-                    )
-                    else "fixed_rectangle"
-                ),
+                _planner_selection()[0],
                 cfg.PLACING_VERIFICATION_INTERVAL_MS,
                 cfg.A4_HOLD_MISSED_FRAMES,
                 cfg.PIECE_SEGMENTATION_MODE,
@@ -1847,14 +1854,11 @@ def main():
                         )
                     elif not last_stable or active_plan is None:
                         plan_start_ms = _ms_now()
-                        configured_planner = (
-                            "outer_first"
-                            if (
-                                cfg.TARGET_RECT_SIZE_MM is None
-                                or cfg.PREFER_OUTER_FIRST_PLANNER
-                            )
-                            else "fixed_rectangle"
-                        )
+                        (
+                            configured_planner,
+                            unknown_planner,
+                            prefer_unknown_planner,
+                        ) = _planner_selection()
                         print(
                             "PLANNING_START,frame={},planner="
                             "{},count={}".format(
@@ -1919,12 +1923,15 @@ def main():
                                 pieces,
                                 cfg.TARGET_RECT_SIZE_MM,
                                 plan_rectangle_assembly,
-                                plan_outer_first_rectangle,
+                                unknown_planner,
                                 allow_unknown_fallback=(
                                     cfg.ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE
                                 ),
                                 prefer_outer_first=(
-                                    cfg.PREFER_OUTER_FIRST_PLANNER
+                                    prefer_unknown_planner
+                                ),
+                                preferred_planner_name=(
+                                    configured_planner
                                 ),
                             )
                         finally:
@@ -1933,8 +1940,9 @@ def main():
                         if routing["fallback_used"]:
                             print(
                                 "PLANNER_FALLBACK,frame={},from=fixed_rectangle,"
-                                "to=outer_first,reason={}".format(
+                                "to={},reason={}".format(
                                     frame_index,
+                                    configured_planner,
                                     routing.get(
                                         "fixed_failure_reason",
                                         "unknown",

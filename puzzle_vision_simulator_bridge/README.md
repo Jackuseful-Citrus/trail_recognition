@@ -91,6 +91,14 @@ if plan.valid:
 ## 部署边界
 
 上游依赖 CPython、NumPy 和 OpenCV，不能直接放进当前 CanMV MicroPython 固件。
-这个桥接目录用于桌面验证、算法对比和混合规划实验。K230 板端应继续使用
-`puzzle_geometry.plan_outer_first_rectangle()`；它在同输入基准中比上游更快。
+这个桥接目录继续用于逐行对照原始桌面实现。板端现在另有独立编写的兼容实现
+`puzzle_simulator_planner.py`，用项目现有纯 Python 多边形运算替代 NumPy/OpenCV，
+并由下列命令生成专用单文件：
 
+```bash
+python3 k230_realtime_a4/build_standalone.py --planner simulator
+```
+
+输出为 `k230_realtime_a4/k230_realtime_a4_simulator_standalone.py`。该后端固定记录
+同一上游提交号，保留全边/T 形部分边候选、连通匹配集、刚体传播、pose graph
+优化和矩形归一化阶段；真实执行默认仍受本地安全 Gate 约束。

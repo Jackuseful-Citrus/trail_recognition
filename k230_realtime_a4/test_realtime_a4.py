@@ -790,8 +790,9 @@ class RealtimeDisplayStateTests(unittest.TestCase):
             fixed,
             unknown,
             prefer_outer_first=True,
+            preferred_planner_name="simulator",
         )
-        self.assertEqual(routing["planner"], "outer_first")
+        self.assertEqual(routing["planner"], "simulator")
         self.assertEqual(
             calls,
             [

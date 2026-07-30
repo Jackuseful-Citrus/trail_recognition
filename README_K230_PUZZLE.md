@@ -14,6 +14,8 @@
 - `k230_puzzle_planner_standalone.py`：供不自动同步依赖文件的 CanMV IDE 直接运行的
   单文件板端入口。
 - `build_k230_standalone.py`：从共享源模块重新生成上述单文件入口。
+- `k230_a4_auto_calibration_standalone.py`：只运行当前自动 A4 搜索、分隔线检测和
+  多帧锁定的独立上板测试；使用方法见 `README_K230_A4_RECOGNITION_TEST.md`。
 - `offline_validate_puzzle.py`：桌面照片验证入口。
 - `test_puzzle_geometry.py`、`test_puzzle_vision.py`：纯几何与当前照片回归测试。
 - `sample_puzzle.jpg`：本次提供的原始示例照片。

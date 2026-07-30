@@ -161,12 +161,13 @@ def plan_frozen_pieces(
     unknown_planner,
     allow_unknown_fallback=False,
     prefer_outer_first=False,
+    preferred_planner_name="outer_first",
 ):
     """Route one frozen input to the configured planner exactly once."""
     if target_rect_size_mm is None:
         return {
             "plan": unknown_planner(pieces),
-            "planner": "outer_first",
+            "planner": preferred_planner_name,
             "fallback_used": False,
         }
     if prefer_outer_first:
@@ -175,7 +176,7 @@ def plan_frozen_pieces(
                 pieces,
                 target_size_mm=target_rect_size_mm,
             ),
-            "planner": "outer_first",
+            "planner": preferred_planner_name,
             "fallback_used": False,
         }
     fixed_result = fixed_planner(pieces)
@@ -190,7 +191,7 @@ def plan_frozen_pieces(
             pieces,
             target_size_mm=target_rect_size_mm,
         ),
-        "planner": "outer_first",
+        "planner": preferred_planner_name,
         "fallback_used": True,
         "fixed_failure_reason": fixed_result.reason,
     }
