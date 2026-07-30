@@ -459,7 +459,9 @@ def _print_plan(plan, pieces, frame_index):
             print(
                 "SIMULATOR_PLAN_PERF,frame={},cut_mode={},"
                 "validation={},candidates={},full={},partial={},"
-                "sets={},selected={},selected_partial={},"
+                "sets={},prefixes={},topologies={},topology_prefixes={},"
+                "pruned_dim={}|outside={}|overlap={}|gap={},"
+                "selected={},selected_partial={},"
                 "limit_hit={},timed_out={},actual_size={}x{},"
                 "dimension_error_mm={},local_gate_failures={},"
                 "safety_gate_failures={}".format(
@@ -470,6 +472,35 @@ def _print_plan(plan, pieces, frame_index):
                     stats.get("full_candidate_count", 0),
                     stats.get("partial_candidate_count", 0),
                     stats.get("matching_sets_evaluated", 0),
+                    stats.get("matching_prefixes_evaluated", 0),
+                    (
+                        "|".join(
+                            "{}:{}".format(name, count)
+                            for name, count in sorted(
+                                stats.get(
+                                    "matching_topology_counts",
+                                    {},
+                                ).items()
+                            )
+                        )
+                        or "none"
+                    ),
+                    (
+                        "|".join(
+                            "{}:{}".format(name, count)
+                            for name, count in sorted(
+                                stats.get(
+                                    "matching_topology_prefix_counts",
+                                    {},
+                                ).items()
+                            )
+                        )
+                        or "none"
+                    ),
+                    stats.get("matching_pruned_dimension", 0),
+                    stats.get("matching_pruned_outside", 0),
+                    stats.get("matching_pruned_overlap", 0),
+                    stats.get("matching_pruned_gap", 0),
                     stats.get("selected_match_count", 0),
                     stats.get("selected_partial_match_count", 0),
                     int(bool(stats.get("limit_hit"))),
