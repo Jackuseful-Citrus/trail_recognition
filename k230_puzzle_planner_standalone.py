@@ -48,6 +48,15 @@ A4_TOP_SIDE = "auto"
 A4_DARK_THRESHOLD = 135
 A4_MAX_INSIDE_GRAY = 178.0
 A4_DARK_BLOB_MIN_AREA_RATIO = 0.03
+# Reject a divider-generated half-paper rectangle by probing just inside and
+# outside every proposed edge in the low-resolution A4 detection image.  A
+# real outer edge changes from the dark A4 surface to the brighter background;
+# an internal divider has the same paper surface on both sides.
+A4_EDGE_PROBE_OFFSET_PX = 8.0
+A4_EDGE_PROBE_SAMPLES = 9
+A4_INTERNAL_EDGE_SIMILAR_GRAY_DELTA = 24.0
+A4_INTERNAL_EDGE_DARK_RATIO_MAX = 0.67
+A4_INTERNAL_EDGE_MIN_SAMPLES = 5
 A4_LOCK_REQUIRED_FRAMES = 3
 A4_HOLD_MISSED_FRAMES = 15
 A4_SLOW_SMOOTH_ALPHA = 0.38
@@ -68,11 +77,33 @@ RECTIFIED_HEIGHT_PX = int(A4_HEIGHT_MM * RECTIFIED_PX_PER_MM + 0.5)
 # Nominal horizontal divider. Automatic correction is restricted to this band.
 DIVIDER_Y_MM = 148.5
 DIVIDER_SEARCH_HALF_RANGE_MM = 8.0
+# The physical separator is also an internal calibration feature. Probe it in
+# the unwarped A4 candidate, estimate its live position/slope, and use the
+# slope to remove differential left/right corner error before rectification.
+ENABLE_DYNAMIC_DIVIDER = True
+A4_REQUIRE_DIVIDER_FOR_LOCK = True
+DIVIDER_LINE_SAMPLE_COUNT = 25
+DIVIDER_LINE_MIN_GRAY = 70
+DIVIDER_LINE_MIN_CONTRAST_GRAY = 35
+DIVIDER_LINE_MIN_COVERAGE = 0.70
+DIVIDER_LINE_MAX_RESIDUAL_PX = 2.5
+DIVIDER_LINE_MAX_SLOPE_MM = 3.0
+DIVIDER_TRACK_ALPHA = 0.35
 
 # White segmentation. Lowering the threshold detects dimmer white pieces but
 # also admits more glare. ``fixed`` is the safe fallback on every frame.
 THRESHOLD_MODE = "fixed"  # "fixed" or "otsu"
 WHITE_GRAY_THRESHOLD = 180
+# Board runtime may override this with ``background_delta``.  The desktop
+# regression stays fixed so historical photo results remain reproducible.
+PIECE_SEGMENTATION_MODE = "fixed"  # "fixed" or "background_delta"
+PIECE_BACKGROUND_SAMPLE_STRIDE = 4
+PIECE_BACKGROUND_HISTOGRAM_BINS = 64
+PIECE_BACKGROUND_DELTA_GRAY = 30
+PIECE_BACKGROUND_RELAXED_DELTA_GRAY = 20
+PIECE_BACKGROUND_NOISE_MARGIN_GRAY = 12
+PIECE_BACKGROUND_MAX_DELTA_GRAY = 55
+PIECE_BACKGROUND_MIN_SAMPLES = 96
 MORPH_KERNEL_PX = 3
 MORPH_OPEN_ITERATIONS = 1
 MORPH_CLOSE_ITERATIONS = 2
@@ -107,6 +138,9 @@ VERTEX_CLEANUP_EXTRA_VERTICES = 4
 # rectification, so they remain meaningful when the working resolution changes.
 CONTOUR_DP_TOLERANCE_MM = 2.2
 LINE_FIT_MAX_ERROR_MM = 2.5
+LINE_REFINE_MAX_SHIFT_MM = 3.0
+LINE_FIT_MIN_POINTS = 6
+LINE_REFINE_MAX_AREA_CHANGE_RATIO = 0.03
 MIN_EDGE_LENGTH_MM = 18.0
 BOUNDARY_TRACE_MAX_STEP_FACTOR = 8
 BOUNDARY_TRACE_MIN_POINTS = 12
@@ -161,6 +195,12 @@ MAX_DFS_NODES = 1200
 MAX_PLAN_TIME_MS = 3000
 STATE_POSITION_QUANTIZATION_MM = 0.5
 STATE_ANGLE_QUANTIZATION_DEG = 0.5
+# Low-overhead planner heartbeat. The shared default stays off so desktop
+# benchmarks and non-realtime entrypoints remain quiet; the realtime CanMV
+# profile enables it. Time is sampled only at existing search batch/exitpoint
+# boundaries, never for every polygon intersection.
+ENABLE_PLAN_DEBUG = False
+PLAN_DEBUG_INTERVAL_MS = 2000
 
 # Geometry tolerances.  Linear and area units are deliberately separate.
 GEOMETRY_EPSILON_MM = 0.05
@@ -171,6 +211,8 @@ TARGET_CENTER_MM = (105.0, 225.0)
 TARGET_MARGIN_MM = 10.0
 # Known prototype target. Set to None for unknown on-site rectangle dimensions.
 TARGET_RECT_SIZE_MM = (100.0, 60.0)
+PREFER_OUTER_FIRST_PLANNER = False
+ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE = False
 
 # Fixed-rectangle packing tolerances for hand-cut 100x60 mm prototypes.
 FIXED_RECT_BEAM_WIDTH = 1200
@@ -179,6 +221,15 @@ FIXED_RECT_MAX_OVERLAP_MM2 = 30.0
 FIXED_RECT_MAX_GAP_MM2 = 220.0
 FIXED_RECT_SCORE_THRESHOLD = 0.06
 FIXED_RECT_BOUNDARY_TOLERANCE_MM = 5.0
+# The fast outer-first search may use tolerant seam matching, but a known-size
+# target is accepted only when its final bounding dimensions stay close to the
+# configured prototype. This is a final-result gate, not a seam tolerance.
+KNOWN_TARGET_DIMENSION_TOLERANCE_MM = 5.0
+# A4 rectification and foreground expansion can bias every detected length by
+# the same small factor. For a known complete partition, total piece area gives
+# a robust global scale correction. Larger corrections are refused because
+# they more likely indicate a missing/extra blob than calibration drift.
+KNOWN_TARGET_MAX_AREA_SCALE_DELTA = 0.04
 
 # Multi-frame stability. Increasing the window reduces false stable plans but
 # delays output. Tolerances are maximum deviations within the stable window.
@@ -186,20 +237,73 @@ STABLE_WINDOW_FRAMES = 10
 REQUIRED_STABLE_FRAMES = 7
 CENTER_STABLE_TOLERANCE_MM = 2.0
 ANGLE_STABLE_TOLERANCE_DEG = 2.0
+AREA_STABLE_TOLERANCE_RATIO = 0.12
 TRACK_MAX_DISTANCE_MM = 35.0
 TRACK_SHAPE_COST_LIMIT = 0.42
 TRACK_MAX_MISSED_FRAMES = 4
+# Contour fitting may temporarily split one physical corner or merge a shallow
+# one.  Cross-frame identity may therefore tolerate a small vertex-count
+# difference when centre and area still agree.
+TRACK_MAX_VERTEX_COUNT_DELTA = 2
+TRACK_VERTEX_MISMATCH_MAX_DISTANCE_MM = 15.0
+TRACK_VERTEX_MISMATCH_MAX_AREA_RATIO = 0.35
+TRACK_VERTEX_MISMATCH_SHAPE_PENALTY = 0.10
 
-# Closed-loop placement. After the initial plan is frozen, the full A4 is
-# rechecked periodically; completed pieces are retired from shape tracking.
-PLACEMENT_CHECK_INTERVAL_MS = 5000
+# A4 lock deadband. Distances are measured in source-frame pixels.
+A4_LOCK_DEADBAND_PX = 3.0
+A4_RELOCK_MOTION_PX = 10.0
+A4_RELOCK_CONFIRM_FRAMES = 3
+
+# Initial count consensus and incomplete-detection hold policy. Values are
+# measured in piece-detection attempts, not camera frames.
+BAD_COUNT_HOLD_DETECTIONS = 3
+COUNT_REACQUIRE_FAILURES = 6
+
+# Closed-loop placement. All distances and areas are in A4 millimetres/mm².
 PLACEMENT_SHAPE_COST_LIMIT = 0.34
-PLACEMENT_CENTER_TOLERANCE_MM = FINAL_CENTER_TOLERANCE_MM
-PLACEMENT_RMS_VERTEX_TOLERANCE_MM = 12.0
-PLACEMENT_MAX_VERTEX_TOLERANCE_MM = FINAL_VERTEX_TOLERANCE_MM
-PLACEMENT_TARGET_WHITE_COVERAGE = 0.82
+PLACEMENT_CONTOUR_SAMPLE_COUNT = 32
+PLACEMENT_CONTOUR_RMS_MAX_MM = 5.0
+PLACEMENT_CONTOUR_P90_MAX_MM = 8.0
+PLACEMENT_CONTOUR_P95_HARD_MAX_MM = 18.0
+PLACEMENT_CENTER_COARSE_MAX_MM = 20.0
+PLACEMENT_AREA_RATIO_MIN = 0.70
+PLACEMENT_AREA_RATIO_MAX = 1.30
+PLACEMENT_POSE_BOUND_MM = 8.0
+PLACEMENT_ORIENTATION_LONGEST_EDGE_RATIO_MIN = 1.15
+PLACEMENT_ORIENTATION_SAMPLE_SPREAD_MAX_DEG = 8.0
+PLACEMENT_TARGET_WHITE_COVERAGE = 0.72
 PLACEMENT_REQUIRED_CHECKS = 1
+PLACEMENT_VERIFY_REQUIRED_PASSES = 2
 PLACEMENT_COVERAGE_SAMPLE_STRIDE = 2
+PLACEMENT_DELTA_TARGET_COVERAGE_MIN = 0.65
+PLACEMENT_DELTA_AREA_RATIO_MIN = 0.55
+PLACEMENT_DELTA_AREA_RATIO_MAX = 1.40
+PLACEMENT_DELTA_SPILL_MAX = 0.15
+PLACEMENT_SOURCE_REMOVAL_MIN = 0.40
+PLACEMENT_DELTA_ENVELOPE_MM = 8.0
+
+# Lightweight motion detection on the rectified A4 grayscale image.
+MOTION_SAMPLE_WIDTH = 80
+MOTION_SAMPLE_HEIGHT = 112
+MOTION_SAMPLE_STRIDE = 3
+MOTION_DIVIDER_IGNORE_MM = 3.0
+MOTION_PIXEL_DIFF_THRESHOLD = 18
+MOTION_MEAN_ABS_DIFF_THRESHOLD = 5.0
+MOTION_CHANGED_PIXEL_RATIO = 0.035
+MOTION_START_CONFIRM_FRAMES = 2
+MOTION_END_CONFIRM_FRAMES = 4
+POST_MOTION_STABLE_FRAMES = 4
+POST_MOTION_VERIFY_SAMPLES = 3
+
+# Final whole-rectangle validation. Linear values are millimetres.
+FINAL_RECT_FILL_MIN = 0.75
+FINAL_AREA_RATIO_MIN = 0.75
+FINAL_AREA_RATIO_MAX = 1.25
+FINAL_RECT_DIM_TOLERANCE_MM = 20.0
+FINAL_RECT_ENVELOPE_MM = 20.0
+FINAL_RECT_SPILL_MAX = 0.10
+FINAL_VERIFY_SAMPLE_COUNT = 3
+FINAL_VERIFY_REQUIRED_PASSES = 2
 
 # Runtime/UI controls.
 DEBUG_SHOW_CAMERA = False
@@ -210,7 +314,10 @@ AUTO_STOP_SECONDS = 0
 MAX_FRAME_COUNT = 0
 A4_DETECT_INTERVAL_ACQUIRE = 2
 A4_DETECT_INTERVAL_PLACING = 8
-PLACING_VERIFICATION_INTERVAL_MS = 5000
+# Disabled by default: normal placement checks are motion-triggered. When
+# enabled this low-frequency watchdog is diagnostic/recovery only.
+PLACING_VERIFICATION_INTERVAL_MS = 30000
+ENABLE_PLACEMENT_WATCHDOG = False
 UI_COUNTDOWN_REFRESH_INTERVAL_MS = 1000
 
 # Lightweight performance instrumentation.  Detailed collection and reporting
@@ -266,6 +373,11 @@ cfg.A4_TOP_SIDE = A4_TOP_SIDE
 cfg.A4_DARK_THRESHOLD = A4_DARK_THRESHOLD
 cfg.A4_MAX_INSIDE_GRAY = A4_MAX_INSIDE_GRAY
 cfg.A4_DARK_BLOB_MIN_AREA_RATIO = A4_DARK_BLOB_MIN_AREA_RATIO
+cfg.A4_EDGE_PROBE_OFFSET_PX = A4_EDGE_PROBE_OFFSET_PX
+cfg.A4_EDGE_PROBE_SAMPLES = A4_EDGE_PROBE_SAMPLES
+cfg.A4_INTERNAL_EDGE_SIMILAR_GRAY_DELTA = A4_INTERNAL_EDGE_SIMILAR_GRAY_DELTA
+cfg.A4_INTERNAL_EDGE_DARK_RATIO_MAX = A4_INTERNAL_EDGE_DARK_RATIO_MAX
+cfg.A4_INTERNAL_EDGE_MIN_SAMPLES = A4_INTERNAL_EDGE_MIN_SAMPLES
 cfg.A4_LOCK_REQUIRED_FRAMES = A4_LOCK_REQUIRED_FRAMES
 cfg.A4_HOLD_MISSED_FRAMES = A4_HOLD_MISSED_FRAMES
 cfg.A4_SLOW_SMOOTH_ALPHA = A4_SLOW_SMOOTH_ALPHA
@@ -282,8 +394,25 @@ cfg.RECTIFIED_WIDTH_PX = RECTIFIED_WIDTH_PX
 cfg.RECTIFIED_HEIGHT_PX = RECTIFIED_HEIGHT_PX
 cfg.DIVIDER_Y_MM = DIVIDER_Y_MM
 cfg.DIVIDER_SEARCH_HALF_RANGE_MM = DIVIDER_SEARCH_HALF_RANGE_MM
+cfg.ENABLE_DYNAMIC_DIVIDER = ENABLE_DYNAMIC_DIVIDER
+cfg.A4_REQUIRE_DIVIDER_FOR_LOCK = A4_REQUIRE_DIVIDER_FOR_LOCK
+cfg.DIVIDER_LINE_SAMPLE_COUNT = DIVIDER_LINE_SAMPLE_COUNT
+cfg.DIVIDER_LINE_MIN_GRAY = DIVIDER_LINE_MIN_GRAY
+cfg.DIVIDER_LINE_MIN_CONTRAST_GRAY = DIVIDER_LINE_MIN_CONTRAST_GRAY
+cfg.DIVIDER_LINE_MIN_COVERAGE = DIVIDER_LINE_MIN_COVERAGE
+cfg.DIVIDER_LINE_MAX_RESIDUAL_PX = DIVIDER_LINE_MAX_RESIDUAL_PX
+cfg.DIVIDER_LINE_MAX_SLOPE_MM = DIVIDER_LINE_MAX_SLOPE_MM
+cfg.DIVIDER_TRACK_ALPHA = DIVIDER_TRACK_ALPHA
 cfg.THRESHOLD_MODE = THRESHOLD_MODE
 cfg.WHITE_GRAY_THRESHOLD = WHITE_GRAY_THRESHOLD
+cfg.PIECE_SEGMENTATION_MODE = PIECE_SEGMENTATION_MODE
+cfg.PIECE_BACKGROUND_SAMPLE_STRIDE = PIECE_BACKGROUND_SAMPLE_STRIDE
+cfg.PIECE_BACKGROUND_HISTOGRAM_BINS = PIECE_BACKGROUND_HISTOGRAM_BINS
+cfg.PIECE_BACKGROUND_DELTA_GRAY = PIECE_BACKGROUND_DELTA_GRAY
+cfg.PIECE_BACKGROUND_RELAXED_DELTA_GRAY = PIECE_BACKGROUND_RELAXED_DELTA_GRAY
+cfg.PIECE_BACKGROUND_NOISE_MARGIN_GRAY = PIECE_BACKGROUND_NOISE_MARGIN_GRAY
+cfg.PIECE_BACKGROUND_MAX_DELTA_GRAY = PIECE_BACKGROUND_MAX_DELTA_GRAY
+cfg.PIECE_BACKGROUND_MIN_SAMPLES = PIECE_BACKGROUND_MIN_SAMPLES
 cfg.MORPH_KERNEL_PX = MORPH_KERNEL_PX
 cfg.MORPH_OPEN_ITERATIONS = MORPH_OPEN_ITERATIONS
 cfg.MORPH_CLOSE_ITERATIONS = MORPH_CLOSE_ITERATIONS
@@ -306,6 +435,9 @@ cfg.VERTEX_CLEANUP_MAX_PASSES = VERTEX_CLEANUP_MAX_PASSES
 cfg.VERTEX_CLEANUP_EXTRA_VERTICES = VERTEX_CLEANUP_EXTRA_VERTICES
 cfg.CONTOUR_DP_TOLERANCE_MM = CONTOUR_DP_TOLERANCE_MM
 cfg.LINE_FIT_MAX_ERROR_MM = LINE_FIT_MAX_ERROR_MM
+cfg.LINE_REFINE_MAX_SHIFT_MM = LINE_REFINE_MAX_SHIFT_MM
+cfg.LINE_FIT_MIN_POINTS = LINE_FIT_MIN_POINTS
+cfg.LINE_REFINE_MAX_AREA_CHANGE_RATIO = LINE_REFINE_MAX_AREA_CHANGE_RATIO
 cfg.MIN_EDGE_LENGTH_MM = MIN_EDGE_LENGTH_MM
 cfg.BOUNDARY_TRACE_MAX_STEP_FACTOR = BOUNDARY_TRACE_MAX_STEP_FACTOR
 cfg.BOUNDARY_TRACE_MIN_POINTS = BOUNDARY_TRACE_MIN_POINTS
@@ -346,32 +478,80 @@ cfg.MAX_DFS_NODES = MAX_DFS_NODES
 cfg.MAX_PLAN_TIME_MS = MAX_PLAN_TIME_MS
 cfg.STATE_POSITION_QUANTIZATION_MM = STATE_POSITION_QUANTIZATION_MM
 cfg.STATE_ANGLE_QUANTIZATION_DEG = STATE_ANGLE_QUANTIZATION_DEG
+cfg.ENABLE_PLAN_DEBUG = ENABLE_PLAN_DEBUG
+cfg.PLAN_DEBUG_INTERVAL_MS = PLAN_DEBUG_INTERVAL_MS
 cfg.GEOMETRY_EPSILON_MM = GEOMETRY_EPSILON_MM
 cfg.OVERLAP_AREA_TOLERANCE_MM2 = OVERLAP_AREA_TOLERANCE_MM2
 cfg.TARGET_CENTER_MM = TARGET_CENTER_MM
 cfg.TARGET_MARGIN_MM = TARGET_MARGIN_MM
 cfg.TARGET_RECT_SIZE_MM = TARGET_RECT_SIZE_MM
+cfg.PREFER_OUTER_FIRST_PLANNER = PREFER_OUTER_FIRST_PLANNER
+cfg.ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE = ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE
 cfg.FIXED_RECT_BEAM_WIDTH = FIXED_RECT_BEAM_WIDTH
 cfg.FIXED_RECT_MAX_OUTSIDE_MM2 = FIXED_RECT_MAX_OUTSIDE_MM2
 cfg.FIXED_RECT_MAX_OVERLAP_MM2 = FIXED_RECT_MAX_OVERLAP_MM2
 cfg.FIXED_RECT_MAX_GAP_MM2 = FIXED_RECT_MAX_GAP_MM2
 cfg.FIXED_RECT_SCORE_THRESHOLD = FIXED_RECT_SCORE_THRESHOLD
 cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM = FIXED_RECT_BOUNDARY_TOLERANCE_MM
+cfg.KNOWN_TARGET_DIMENSION_TOLERANCE_MM = KNOWN_TARGET_DIMENSION_TOLERANCE_MM
+cfg.KNOWN_TARGET_MAX_AREA_SCALE_DELTA = KNOWN_TARGET_MAX_AREA_SCALE_DELTA
 cfg.STABLE_WINDOW_FRAMES = STABLE_WINDOW_FRAMES
 cfg.REQUIRED_STABLE_FRAMES = REQUIRED_STABLE_FRAMES
 cfg.CENTER_STABLE_TOLERANCE_MM = CENTER_STABLE_TOLERANCE_MM
 cfg.ANGLE_STABLE_TOLERANCE_DEG = ANGLE_STABLE_TOLERANCE_DEG
+cfg.AREA_STABLE_TOLERANCE_RATIO = AREA_STABLE_TOLERANCE_RATIO
 cfg.TRACK_MAX_DISTANCE_MM = TRACK_MAX_DISTANCE_MM
 cfg.TRACK_SHAPE_COST_LIMIT = TRACK_SHAPE_COST_LIMIT
 cfg.TRACK_MAX_MISSED_FRAMES = TRACK_MAX_MISSED_FRAMES
-cfg.PLACEMENT_CHECK_INTERVAL_MS = PLACEMENT_CHECK_INTERVAL_MS
+cfg.TRACK_MAX_VERTEX_COUNT_DELTA = TRACK_MAX_VERTEX_COUNT_DELTA
+cfg.TRACK_VERTEX_MISMATCH_MAX_DISTANCE_MM = TRACK_VERTEX_MISMATCH_MAX_DISTANCE_MM
+cfg.TRACK_VERTEX_MISMATCH_MAX_AREA_RATIO = TRACK_VERTEX_MISMATCH_MAX_AREA_RATIO
+cfg.TRACK_VERTEX_MISMATCH_SHAPE_PENALTY = TRACK_VERTEX_MISMATCH_SHAPE_PENALTY
+cfg.A4_LOCK_DEADBAND_PX = A4_LOCK_DEADBAND_PX
+cfg.A4_RELOCK_MOTION_PX = A4_RELOCK_MOTION_PX
+cfg.A4_RELOCK_CONFIRM_FRAMES = A4_RELOCK_CONFIRM_FRAMES
+cfg.BAD_COUNT_HOLD_DETECTIONS = BAD_COUNT_HOLD_DETECTIONS
+cfg.COUNT_REACQUIRE_FAILURES = COUNT_REACQUIRE_FAILURES
 cfg.PLACEMENT_SHAPE_COST_LIMIT = PLACEMENT_SHAPE_COST_LIMIT
-cfg.PLACEMENT_CENTER_TOLERANCE_MM = PLACEMENT_CENTER_TOLERANCE_MM
-cfg.PLACEMENT_RMS_VERTEX_TOLERANCE_MM = PLACEMENT_RMS_VERTEX_TOLERANCE_MM
-cfg.PLACEMENT_MAX_VERTEX_TOLERANCE_MM = PLACEMENT_MAX_VERTEX_TOLERANCE_MM
+cfg.PLACEMENT_CONTOUR_SAMPLE_COUNT = PLACEMENT_CONTOUR_SAMPLE_COUNT
+cfg.PLACEMENT_CONTOUR_RMS_MAX_MM = PLACEMENT_CONTOUR_RMS_MAX_MM
+cfg.PLACEMENT_CONTOUR_P90_MAX_MM = PLACEMENT_CONTOUR_P90_MAX_MM
+cfg.PLACEMENT_CONTOUR_P95_HARD_MAX_MM = PLACEMENT_CONTOUR_P95_HARD_MAX_MM
+cfg.PLACEMENT_CENTER_COARSE_MAX_MM = PLACEMENT_CENTER_COARSE_MAX_MM
+cfg.PLACEMENT_AREA_RATIO_MIN = PLACEMENT_AREA_RATIO_MIN
+cfg.PLACEMENT_AREA_RATIO_MAX = PLACEMENT_AREA_RATIO_MAX
+cfg.PLACEMENT_POSE_BOUND_MM = PLACEMENT_POSE_BOUND_MM
+cfg.PLACEMENT_ORIENTATION_LONGEST_EDGE_RATIO_MIN = PLACEMENT_ORIENTATION_LONGEST_EDGE_RATIO_MIN
+cfg.PLACEMENT_ORIENTATION_SAMPLE_SPREAD_MAX_DEG = PLACEMENT_ORIENTATION_SAMPLE_SPREAD_MAX_DEG
 cfg.PLACEMENT_TARGET_WHITE_COVERAGE = PLACEMENT_TARGET_WHITE_COVERAGE
 cfg.PLACEMENT_REQUIRED_CHECKS = PLACEMENT_REQUIRED_CHECKS
+cfg.PLACEMENT_VERIFY_REQUIRED_PASSES = PLACEMENT_VERIFY_REQUIRED_PASSES
 cfg.PLACEMENT_COVERAGE_SAMPLE_STRIDE = PLACEMENT_COVERAGE_SAMPLE_STRIDE
+cfg.PLACEMENT_DELTA_TARGET_COVERAGE_MIN = PLACEMENT_DELTA_TARGET_COVERAGE_MIN
+cfg.PLACEMENT_DELTA_AREA_RATIO_MIN = PLACEMENT_DELTA_AREA_RATIO_MIN
+cfg.PLACEMENT_DELTA_AREA_RATIO_MAX = PLACEMENT_DELTA_AREA_RATIO_MAX
+cfg.PLACEMENT_DELTA_SPILL_MAX = PLACEMENT_DELTA_SPILL_MAX
+cfg.PLACEMENT_SOURCE_REMOVAL_MIN = PLACEMENT_SOURCE_REMOVAL_MIN
+cfg.PLACEMENT_DELTA_ENVELOPE_MM = PLACEMENT_DELTA_ENVELOPE_MM
+cfg.MOTION_SAMPLE_WIDTH = MOTION_SAMPLE_WIDTH
+cfg.MOTION_SAMPLE_HEIGHT = MOTION_SAMPLE_HEIGHT
+cfg.MOTION_SAMPLE_STRIDE = MOTION_SAMPLE_STRIDE
+cfg.MOTION_DIVIDER_IGNORE_MM = MOTION_DIVIDER_IGNORE_MM
+cfg.MOTION_PIXEL_DIFF_THRESHOLD = MOTION_PIXEL_DIFF_THRESHOLD
+cfg.MOTION_MEAN_ABS_DIFF_THRESHOLD = MOTION_MEAN_ABS_DIFF_THRESHOLD
+cfg.MOTION_CHANGED_PIXEL_RATIO = MOTION_CHANGED_PIXEL_RATIO
+cfg.MOTION_START_CONFIRM_FRAMES = MOTION_START_CONFIRM_FRAMES
+cfg.MOTION_END_CONFIRM_FRAMES = MOTION_END_CONFIRM_FRAMES
+cfg.POST_MOTION_STABLE_FRAMES = POST_MOTION_STABLE_FRAMES
+cfg.POST_MOTION_VERIFY_SAMPLES = POST_MOTION_VERIFY_SAMPLES
+cfg.FINAL_RECT_FILL_MIN = FINAL_RECT_FILL_MIN
+cfg.FINAL_AREA_RATIO_MIN = FINAL_AREA_RATIO_MIN
+cfg.FINAL_AREA_RATIO_MAX = FINAL_AREA_RATIO_MAX
+cfg.FINAL_RECT_DIM_TOLERANCE_MM = FINAL_RECT_DIM_TOLERANCE_MM
+cfg.FINAL_RECT_ENVELOPE_MM = FINAL_RECT_ENVELOPE_MM
+cfg.FINAL_RECT_SPILL_MAX = FINAL_RECT_SPILL_MAX
+cfg.FINAL_VERIFY_SAMPLE_COUNT = FINAL_VERIFY_SAMPLE_COUNT
+cfg.FINAL_VERIFY_REQUIRED_PASSES = FINAL_VERIFY_REQUIRED_PASSES
 cfg.DEBUG_SHOW_CAMERA = DEBUG_SHOW_CAMERA
 cfg.DISPLAY_EVERY_N_FRAMES = DISPLAY_EVERY_N_FRAMES
 cfg.PENDING_PRINT_EVERY_N_FRAMES = PENDING_PRINT_EVERY_N_FRAMES
@@ -381,6 +561,7 @@ cfg.MAX_FRAME_COUNT = MAX_FRAME_COUNT
 cfg.A4_DETECT_INTERVAL_ACQUIRE = A4_DETECT_INTERVAL_ACQUIRE
 cfg.A4_DETECT_INTERVAL_PLACING = A4_DETECT_INTERVAL_PLACING
 cfg.PLACING_VERIFICATION_INTERVAL_MS = PLACING_VERIFICATION_INTERVAL_MS
+cfg.ENABLE_PLACEMENT_WATCHDOG = ENABLE_PLACEMENT_WATCHDOG
 cfg.UI_COUNTDOWN_REFRESH_INTERVAL_MS = UI_COUNTDOWN_REFRESH_INTERVAL_MS
 cfg.ENABLE_STAGE_TIMING = ENABLE_STAGE_TIMING
 cfg.TIMING_REPORT_INTERVAL_FRAMES = TIMING_REPORT_INTERVAL_FRAMES
@@ -576,6 +757,7 @@ GEOMETRY_COUNTERS = {
     "polygon_intersection_calls": 0,
     "aabb_reject_count": 0,
 }
+PLAN_DEBUG_STATE = None
 
 
 def reset_geometry_counters():
@@ -587,13 +769,136 @@ def geometry_counters_snapshot():
     return dict(GEOMETRY_COUNTERS)
 
 
-def _geometry_exitpoint(counter, interval=32):
-    """Keep long planner searches interruptible from CanMV IDE."""
-    if counter % interval != 0:
+def begin_plan_debug(planner, piece_count):
+    """Start one low-frequency planner heartbeat session."""
+    global PLAN_DEBUG_STATE
+    if not getattr(cfg, "ENABLE_PLAN_DEBUG", False):
+        PLAN_DEBUG_STATE = None
+        return
+    reset_geometry_counters()
+    now = ticks_ms()
+    PLAN_DEBUG_STATE = {
+        "planner": str(planner),
+        "stage": "dispatch",
+        "started_ms": now,
+        "last_report_ms": now,
+        "piece_count": int(piece_count),
+        "depth": 0,
+        "states": 0,
+        "expanded": 0,
+        "nodes": 0,
+        "work": 0,
+        "best_score": None,
+    }
+
+
+def update_plan_debug(
+    stage=None,
+    depth=None,
+    states=None,
+    expanded=None,
+    nodes=None,
+    best_score=None,
+):
+    """Update heartbeat fields without reading the clock or printing."""
+    state = PLAN_DEBUG_STATE
+    if state is None:
+        return
+    if stage is not None:
+        state["stage"] = str(stage)
+    if depth is not None:
+        state["depth"] = int(depth)
+    if states is not None:
+        state["states"] = int(states)
+    if expanded is not None:
+        state["expanded"] = int(expanded)
+    if nodes is not None:
+        state["nodes"] = int(nodes)
+    if best_score is not None:
+        state["best_score"] = float(best_score)
+
+
+def plan_debug_heartbeat(force=False):
+    """Print progress only when the configured wall-clock interval elapsed."""
+    state = PLAN_DEBUG_STATE
+    if state is None:
+        return False
+    now = ticks_ms()
+    elapsed_since_report = ticks_diff(
+        now, state["last_report_ms"]
+    )
+    interval_ms = max(
+        250,
+        int(getattr(cfg, "PLAN_DEBUG_INTERVAL_MS", 2000)),
+    )
+    if not force and elapsed_since_report < interval_ms:
+        return False
+    elapsed_ms = max(
+        0, ticks_diff(now, state["started_ms"])
+    )
+    best_score = state["best_score"]
+    best_text = (
+        "na"
+        if best_score is None
+        else "{:.4f}".format(best_score)
+    )
+    print(
+        "PLAN_DEBUG,planner={},stage={},elapsed_ms={},pieces={},"
+        "depth={},states={},expanded={},nodes={},work={},"
+        "best_score={},intersections={},aabb_rejects={}".format(
+            state["planner"],
+            state["stage"],
+            elapsed_ms,
+            state["piece_count"],
+            state["depth"],
+            state["states"],
+            state["expanded"],
+            state["nodes"],
+            state["work"],
+            best_text,
+            GEOMETRY_COUNTERS["polygon_intersection_calls"],
+            GEOMETRY_COUNTERS["aabb_reject_count"],
+        )
+    )
+    state["last_report_ms"] = now
+    return True
+
+
+def end_plan_debug():
+    """End the active heartbeat session without adding another log line."""
+    global PLAN_DEBUG_STATE
+    PLAN_DEBUG_STATE = None
+
+
+def _plan_debug_work(amount=1):
+    state = PLAN_DEBUG_STATE
+    if state is not None:
+        state["work"] += int(amount)
+
+
+def _plan_debug_checkpoint(interval=32):
+    """Poll time/IDE only once per small batch of expensive helper calls."""
+    state = PLAN_DEBUG_STATE
+    if state is None:
+        return
+    state["work"] += 1
+    if state["work"] % max(1, int(interval)) != 0:
         return
     exitpoint = getattr(os, "exitpoint", None)
     if exitpoint is not None:
         exitpoint()
+    plan_debug_heartbeat()
+
+
+def _geometry_exitpoint(counter, interval=32):
+    """Keep long planner searches interruptible from CanMV IDE."""
+    if counter % interval != 0:
+        return
+    _plan_debug_work(interval)
+    exitpoint = getattr(os, "exitpoint", None)
+    if exitpoint is not None:
+        exitpoint()
+    plan_debug_heartbeat()
 
 
 class PieceObservation:
@@ -1427,6 +1732,18 @@ class EdgeCandidateGraph:
 def build_edge_candidate_graph(pieces, tolerant=False):
     """Build the complete seam candidate graph once before DFS."""
     started = ticks_ms()
+    update_plan_debug(
+        stage=(
+            "candidate_graph_tolerant"
+            if tolerant
+            else "candidate_graph_strict"
+        ),
+        depth=0,
+        states=0,
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
     graph = EdgeCandidateGraph()
     edges_by_piece = []
     for piece_index, piece in enumerate(pieces):
@@ -1453,6 +1770,8 @@ def build_edge_candidate_graph(pieces, tolerant=False):
             pair_candidates = []
             for desc_a in edges_by_piece[piece_a]:
                 for desc_b in edges_by_piece[piece_b]:
+                    if PLAN_DEBUG_STATE is not None:
+                        _plan_debug_checkpoint()
                     graph.raw_pair_count += 1
                     if not _edge_length_matches(
                         desc_a.length,
@@ -1468,6 +1787,9 @@ def build_edge_candidate_graph(pieces, tolerant=False):
                     )
                     pair_candidates.append(candidate)
                     graph.candidates.append(candidate)
+                    update_plan_debug(
+                        expanded=len(graph.candidates),
+                    )
                     for key in (
                         (piece_a, desc_a.edge_index),
                         (piece_b, desc_b.edge_index),
@@ -2123,6 +2445,8 @@ def _boundary_anchor_candidates(polygon, width, height, rectangle):
         for neighbor_index in neighbors:
             for corner_index, (corner, directions) in enumerate(corners):
                 for direction_index, direction in enumerate(directions):
+                    if PLAN_DEBUG_STATE is not None:
+                        _plan_debug_checkpoint()
                     transform = _transform_from_vertex_direction(
                         polygon,
                         vertex_index,
@@ -2152,6 +2476,12 @@ def _boundary_anchor_candidates(polygon, width, height, rectangle):
                             "polygon": candidate,
                             "transform": transform,
                             "outside": outside,
+                            "boundary": _boundary_contact_length(
+                                candidate,
+                                width,
+                                height,
+                                cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                            ),
                             "anchor": {
                                 "type": "boundary",
                                 "vertex_index": vertex_index,
@@ -2165,6 +2495,9 @@ def _boundary_anchor_candidates(polygon, width, height, rectangle):
 
 
 def _fixed_state_key(state):
+    cached = state.get("pose_entries")
+    if cached is not None:
+        return cached
     result = []
     for index, transform in enumerate(state["transforms"]):
         if transform is None:
@@ -2181,9 +2514,45 @@ def _fixed_state_key(state):
     return tuple(result)
 
 
+def _fixed_pose_entry(piece_index, polygon, transform):
+    center = polygon_centroid(polygon)
+    return (
+        int(piece_index),
+        int(round(center[0])),
+        int(round(center[1])),
+        int(round(transform[4])),
+    )
+
+
+def _fixed_extended_state_key(
+    state, new_index, candidate
+):
+    entries = state.get("pose_entries")
+    if entries is None:
+        entries = tuple(
+            _fixed_pose_entry(
+                index,
+                state["polygons"][index],
+                state["transforms"][index],
+            )
+            for index in state["placed"]
+        )
+    new_entry = _fixed_pose_entry(
+        new_index,
+        candidate["polygon"],
+        candidate["transform"],
+    )
+    return tuple(sorted(entries + (new_entry,)))
+
+
 def _fixed_partial_rank(
     state, rectangle, width, height
 ):
+    cached = state.get("partial_rank")
+    if cached is not None:
+        return cached
+    if PLAN_DEBUG_STATE is not None:
+        _plan_debug_checkpoint()
     outside = 0.0
     overlap = 0.0
     boundary = 0.0
@@ -2206,6 +2575,8 @@ def _fixed_partial_rank(
 
 
 def _fixed_complete_metrics(polygons, rectangle, width, height):
+    if PLAN_DEBUG_STATE is not None:
+        _plan_debug_checkpoint()
     outside = 0.0
     overlap = 0.0
     inside_sum = 0.0
@@ -2273,6 +2644,8 @@ def _fixed_edge_candidates(
             a0 = fixed_polygon[fixed_edge]
             a1 = fixed_polygon[(fixed_edge + 1) % len(fixed_polygon)]
             for new_edge in range(len(new_polygon)):
+                if PLAN_DEBUG_STATE is not None:
+                    _plan_debug_checkpoint()
                 if not _edge_length_matches(
                     fixed_lengths[fixed_edge],
                     new_lengths[new_edge],
@@ -2318,6 +2691,12 @@ def _fixed_edge_candidates(
                         "polygon": candidate,
                         "transform": transform,
                         "outside": outside,
+                        "boundary": _boundary_contact_length(
+                            candidate,
+                            rectangle[1][0],
+                            rectangle[2][1],
+                            cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                        ),
                         "anchor": {
                             "type": "seam",
                             "piece_a_index": fixed_index,
@@ -2397,12 +2776,25 @@ def _plan_fixed_rectangle(pieces, size_mm):
     height = float(size_mm[1])
     rectangle = _fixed_rectangle_polygon(width, height)
     count = len(pieces)
-    boundary_candidates = [
-        _boundary_anchor_candidates(
+    update_plan_debug(
+        stage="fixed_boundary_anchors",
+        depth=0,
+        states=0,
+        expanded=0,
+        nodes=0,
+    )
+    boundary_candidates = []
+    boundary_candidate_count = 0
+    for piece in pieces:
+        candidates = _boundary_anchor_candidates(
             piece.polygon_mm, width, height, rectangle
         )
-        for piece in pieces
-    ]
+        boundary_candidates.append(candidates)
+        boundary_candidate_count += len(candidates)
+        update_plan_debug(
+            states=boundary_candidate_count,
+        )
+        plan_debug_heartbeat()
     states = []
     for piece_index in range(count):
         for candidate in boundary_candidates[piece_index]:
@@ -2417,6 +2809,20 @@ def _plan_fixed_rectangle(pieces, size_mm):
                     "transforms": transforms,
                     "seams": [],
                     "anchors": [candidate["anchor"]],
+                    "outside_sum": candidate["outside"],
+                    "overlap_sum": 0.0,
+                    "boundary_sum": candidate["boundary"],
+                    "partial_rank": (
+                        5.0 * candidate["outside"]
+                        - 0.5 * candidate["boundary"]
+                    ),
+                    "pose_entries": (
+                        _fixed_pose_entry(
+                            piece_index,
+                            candidate["polygon"],
+                            candidate["transform"],
+                        ),
+                    ),
                 }
             )
     if not states:
@@ -2426,10 +2832,25 @@ def _plan_fixed_rectangle(pieces, size_mm):
         )
 
     nodes = len(states)
+    update_plan_debug(
+        stage="fixed_seed_states",
+        states=len(states),
+        expanded=0,
+        nodes=nodes,
+    )
+    plan_debug_heartbeat()
     work_counter = 0
     for _depth in range(1, count):
         expanded = []
         seen = set()
+        update_plan_debug(
+            stage="fixed_expand",
+            depth=_depth,
+            states=len(states),
+            expanded=0,
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
         for state in states:
             work_counter += 1
             _geometry_exitpoint(work_counter)
@@ -2450,6 +2871,11 @@ def _plan_fixed_rectangle(pieces, size_mm):
                 for candidate in candidates:
                     work_counter += 1
                     _geometry_exitpoint(work_counter)
+                    key = _fixed_extended_state_key(
+                        state, new_index, candidate
+                    )
+                    if key in seen:
+                        continue
                     overlap = 0.0
                     for placed_index in state["placed"]:
                         overlap += polygon_overlap_area(
@@ -2479,12 +2905,30 @@ def _plan_fixed_rectangle(pieces, size_mm):
                         "transforms": transforms,
                         "seams": seams,
                         "anchors": anchors,
+                        "outside_sum": (
+                            state["outside_sum"]
+                            + candidate["outside"]
+                        ),
+                        "overlap_sum": (
+                            state["overlap_sum"] + overlap
+                        ),
+                        "boundary_sum": (
+                            state["boundary_sum"]
+                            + candidate["boundary"]
+                        ),
+                        "pose_entries": key,
                     }
-                    key = _fixed_state_key(new_state)
-                    if key in seen:
-                        continue
+                    new_state["partial_rank"] = (
+                        5.0 * new_state["outside_sum"]
+                        + 20.0 * new_state["overlap_sum"]
+                        - 0.5 * new_state["boundary_sum"]
+                    )
                     seen.add(key)
                     expanded.append(new_state)
+            update_plan_debug(
+                expanded=len(expanded),
+                nodes=nodes + len(expanded),
+            )
         nodes += len(expanded)
         if not expanded:
             return PlanResult(
@@ -2492,15 +2936,37 @@ def _plan_fixed_rectangle(pieces, size_mm):
                 search_nodes=nodes,
                 mode="fixed_tolerant",
             )
+        update_plan_debug(
+            stage="fixed_rank",
+            states=len(expanded),
+            expanded=len(expanded),
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
         expanded.sort(
             key=lambda state: _fixed_partial_rank(
                 state, rectangle, width, height
             )
         )
         states = expanded[: cfg.FIXED_RECT_BEAM_WIDTH]
+        update_plan_debug(
+            stage="fixed_beam",
+            states=len(states),
+            expanded=len(expanded),
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
 
     best = None
     best_metrics = None
+    update_plan_debug(
+        stage="fixed_evaluate",
+        depth=count,
+        states=len(states),
+        expanded=0,
+        nodes=nodes,
+    )
+    plan_debug_heartbeat()
     for state in states:
         work_counter += 1
         _geometry_exitpoint(work_counter)
@@ -2527,6 +2993,9 @@ def _plan_fixed_rectangle(pieces, size_mm):
         ):
             best = state
             best_metrics = metrics
+            update_plan_debug(
+                best_score=best_metrics["score"],
+            )
     if best is None:
         return PlanResult(
             reason="no complete fixed rectangle candidate",
@@ -2783,6 +3252,116 @@ def _outer_first_complete_metrics(polygons):
     }
 
 
+def _target_rectangle_dimensions(target_size_mm):
+    """Return both axis orientations for one configured target size."""
+    if target_size_mm is None:
+        return []
+    width = float(target_size_mm[0])
+    height = float(target_size_mm[1])
+    if width <= EPS or height <= EPS:
+        return []
+    result = [(width, height)]
+    if abs(width - height) > EPS:
+        result.append((height, width))
+    return result
+
+
+def _normalize_pieces_for_known_target(
+    pieces, target_size_mm
+):
+    """Correct a small common contour scale bias from known total area."""
+    if target_size_mm is None:
+        return pieces, 1.0
+    target_area = (
+        float(target_size_mm[0])
+        * float(target_size_mm[1])
+    )
+    observed_area = sum(
+        piece.area_mm2 for piece in pieces
+    )
+    if target_area <= EPS or observed_area <= EPS:
+        return pieces, 1.0
+    scale = math.sqrt(target_area / observed_area)
+    if (
+        abs(scale - 1.0)
+        > cfg.KNOWN_TARGET_MAX_AREA_SCALE_DELTA
+    ):
+        return pieces, 1.0
+    if abs(scale - 1.0) <= 1e-6:
+        return pieces, 1.0
+    normalized = []
+    for piece in pieces:
+        center_x, center_y = piece.centroid_mm
+        polygon = [
+            (
+                center_x + (point[0] - center_x) * scale,
+                center_y + (point[1] - center_y) * scale,
+            )
+            for point in piece.polygon_mm
+        ]
+        value = PieceObservation(
+            piece.piece_id,
+            piece.contour_px,
+            polygon,
+            centroid_mm=piece.centroid_mm,
+            confidence=piece.confidence,
+            rotation_ambiguous=piece.rotation_ambiguous,
+            centroid_fallback=piece.centroid_fallback,
+        )
+        value.stable = piece.stable
+        normalized.append(value)
+    return normalized, scale
+
+
+def _known_target_gate_reason(
+    metrics, width, height, target_size_mm
+):
+    """Reject tolerant assemblies that are not the configured rectangle."""
+    if target_size_mm is None:
+        return None
+    target_long = max(
+        float(target_size_mm[0]),
+        float(target_size_mm[1]),
+    )
+    target_short = min(
+        float(target_size_mm[0]),
+        float(target_size_mm[1]),
+    )
+    actual_long = max(float(width), float(height))
+    actual_short = min(float(width), float(height))
+    outside = metrics.get("outside_mm2", 0.0)
+    overlap = metrics.get("overlap_mm2", 0.0)
+    gap = metrics.get("fill_gap_mm2", 0.0)
+    dimension_error = max(
+        abs(actual_long - target_long),
+        abs(actual_short - target_short),
+    )
+    if (
+        dimension_error
+        <= cfg.KNOWN_TARGET_DIMENSION_TOLERANCE_MM
+        and metrics["score"] <= cfg.FIXED_RECT_SCORE_THRESHOLD
+        and outside <= cfg.FIXED_RECT_MAX_OUTSIDE_MM2
+        and overlap <= cfg.FIXED_RECT_MAX_OVERLAP_MM2
+        and gap <= cfg.FIXED_RECT_MAX_GAP_MM2
+    ):
+        return None
+    return (
+        "known target gate actual={:.1f}x{:.1f},"
+        "target={:.1f}x{:.1f},dim_error={:.1f},"
+        "score={:.4f},outside={:.1f},overlap={:.1f},gap={:.1f}"
+    ).format(
+        actual_long,
+        actual_short,
+        target_long,
+        target_short,
+        dimension_error,
+        metrics["score"],
+        outside,
+        overlap,
+        gap,
+    )
+
+
 def _corner_dimension_candidates(pieces, tolerant):
     """Infer plausible unknown rectangle sizes from corner-adjacent edges."""
     angle_tolerance = (
@@ -2994,6 +3573,12 @@ def _corner_anchor_candidates(
                             "polygon": candidate,
                             "transform": transform,
                             "outside": outside,
+                            "boundary": _boundary_contact_length(
+                                candidate,
+                                width,
+                                height,
+                                cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                            ),
                             "anchor": {
                                 "type": "boundary",
                                 "piece_index": piece_index,
@@ -3098,6 +3683,12 @@ def _fixed_graph_edge_candidates(
                     "polygon": candidate,
                     "transform": transform,
                     "outside": outside,
+                    "boundary": _boundary_contact_length(
+                        candidate,
+                        rectangle[1][0],
+                        rectangle[2][1],
+                        cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                    ),
                     "candidate_cost": match.geometric_cost,
                     "anchor": {
                         "type": "seam",
@@ -3118,7 +3709,11 @@ def _fixed_graph_edge_candidates(
 
 
 def _plan_corner_hybrid_rectangle(
-    pieces, tolerant, candidate_graph, plan_started_ms=None
+    pieces,
+    tolerant,
+    candidate_graph,
+    plan_started_ms=None,
+    target_size_mm=None,
 ):
     """Anchor reliable corner pieces, then attach non-corner pieces by seams."""
     mode = (
@@ -3126,9 +3721,17 @@ def _plan_corner_hybrid_rectangle(
         if tolerant
         else "corner_outer_strict"
     )
-    all_dimensions = _corner_dimension_candidates(
-        pieces, tolerant
-    )
+    if target_size_mm is None:
+        all_dimensions = _corner_dimension_candidates(
+            pieces, tolerant
+        )
+    else:
+        # A known prototype must not be replaced by a rectangle size inferred
+        # from noisy edges. Searching only its two orientations is both safer
+        # and substantially cheaper than ranking many dimension hypotheses.
+        all_dimensions = _target_rectangle_dimensions(
+            target_size_mm
+        )
     dimensions = all_dimensions[
         : max(1, cfg.MAX_RECTANGLE_HYPOTHESES)
     ]
@@ -3136,7 +3739,26 @@ def _plan_corner_hybrid_rectangle(
         "rectangle_hypothesis_raw_count": len(all_dimensions),
         "rectangle_hypothesis_count": len(dimensions),
         "rectangle_hypotheses_used": len(dimensions),
+        "boundary_anchor_count": 0,
+        "seed_state_count": 0,
+        "expanded_candidate_count": 0,
+        "pruned_overlap": 0,
+        "complete_state_count": 0,
+        "pruned_outer_edge": 0,
+        "max_depth": 0,
     }
+    update_plan_debug(
+        stage=(
+            "corner_dimensions_tolerant"
+            if tolerant
+            else "corner_dimensions_strict"
+        ),
+        depth=0,
+        states=len(dimensions),
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
     PERF_STATS.increment(
         "rectangle_hypothesis_count", len(dimensions)
     )
@@ -3173,6 +3795,10 @@ def _plan_corner_hybrid_rectangle(
             )
             for index, piece in enumerate(pieces)
         ]
+        plan_stats["boundary_anchor_count"] += sum(
+            len(candidates)
+            for candidates in boundary_candidates
+        )
         states = []
         for piece_index, candidates in enumerate(
             boundary_candidates
@@ -3192,10 +3818,28 @@ def _plan_corner_hybrid_rectangle(
                         "corners": {
                             candidate["corner_index"]
                         },
+                        "outside_sum": candidate["outside"],
+                        "overlap_sum": 0.0,
+                        "boundary_sum": candidate["boundary"],
+                        "partial_rank": (
+                            5.0 * candidate["outside"]
+                            - 0.5 * candidate["boundary"]
+                        ),
+                        "pose_entries": (
+                            _fixed_pose_entry(
+                                piece_index,
+                                candidate["polygon"],
+                                candidate["transform"],
+                            ),
+                        ),
                     }
                 )
         if not states:
             continue
+        plan_stats["seed_state_count"] += len(states)
+        plan_stats["max_depth"] = max(
+            plan_stats["max_depth"], 1
+        )
         states.sort(
             key=lambda state: _fixed_partial_rank(
                 state, rectangle, width, height
@@ -3205,6 +3849,18 @@ def _plan_corner_hybrid_rectangle(
             : cfg.OUTER_FIRST_CORNER_BEAM_WIDTH
         ]
         nodes += len(states)
+        update_plan_debug(
+            stage=(
+                "corner_expand_tolerant"
+                if tolerant
+                else "corner_expand_strict"
+            ),
+            depth=1,
+            states=len(states),
+            expanded=0,
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
 
         for _depth in range(1, count):
             expanded = []
@@ -3248,7 +3904,13 @@ def _plan_corner_hybrid_rectangle(
                     for candidate in candidates[
                         : cfg.OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE
                     ]:
+                        plan_stats["expanded_candidate_count"] += 1
                         nodes += 1
+                        update_plan_debug(
+                            depth=_depth,
+                            expanded=len(expanded),
+                            nodes=nodes,
+                        )
                         _geometry_exitpoint(nodes)
                         if (
                             nodes
@@ -3266,6 +3928,11 @@ def _plan_corner_hybrid_rectangle(
                             timed_out = True
                             limit_hit = True
                             break
+                        key = _fixed_extended_state_key(
+                            state, new_index, candidate
+                        )
+                        if key in seen:
+                            continue
                         overlap = 0.0
                         for placed_index in state["placed"]:
                             overlap += polygon_overlap_area(
@@ -3278,6 +3945,7 @@ def _plan_corner_hybrid_rectangle(
                             else cfg.OVERLAP_AREA_TOLERANCE_MM2
                         )
                         if overlap > overlap_limit:
+                            plan_stats["pruned_overlap"] += 1
                             continue
                         polygons = list(state["polygons"])
                         transforms = list(state["transforms"])
@@ -3304,12 +3972,30 @@ def _plan_corner_hybrid_rectangle(
                             "seams": seams,
                             "anchors": anchors,
                             "corners": corners,
+                            "outside_sum": (
+                                state["outside_sum"]
+                                + candidate["outside"]
+                            ),
+                            "overlap_sum": (
+                                state["overlap_sum"] + overlap
+                            ),
+                            "boundary_sum": (
+                                state["boundary_sum"]
+                                + candidate["boundary"]
+                            ),
+                            "pose_entries": key,
                         }
-                        key = _fixed_state_key(new_state)
-                        if key in seen:
-                            continue
+                        new_state["partial_rank"] = (
+                            5.0 * new_state["outside_sum"]
+                            + 20.0 * new_state["overlap_sum"]
+                            - 0.5 * new_state["boundary_sum"]
+                        )
                         seen.add(key)
                         expanded.append(new_state)
+                        plan_stats["max_depth"] = max(
+                            plan_stats["max_depth"],
+                            len(new_state["placed"]),
+                        )
                     if limit_hit:
                         break
                 if limit_hit:
@@ -3325,12 +4011,25 @@ def _plan_corner_hybrid_rectangle(
             states = expanded[
                 : cfg.OUTER_FIRST_CORNER_BEAM_WIDTH
             ]
+            update_plan_debug(
+                stage=(
+                    "corner_rank_tolerant"
+                    if tolerant
+                    else "corner_rank_strict"
+                ),
+                depth=_depth + 1,
+                states=len(states),
+                expanded=len(expanded),
+                nodes=nodes,
+            )
+            plan_debug_heartbeat()
             if limit_hit:
                 break
 
         for state in states:
             if len(state["placed"]) != count:
                 continue
+            plan_stats["complete_state_count"] += 1
             metrics = _fixed_complete_metrics(
                 state["polygons"],
                 rectangle,
@@ -3338,7 +4037,9 @@ def _plan_corner_hybrid_rectangle(
                 height,
             )
             boundary_tolerance = (
-                cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
+                cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM
+                if target_size_mm is not None
+                else cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
                 if tolerant
                 else cfg.OUTER_EDGE_TOLERANCE_MM
             )
@@ -3355,6 +4056,7 @@ def _plan_corner_hybrid_rectangle(
                 },
                 tolerance=boundary_tolerance,
             ):
+                plan_stats["pruned_outer_edge"] += 1
                 continue
             if (
                 best_metrics is None
@@ -3364,6 +4066,9 @@ def _plan_corner_hybrid_rectangle(
                 best_metrics = metrics
                 best_width = width
                 best_height = height
+                update_plan_debug(
+                    best_score=best_metrics["score"],
+                )
         if (
             best_metrics is not None
             and best_metrics["score"]
@@ -3374,6 +4079,9 @@ def _plan_corner_hybrid_rectangle(
             break
 
     if best is None:
+        plan_stats["limit_hit"] = bool(limit_hit)
+        plan_stats["timed_out"] = bool(timed_out)
+        plan_stats["search_nodes"] = nodes
         return PlanResult(
             reason=(
                 "corner-outer plan time limit reached"
@@ -3386,25 +4094,48 @@ def _plan_corner_hybrid_rectangle(
             mode=mode,
             plan_stats=plan_stats,
         )
+    known_target_rejection = _known_target_gate_reason(
+        best_metrics,
+        best_width,
+        best_height,
+        target_size_mm,
+    )
+    plan_stats["limit_hit"] = bool(limit_hit)
+    plan_stats["timed_out"] = bool(timed_out)
+    plan_stats["search_nodes"] = nodes
+    plan_stats["best_complete_score"] = best_metrics["score"]
+    plan_stats["best_complete_gap_mm2"] = best_metrics[
+        "fill_gap_mm2"
+    ]
+    plan_stats["best_complete_overlap_mm2"] = best_metrics[
+        "overlap_mm2"
+    ]
+    plan_stats["best_complete_outside_mm2"] = best_metrics[
+        "outside_mm2"
+    ]
     score_limit = (
         cfg.TOLERANT_RECTANGLE_SCORE_THRESHOLD
-        if tolerant
+        if tolerant and target_size_mm is None
         else cfg.FIXED_RECT_SCORE_THRESHOLD
     )
     gap_limit = (
         cfg.TOLERANT_MAX_FILL_GAP_RATIO
         * best_width
         * best_height
-        if tolerant
+        if tolerant and target_size_mm is None
+        else cfg.FIXED_RECT_MAX_GAP_MM2
+        if target_size_mm is not None
         else cfg.RECT_FILL_GAP_TOLERANCE_MM2
     )
     if (
-        best_metrics["score"] > score_limit
+        known_target_rejection is not None
+        or best_metrics["score"] > score_limit
         or best_metrics["fill_gap_mm2"] > gap_limit
     ):
         return PlanResult(
             reason=(
-                "corner-outer metrics score={:.4f},gap={:.1f}"
+                known_target_rejection
+                or "corner-outer metrics score={:.4f},gap={:.1f}"
             ).format(
                 best_metrics["score"],
                 best_metrics["fill_gap_mm2"],
@@ -3413,6 +4144,8 @@ def _plan_corner_hybrid_rectangle(
             search_nodes=nodes,
             mode=mode,
             fill_gap_mm2=best_metrics["fill_gap_mm2"],
+            overlap_mm2=best_metrics["overlap_mm2"],
+            outside_mm2=best_metrics["outside_mm2"],
             plan_stats=plan_stats,
         )
     operations, target_polygons, target_rect = (
@@ -3699,7 +4432,13 @@ def _outer_graph_state_candidates(
 
 
 def plan_outer_first_rectangle(
-    pieces, tolerant_fallback=True, _tolerant=False
+    pieces,
+    tolerant_fallback=True,
+    _tolerant=False,
+    target_size_mm=None,
+    _area_normalized=False,
+    _input_piece_area_mm2=None,
+    _target_area_scale=1.0,
 ):
     """Plan an unknown 2..4-piece rectangle from its outside edges first.
 
@@ -3722,6 +4461,18 @@ def plan_outer_first_rectangle(
             mode="outer_first",
         )
 
+    if _area_normalized:
+        input_piece_area_mm2 = _input_piece_area_mm2
+        target_area_scale = _target_area_scale
+    else:
+        input_piece_area_mm2 = sum(
+            piece.area_mm2 for piece in pieces
+        )
+        pieces, target_area_scale = (
+            _normalize_pieces_for_known_target(
+                pieces, target_size_mm
+            )
+        )
     plan_started_ms = ticks_ms()
     reset_geometry_counters()
     candidate_graph = build_edge_candidate_graph(
@@ -3748,9 +4499,34 @@ def plan_outer_first_rectangle(
         )
         stats["candidate_graph_ms"] = candidate_graph.build_ms
         stats["dfs_nodes_expanded"] = plan.search_nodes
+        stats["input_piece_area_mm2"] = (
+            input_piece_area_mm2
+        )
+        stats["target_area_scale"] = target_area_scale
+        if target_size_mm is not None:
+            target_area_mm2 = (
+                float(target_size_mm[0])
+                * float(target_size_mm[1])
+            )
+            stats["target_area_mm2"] = target_area_mm2
+            stats["input_area_error_pct"] = (
+                100.0
+                * abs(input_piece_area_mm2 - target_area_mm2)
+                / max(EPS, target_area_mm2)
+            )
         stats["plan_ms"] = max(
             0, ticks_diff(ticks_ms(), plan_started_ms)
         )
+        corner_failure = corner_plan_holder[0]
+        if corner_failure is not None and not corner_failure.valid:
+            stats["corner_failure_reason"] = (
+                corner_failure.reason
+            )
+            stats["corner_search_nodes"] = (
+                corner_failure.search_nodes
+            )
+            for key, value in corner_failure.plan_stats.items():
+                stats["corner_{}".format(key)] = value
         plan.plan_stats = stats
         PERF_STATS.add_stage(
             "plan_ms", elapsed_ms=stats["plan_ms"]
@@ -3763,6 +4539,7 @@ def plan_outer_first_rectangle(
         else "outer_first_strict"
     )
 
+    corner_plan_holder = [None]
     corner_attempted = _outer_should_try_corner_first(
         pieces, tolerant=_tolerant
     )
@@ -3772,7 +4549,9 @@ def plan_outer_first_rectangle(
             tolerant=_tolerant,
             candidate_graph=candidate_graph,
             plan_started_ms=plan_started_ms,
+            target_size_mm=target_size_mm,
         )
+        corner_plan_holder[0] = corner_plan
         if corner_plan.valid:
             return finalize(corner_plan)
 
@@ -3783,7 +4562,9 @@ def plan_outer_first_rectangle(
                 tolerant=_tolerant,
                 candidate_graph=candidate_graph,
                 plan_started_ms=plan_started_ms,
+                target_size_mm=target_size_mm,
             )
+            corner_plan_holder[0] = corner_plan
             if corner_plan.valid:
                 corner_plan.search_nodes += nodes
                 return finalize(corner_plan)
@@ -3796,6 +4577,12 @@ def plan_outer_first_rectangle(
                 pieces,
                 tolerant_fallback=False,
                 _tolerant=True,
+                target_size_mm=target_size_mm,
+                _area_normalized=True,
+                _input_piece_area_mm2=(
+                    input_piece_area_mm2
+                ),
+                _target_area_scale=target_area_scale,
             )
         return finalize(
             PlanResult(
@@ -3842,6 +4629,16 @@ def plan_outer_first_rectangle(
         "limit_hit": False,
         "exact_solution": False,
         "timed_out": False,
+        "complete_state_count": 0,
+        "pruned_rect_range": 0,
+        "pruned_target_dimension": 0,
+        "pruned_complete_boundary": 0,
+        "max_depth": 1,
+        "closest_target_dimension_error_mm": None,
+        "closest_target_long_mm": None,
+        "closest_target_short_mm": None,
+        "closest_target_score": None,
+        "closest_target_gap_mm2": None,
         "pruned_endpoint": 0,
         "pruned_side": 0,
         "pruned_overlap": 0,
@@ -3854,6 +4651,18 @@ def plan_outer_first_rectangle(
     roots = _outer_first_root_candidates(
         pieces, tolerant=_tolerant
     )
+    update_plan_debug(
+        stage=(
+            "outer_roots_tolerant"
+            if _tolerant
+            else "outer_roots_strict"
+        ),
+        depth=0,
+        states=len(roots),
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
 
     for root_number, root in enumerate(roots):
         if state["nodes"] >= min(
@@ -3870,6 +4679,17 @@ def plan_outer_first_rectangle(
             state["limit_hit"] = True
             break
         state["nodes"] += 1
+        update_plan_debug(
+            stage=(
+                "outer_dfs_tolerant"
+                if _tolerant
+                else "outer_dfs_strict"
+            ),
+            depth=1,
+            states=len(roots),
+            expanded=root_number,
+            nodes=state["nodes"],
+        )
         _geometry_exitpoint(state["nodes"])
         root_index = root["piece_index"]
         root_edge = root["edge_index"]
@@ -3904,6 +4724,7 @@ def plan_outer_first_rectangle(
                 state["limit_hit"] = True
                 return
             if len(placed_indices) == count:
+                state["complete_state_count"] += 1
                 candidate_polygons = [
                     placed_polygons[index]
                     for index in range(count)
@@ -3912,9 +4733,55 @@ def plan_outer_first_rectangle(
                     candidate_polygons
                 )
                 if metrics is None:
+                    state["pruned_rect_range"] += 1
                     return
+                if target_size_mm is not None:
+                    rect = metrics["rect"]
+                    actual_long = max(
+                        rect["width"], rect["height"]
+                    )
+                    actual_short = min(
+                        rect["width"], rect["height"]
+                    )
+                    target_long = max(target_size_mm)
+                    target_short = min(target_size_mm)
+                    dimension_error = max(
+                        abs(actual_long - target_long),
+                        abs(actual_short - target_short),
+                    )
+                    closest_error = state[
+                        "closest_target_dimension_error_mm"
+                    ]
+                    if (
+                        closest_error is None
+                        or dimension_error < closest_error
+                    ):
+                        state[
+                            "closest_target_dimension_error_mm"
+                        ] = dimension_error
+                        state["closest_target_long_mm"] = (
+                            actual_long
+                        )
+                        state["closest_target_short_mm"] = (
+                            actual_short
+                        )
+                        state["closest_target_score"] = metrics[
+                            "score"
+                        ]
+                        state["closest_target_gap_mm2"] = metrics[
+                            "fill_gap_mm2"
+                        ]
+                    if (
+                        dimension_error
+                        > cfg.KNOWN_TARGET_DIMENSION_TOLERANCE_MM
+                    ):
+                        state["pruned_dimension"] += 1
+                        state["pruned_target_dimension"] += 1
+                        return
                 boundary_tolerance = (
-                    cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
+                    cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM
+                    if target_size_mm is not None
+                    else cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
                     if _tolerant
                     else cfg.OUTER_EDGE_TOLERANCE_MM
                 )
@@ -3923,6 +4790,7 @@ def plan_outer_first_rectangle(
                     metrics["rect"],
                     tolerance=boundary_tolerance,
                 ):
+                    state["pruned_complete_boundary"] += 1
                     return
                 if metrics["score"] < best["score"]:
                     best["score"] = metrics["score"]
@@ -3939,6 +4807,9 @@ def plan_outer_first_rectangle(
                     ]
                     if metrics["score"] <= 1e-6:
                         state["exact_solution"] = True
+                    update_plan_debug(
+                        best_score=best["score"],
+                    )
                 return
 
             candidates = _outer_graph_state_candidates(
@@ -3984,6 +4855,13 @@ def plan_outer_first_rectangle(
                     }
                 )
                 next_indices = placed_indices + [new_index]
+                state["max_depth"] = max(
+                    state["max_depth"], len(next_indices)
+                )
+                update_plan_debug(
+                    depth=len(next_indices),
+                    nodes=state["nodes"],
+                )
                 state_key = []
                 for index in sorted(next_indices):
                     center = polygon_centroid(
@@ -4025,16 +4903,83 @@ def plan_outer_first_rectangle(
             break
 
     if best["metrics"] is None:
-        reason = (
-            "outer-first search limit reached"
-            if state["limit_hit"]
-            else "no outside-edge rectangle assembly"
-        )
+        if state["limit_hit"]:
+            reason = (
+                "outer-first search limit reached; nodes={};"
+                "max_depth={}; complete={}"
+            ).format(
+                state["nodes"],
+                state["max_depth"],
+                state["complete_state_count"],
+            )
+        elif (
+            target_size_mm is not None
+            and state["complete_state_count"] > 0
+            and state["closest_target_dimension_error_mm"]
+            is not None
+        ):
+            reason = (
+                "no outside-edge rectangle assembly: complete candidates "
+                "miss target; complete={};rect_range_reject={};"
+                "target_size_reject={};closest={:.1f}x{:.1f};"
+                "target={:.1f}x{:.1f};size_error={:.1f};"
+                "closest_gap={:.1f};seam_pairs={}"
+            ).format(
+                state["complete_state_count"],
+                state["pruned_rect_range"],
+                state["pruned_target_dimension"],
+                state["closest_target_long_mm"],
+                state["closest_target_short_mm"],
+                max(target_size_mm),
+                min(target_size_mm),
+                state["closest_target_dimension_error_mm"],
+                state["closest_target_gap_mm2"],
+                candidate_graph.filtered_pair_count,
+            )
+        elif state["complete_state_count"] > 0:
+            reason = (
+                "no outside-edge rectangle assembly: complete candidates "
+                "failed rectangle gates; complete={};rect_range_reject={};"
+                "outer_edge_reject={};seam_pairs={}"
+            ).format(
+                state["complete_state_count"],
+                state["pruned_rect_range"],
+                state["pruned_complete_boundary"],
+                candidate_graph.filtered_pair_count,
+            )
+        else:
+            reason = (
+                "no outside-edge rectangle assembly: seam graph did not "
+                "complete all pieces; max_depth={}/{};seam_pairs={};"
+                "pruned_boundary={};pruned_dimension={}"
+            ).format(
+                state["max_depth"],
+                count,
+                candidate_graph.filtered_pair_count,
+                state["pruned_boundary"],
+                state["pruned_dimension"],
+            )
         return failed(reason, nodes=state["nodes"])
 
+    rect = best["metrics"]["rect"]
+    known_target_rejection = _known_target_gate_reason(
+        best["metrics"],
+        rect["width"],
+        rect["height"],
+        target_size_mm,
+    )
+    if known_target_rejection is not None:
+        return failed(
+            known_target_rejection,
+            score=best["score"],
+            nodes=state["nodes"],
+            fill_gap=best["metrics"]["fill_gap_mm2"],
+        )
     score_threshold = (
         cfg.TOLERANT_RECTANGLE_SCORE_THRESHOLD
-        if _tolerant
+        if _tolerant and target_size_mm is None
+        else cfg.FIXED_RECT_SCORE_THRESHOLD
+        if target_size_mm is not None
         else cfg.RECTANGLE_SCORE_THRESHOLD
     )
     if best["score"] > score_threshold:
@@ -4047,11 +4992,13 @@ def plan_outer_first_rectangle(
             fill_gap=best["metrics"]["fill_gap_mm2"],
         )
     gap_tolerance = cfg.RECT_FILL_GAP_TOLERANCE_MM2
-    if _tolerant:
+    if _tolerant and target_size_mm is None:
         gap_tolerance = (
             cfg.TOLERANT_MAX_FILL_GAP_RATIO
             * best["metrics"]["rect"]["area"]
         )
+    elif target_size_mm is not None:
+        gap_tolerance = cfg.FIXED_RECT_MAX_GAP_MM2
     if best["metrics"]["fill_gap_mm2"] > gap_tolerance:
         return failed(
             "best outer-first gap {:.1f} exceeds {:.1f}".format(
@@ -4125,6 +5072,18 @@ def plan_rectangle_assembly(
             return fixed_plan
 
     mode = "tolerant" if _tolerant else "strict"
+    update_plan_debug(
+        stage=(
+            "tolerant_dfs"
+            if _tolerant
+            else "strict_dfs"
+        ),
+        depth=1,
+        states=1,
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
 
     def failed(reason, score=None, nodes=0, fill_gap=None):
         if (
@@ -4169,6 +5128,10 @@ def plan_rectangle_assembly(
             state["limit_hit"] = True
             return
         state["nodes"] += 1
+        update_plan_debug(
+            depth=len(placed_indices),
+            nodes=state["nodes"],
+        )
         _geometry_exitpoint(state["nodes"])
         depth = len(placed_indices)
         if depth == count:
@@ -4191,6 +5154,9 @@ def plan_rectangle_assembly(
                 best["polygons"] = [list(poly) for poly in candidate_polygons]
                 best["transforms"] = list(placed_transforms)
                 best["seams"] = [dict(seam) for seam in seam_stack]
+                update_plan_debug(
+                    best_score=best["score"],
+                )
             return
 
         unplaced = [i for i in range(count) if i not in placed_indices]
@@ -4365,7 +5331,24 @@ def match_piece_across_frames(previous, current):
     """Return ``(matches, cost)`` using shape, area, orientation, and distance."""
     previous_signature = polygon_shape_signature(previous.polygon_mm)
     current_signature = polygon_shape_signature(current.polygon_mm)
-    shape_cost = _signature_cost(previous_signature, current_signature)
+    vertex_count_delta = abs(
+        len(previous.polygon_mm) - len(current.polygon_mm)
+    )
+    if vertex_count_delta == 0:
+        shape_cost = _signature_cost(
+            previous_signature, current_signature
+        )
+    elif vertex_count_delta <= cfg.TRACK_MAX_VERTEX_COUNT_DELTA:
+        # Edge-by-edge signatures cannot be compared when one noisy corner was
+        # split or merged. Compactness, area and rectified-A4 position remain
+        # useful and do not require equal vertex counts.
+        shape_cost = (
+            abs(previous_signature[1] - current_signature[1])
+            + cfg.TRACK_VERTEX_MISMATCH_SHAPE_PENALTY
+            * vertex_count_delta
+        )
+    else:
+        shape_cost = 1e9
     area_scale = max(EPS, previous.area_mm2, current.area_mm2)
     area_cost = abs(previous.area_mm2 - current.area_mm2) / area_scale
     distance = _distance(previous.centroid_mm, current.centroid_mm)
@@ -4380,16 +5363,33 @@ def match_piece_across_frames(previous, current):
         period=angle_period,
     ) / 180.0
     cost = 0.55 * shape_cost + 0.20 * area_cost + 0.20 * distance_cost + 0.05 * angle_cost
+    mismatch_geometry_ok = (
+        vertex_count_delta == 0
+        or (
+            distance
+            <= cfg.TRACK_VERTEX_MISMATCH_MAX_DISTANCE_MM
+            and area_cost
+            <= cfg.TRACK_VERTEX_MISMATCH_MAX_AREA_RATIO
+        )
+    )
     matches = (
-        len(previous.polygon_mm) == len(current.polygon_mm)
+        vertex_count_delta <= cfg.TRACK_MAX_VERTEX_COUNT_DELTA
         and distance <= cfg.TRACK_MAX_DISTANCE_MM
+        and mismatch_geometry_ok
         and cost <= cfg.TRACK_SHAPE_COST_LIMIT
     )
     return matches, cost
 
 
 class _Track:
-    __slots__ = ("piece_id", "last", "history", "missed", "stable")
+    __slots__ = (
+        "piece_id",
+        "last",
+        "history",
+        "samples",
+        "missed",
+        "stable",
+    )
 
     def __init__(self, piece_id, observation):
         self.piece_id = piece_id
@@ -4397,19 +5397,91 @@ class _Track:
         self.history = [
             (observation.centroid_mm, observation.current_orientation_deg)
         ]
+        self.samples = [observation]
         self.missed = 0
         self.stable = False
+
+
+def _representative_track_observation(track):
+    """Choose a temporally supported polygon for planning and display."""
+    if not track.samples:
+        return track.last
+    counts = {}
+    for observation in track.samples:
+        vertex_count = len(observation.polygon_mm)
+        counts[vertex_count] = counts.get(vertex_count, 0) + 1
+    modal_count = min(
+        counts,
+        key=lambda value: (-counts[value], value),
+    )
+    candidates = [
+        observation
+        for observation in track.samples
+        if len(observation.polygon_mm) == modal_count
+    ]
+    areas = sorted(
+        observation.area_mm2 for observation in candidates
+    )
+    median_area = areas[len(areas) // 2]
+    candidates.sort(
+        key=lambda observation: (
+            abs(observation.area_mm2 - median_area),
+            -observation.confidence,
+        )
+    )
+    return candidates[0]
 
 
 class PieceTracker:
     """Maintain shape-aware stable IDs and per-piece motion state."""
 
-    def __init__(self):
+    def __init__(self, expected_count=None):
+        self.expected_count = (
+            None
+            if expected_count is None
+            else max(1, int(expected_count))
+        )
+        self.reset()
+
+    def reset(self, expected_count=None):
+        if expected_count is not None:
+            self.expected_count = max(1, int(expected_count))
         self.tracks = []
         self.next_id = 1
         self.last_count = None
 
     def _new_track(self, observation):
+        limit = (
+            self.expected_count
+            if self.expected_count is not None
+            else cfg.MAX_PIECE_COUNT
+        )
+        reusable = [
+            track
+            for track in self.tracks
+            if track.missed > cfg.TRACK_MAX_MISSED_FRAMES
+        ]
+        if reusable:
+            track = max(reusable, key=lambda item: item.missed)
+            observation.piece_id = track.piece_id
+            track.last = observation
+            track.history = [
+                (
+                    observation.centroid_mm,
+                    observation.current_orientation_deg,
+                )
+            ]
+            track.samples = [observation]
+            track.missed = 0
+            track.stable = False
+            return track
+        active_count = sum(
+            1
+            for track in self.tracks
+            if track.missed <= cfg.TRACK_MAX_MISSED_FRAMES
+        )
+        if active_count >= limit:
+            return None
         piece_id = "P{}".format(self.next_id)
         self.next_id += 1
         observation.piece_id = piece_id
@@ -4418,20 +5490,12 @@ class PieceTracker:
         return track
 
     def update(self, observations):
-        count_changed = (
-            self.last_count is not None
-            and self.last_count != len(observations)
-        )
         self.last_count = len(observations)
         active = [
             track
             for track in self.tracks
             if track.missed <= cfg.TRACK_MAX_MISSED_FRAMES
         ]
-        if count_changed:
-            for track in active:
-                track.history = []
-                track.stable = False
         candidates = []
         for track_index, track in enumerate(active):
             for obs_index, observation in enumerate(observations):
@@ -4453,9 +5517,8 @@ class PieceTracker:
         for track in active:
             if track not in [pair[0] for pair in assignments]:
                 track.missed += 1
-                track.stable = False
-                track.history = []
 
+        stable_representatives = {}
         for track, observation in assignments:
             observation.piece_id = track.piece_id
             moved = _distance(track.last.centroid_mm, observation.centroid_mm) > cfg.CENTER_STABLE_TOLERANCE_MM
@@ -4470,12 +5533,16 @@ class PieceTracker:
             ) > cfg.ANGLE_STABLE_TOLERANCE_DEG
             if moved or rotated:
                 track.history = []
+                track.samples = []
                 track.stable = False
             track.history.append(
                 (observation.centroid_mm, observation.current_orientation_deg)
             )
+            track.samples.append(observation)
             if len(track.history) > cfg.STABLE_WINDOW_FRAMES:
                 track.history.pop(0)
+            if len(track.samples) > cfg.STABLE_WINDOW_FRAMES:
+                track.samples.pop(0)
             track.last = observation
             track.missed = 0
 
@@ -4488,21 +5555,64 @@ class PieceTracker:
                     _angle_difference_deg(base_angle, sample[1], period=angle_period)
                     for sample in track.history
                 )
+                areas = sorted(
+                    sample.area_mm2 for sample in track.samples
+                )
+                median_area = areas[len(areas) // 2]
+                area_spread = max(
+                    abs(area - median_area)
+                    / max(EPS, median_area)
+                    for area in areas
+                )
                 track.stable = (
                     center_spread <= cfg.CENTER_STABLE_TOLERANCE_MM
                     and angle_spread <= cfg.ANGLE_STABLE_TOLERANCE_DEG
+                    and area_spread
+                    <= cfg.AREA_STABLE_TOLERANCE_RATIO
                 )
             observation.stable = track.stable
+            if track.stable:
+                representative = _representative_track_observation(
+                    track
+                )
+                representative.piece_id = track.piece_id
+                representative.stable = True
+                stable_representatives[track.piece_id] = (
+                    representative
+                )
 
         for obs_index, observation in enumerate(observations):
             if obs_index not in used_observations:
-                self._new_track(observation)
+                track = self._new_track(observation)
+                if track is not None:
+                    used_observations.add(obs_index)
 
-        observations.sort(key=lambda observation: int(observation.piece_id[1:]))
+        tracked_observations = [
+            observation
+            for observation in observations
+            if observation.piece_id
+        ]
+        for index, observation in enumerate(tracked_observations):
+            representative = stable_representatives.get(
+                observation.piece_id
+            )
+            if representative is not None:
+                tracked_observations[index] = representative
+        observations = tracked_observations
+        observations.sort(
+            key=lambda observation: int(observation.piece_id[1:])
+        )
+        count_ready = (
+            len(observations) == self.expected_count
+            if self.expected_count is not None
+            else (
+                cfg.MIN_PIECE_COUNT
+                <= len(observations)
+                <= cfg.MAX_PIECE_COUNT
+            )
+        )
         all_stable = (
-            not count_changed
-            and
-            cfg.MIN_PIECE_COUNT <= len(observations) <= cfg.MAX_PIECE_COUNT
+            count_ready
             and all(observation.stable for observation in observations)
         )
         return observations, all_stable
@@ -4771,18 +5881,35 @@ def _refine_vertices_with_lines(contour, polygon):
         return list(polygon)
     groups = [[] for _ in polygon]
     for point in contour:
-        nearest = min(
-            range(len(polygon)),
-            key=lambda index: _point_line_distance(
-                point,
-                polygon[index],
-                polygon[(index + 1) % len(polygon)],
-            ),
-        )
+        distances = [
+            (
+                _point_line_distance(
+                    point,
+                    polygon[index],
+                    polygon[(index + 1) % len(polygon)],
+                ),
+                index,
+            )
+            for index in range(len(polygon))
+        ]
+        distances.sort()
+        # A vertex belongs equally to two adjacent sides. Excluding numerical
+        # ties keeps the fitted lines independent of ring start/direction.
+        if (
+            len(distances) > 1
+            and abs(distances[0][0] - distances[1][0])
+            <= cfg.GEOMETRY_EPSILON_MM
+        ):
+            continue
+        nearest = distances[0][1]
         groups[nearest].append(point)
     lines = []
     for index, points in enumerate(groups):
-        fitted = _fit_line(points)
+        fitted = (
+            _fit_line(points)
+            if len(points) >= cfg.LINE_FIT_MIN_POINTS
+            else None
+        )
         if (
             fitted is None
             or fitted[2] > cfg.LINE_FIT_MAX_ERROR_MM
@@ -4803,7 +5930,7 @@ def _refine_vertices_with_lines(contour, polygon):
     result = []
     # Line fitting should reduce raster jitter, not move a hand-cut vertex by
     # several millimetres and thereby change the puzzle geometry.
-    maximum_shift = cfg.GEOMETRY_EPSILON_MM
+    maximum_shift = cfg.LINE_REFINE_MAX_SHIFT_MM
     for index, original in enumerate(polygon):
         point = _infinite_line_intersection(
             lines[(index - 1) % len(lines)],
@@ -4818,6 +5945,14 @@ def _refine_vertices_with_lines(contour, polygon):
             result.append(original)
         else:
             result.append(point)
+    original_area = polygon_area(polygon)
+    refined_area = polygon_area(result)
+    if (
+        original_area <= 1e-9
+        or abs(refined_area - original_area) / original_area
+        > cfg.LINE_REFINE_MAX_AREA_CHANGE_RATIO
+    ):
+        return list(polygon)
     return result
 
 
@@ -4848,6 +5983,8 @@ def _finalize_fitted_polygon(contour_mm, polygon):
         <= len(polygon)
         <= cfg.MAX_POLYGON_VERTICES
     ):
+        return None
+    if not polygon_is_simple(polygon):
         return None
     if min(edge_lengths(polygon)) <= cfg.GEOMETRY_EPSILON_MM:
         return None
@@ -5089,6 +6226,102 @@ def _pixel_is_white(gray_array, x, y, threshold):
     return int(gray_array[y][x]) >= threshold
 
 
+def estimate_background_gray(
+    gray_array,
+    roi,
+    sample_stride=4,
+    histogram_bins=64,
+):
+    """Estimate the dominant A4 background from a sparsely sampled ROI.
+
+    The physical lower half is empty during acquisition and remains mostly
+    background during placement. Median and the 60th percentile are therefore
+    robust to black divider pixels and to the target rectangle covering up to
+    roughly 36 percent of the lower A4 half.
+    """
+    array_height = int(gray_array.shape[0])
+    array_width = int(gray_array.shape[1])
+    x0 = max(0, int(roi[0]))
+    y0 = max(0, int(roi[1]))
+    x1 = min(
+        array_width, x0 + max(0, int(roi[2]))
+    )
+    y1 = min(
+        array_height, y0 + max(0, int(roi[3]))
+    )
+    stride = max(1, int(sample_stride))
+    bin_count = max(8, min(256, int(histogram_bins)))
+    counts = [0 for _ in range(bin_count)]
+    sums = [0 for _ in range(bin_count)]
+    sample_count = 0
+    for y in range(y0, y1, stride):
+        _vision_exitpoint(y - y0, interval=16)
+        row = gray_array[y]
+        for x in range(x0, x1, stride):
+            value = max(0, min(255, int(row[x])))
+            index = min(
+                bin_count - 1,
+                value * bin_count // 256,
+            )
+            counts[index] += 1
+            sums[index] += value
+            sample_count += 1
+
+    def percentile(fraction):
+        if sample_count <= 0:
+            return 0.0
+        target = max(
+            1, int(sample_count * fraction + 0.5)
+        )
+        cumulative = 0
+        for index, count in enumerate(counts):
+            cumulative += count
+            if cumulative >= target:
+                if count > 0:
+                    return float(sums[index]) / count
+                return (index + 0.5) * 256.0 / bin_count
+        return 255.0
+
+    background = percentile(0.50)
+    upper_background = percentile(0.60)
+    return {
+        "background_gray": background,
+        "background_high_gray": upper_background,
+        "background_spread_gray": max(
+            0.0, upper_background - background
+        ),
+        "sample_count": sample_count,
+        "roi": (x0, y0, x1 - x0, y1 - y0),
+    }
+
+
+def background_difference_threshold(
+    background_stats,
+    minimum_delta_gray,
+    noise_margin_gray,
+    maximum_delta_gray,
+):
+    """Convert a robust background estimate into a bright-piece threshold."""
+    background = float(
+        background_stats.get("background_gray", 0.0)
+    )
+    spread = max(
+        0.0,
+        float(
+            background_stats.get(
+                "background_spread_gray", 0.0
+            )
+        ),
+    )
+    delta = max(
+        float(minimum_delta_gray),
+        spread + float(noise_margin_gray),
+    )
+    delta = min(float(maximum_delta_gray), delta)
+    threshold = int(background + delta + 0.5)
+    return max(0, min(250, threshold))
+
+
 def trace_ordered_boundary(
     gray_array,
     rect,
@@ -5259,13 +6492,40 @@ def _nearest_white_pixel(
     return best
 
 
+class _ComponentMaskRow:
+    __slots__ = ("data", "offset")
+
+    def __init__(self, data, offset):
+        self.data = data
+        self.offset = int(offset)
+
+    def __getitem__(self, x):
+        return self.data[self.offset + int(x)]
+
+
+class _ComponentMask:
+    """Minimal 2-D bytearray view accepted by trace_ordered_boundary."""
+
+    __slots__ = ("data", "shape", "width")
+
+    def __init__(self, data, width, height):
+        self.data = data
+        self.width = int(width)
+        self.shape = (int(height), int(width))
+
+    def __getitem__(self, y):
+        return _ComponentMaskRow(
+            self.data, int(y) * self.width
+        )
+
+
 def _component_boundary(
     gray_array,
     rect,
     center,
     threshold,
 ):
-    """Flood one thresholded component and return only its boundary pixels."""
+    """Flood-isolate one component, then Moore-trace its ordered boundary."""
     array_height = int(gray_array.shape[0])
     array_width = int(gray_array.shape[1])
     x0 = max(0, int(rect[0]))
@@ -5274,8 +6534,16 @@ def _component_boundary(
     y1 = min(array_height, y0 + max(1, int(rect[3])))
     width = x1 - x0
     height = y1 - y0
+    diagnostics = {
+        "ok": False,
+        "reason": "",
+        "pixel_reads": 0,
+        "boundary_steps": 0,
+        "component_pixels": 0,
+    }
     if width <= 0 or height <= 0:
-        return []
+        diagnostics["reason"] = "fallback_empty_bbox"
+        return [], diagnostics
 
     seed = _nearest_white_pixel(
         gray_array,
@@ -5288,7 +6556,8 @@ def _component_boundary(
         threshold,
     )
     if seed is None:
-        return []
+        diagnostics["reason"] = "fallback_no_seed"
+        return [], diagnostics
 
     # One byte per bounding-box pixel is predictable and much smaller than a
     # Python set of coordinate tuples on MicroPython.
@@ -5296,7 +6565,6 @@ def _component_boundary(
     seed_index = (seed[1] - y0) * width + (seed[0] - x0)
     visited[seed_index] = 1
     stack = [seed_index]
-    boundary = []
     neighbor_offsets = (
         (-1, -1),
         (0, -1),
@@ -5319,8 +6587,8 @@ def _component_boundary(
         y = y0 + local_y
         if not _pixel_is_white(gray_array, x, y, threshold):
             continue
+        diagnostics["component_pixels"] += 1
 
-        is_boundary = False
         for dx, dy in neighbor_offsets:
             nx = x + dx
             ny = y + dy
@@ -5333,15 +6601,31 @@ def _component_boundary(
                     gray_array, nx, ny, threshold
                 )
             ):
-                is_boundary = True
                 continue
             neighbor_index = (ny - y0) * width + (nx - x0)
             if not visited[neighbor_index]:
                 visited[neighbor_index] = 1
                 stack.append(neighbor_index)
-        if is_boundary:
-            boundary.append((float(x), float(y)))
-    return boundary
+    local_mask = _ComponentMask(visited, width, height)
+    boundary, trace = trace_ordered_boundary(
+        local_mask,
+        (0, 0, width, height),
+        1,
+    )
+    diagnostics["ok"] = bool(trace["ok"])
+    diagnostics["reason"] = (
+        "fallback_ok"
+        if trace["ok"]
+        else "fallback_{}".format(trace["reason"])
+    )
+    diagnostics["pixel_reads"] = trace["pixel_reads"]
+    diagnostics["boundary_steps"] = trace["boundary_steps"]
+    if not trace["ok"]:
+        return [], diagnostics
+    return [
+        (point[0] + x0, point[1] + y0)
+        for point in boundary
+    ], diagnostics
 
 
 def _cross(origin, a, b):
@@ -5442,6 +6726,16 @@ def _extract_canmv_polygon(
     boundary_px, trace_diagnostics = trace_ordered_boundary(
         gray_array, rect, threshold
     )
+    trace_diagnostics["boundary_primary_ok"] = bool(
+        trace_diagnostics["ok"]
+    )
+    trace_diagnostics["boundary_fallback_used"] = False
+    trace_diagnostics["boundary_fallback_ordered_ok"] = False
+    trace_diagnostics["boundary_failure_reason"] = (
+        ""
+        if trace_diagnostics["ok"]
+        else trace_diagnostics["reason"]
+    )
     if (
         not trace_diagnostics["ok"]
         or len(boundary_px) < cfg.BOUNDARY_TRACE_MIN_POINTS
@@ -5451,15 +6745,41 @@ def _extract_canmv_polygon(
                 "contour_ms", contour_started
             )
             return None, boundary_px, trace_diagnostics
-        boundary_px = _component_boundary(
+        boundary_px, fallback_diagnostics = _component_boundary(
             gray_array, rect, center, threshold
         )
         trace_diagnostics["fallback"] = True
+        trace_diagnostics["boundary_fallback_used"] = True
+        trace_diagnostics["boundary_fallback_ordered_ok"] = bool(
+            fallback_diagnostics["ok"]
+        )
+        trace_diagnostics["ok"] = bool(
+            fallback_diagnostics["ok"]
+        )
+        trace_diagnostics["reason"] = fallback_diagnostics["reason"]
+        trace_diagnostics["boundary_failure_reason"] = (
+            ""
+            if fallback_diagnostics["ok"]
+            else fallback_diagnostics["reason"]
+        )
+        trace_diagnostics["pixel_reads"] += fallback_diagnostics[
+            "pixel_reads"
+        ]
+        trace_diagnostics["boundary_steps"] += fallback_diagnostics[
+            "boundary_steps"
+        ]
         PERF_STATS.increment("boundary_fallback_count")
     else:
         trace_diagnostics["fallback"] = False
     PERF_STATS.add_stage("contour_ms", contour_started)
-    if len(boundary_px) < cfg.MIN_POLYGON_VERTICES:
+    if (
+        not trace_diagnostics["ok"]
+        or len(boundary_px) < cfg.MIN_POLYGON_VERTICES
+    ):
+        if not trace_diagnostics["boundary_failure_reason"]:
+            trace_diagnostics["boundary_failure_reason"] = (
+                "ordered_boundary_too_short"
+            )
         return None, boundary_px, trace_diagnostics
 
     fit_started = PERF_STATS.mark()
@@ -5495,6 +6815,7 @@ def detect_pieces_from_canmv_image(
     source_frame_size,
     region="upper",
     threshold=None,
+    divider_y_mm=None,
 ):
     """Detect pieces with CanMV v1.6 native image APIs, without ``cv2``.
 
@@ -5510,12 +6831,6 @@ def detect_pieces_from_canmv_image(
         raise ValueError("invalid CanMV work image size")
     if source_width < 2 or source_height < 2:
         raise ValueError("invalid source frame size")
-    piece_threshold = (
-        int(cfg.WHITE_GRAY_THRESHOLD)
-        if threshold is None
-        else max(0, min(255, int(threshold)))
-    )
-
     scale_x = float(work_width - 1) / float(source_width - 1)
     scale_y = float(work_height - 1) / float(source_height - 1)
     work_corners = [
@@ -5531,8 +6846,16 @@ def detect_pieces_from_canmv_image(
 
     pixels_per_mm_x = float(work_width - 1) / cfg.A4_WIDTH_MM
     pixels_per_mm_y = float(work_height - 1) / cfg.A4_HEIGHT_MM
+    active_divider_y_mm = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else max(
+            0.0,
+            min(cfg.A4_HEIGHT_MM, float(divider_y_mm)),
+        )
+    )
     nominal_divider = int(
-        cfg.DIVIDER_Y_MM * pixels_per_mm_y + 0.5
+        active_divider_y_mm * pixels_per_mm_y + 0.5
     )
     upper_end = max(
         2,
@@ -5551,6 +6874,69 @@ def detect_pieces_from_canmv_image(
         1,
         int(cfg.DETECTION_BORDER_MARGIN_MM * pixels_per_mm_y + 0.5),
     )
+    gray_array = gray_image.to_numpy_ref()
+    segmentation_mode = getattr(
+        cfg, "PIECE_SEGMENTATION_MODE", "fixed"
+    )
+    background_stats = {
+        "background_gray": 0.0,
+        "background_high_gray": 0.0,
+        "background_spread_gray": 0.0,
+        "sample_count": 0,
+        "roi": (0, 0, 0, 0),
+    }
+    if segmentation_mode == "background_delta":
+        calibration_start = min(
+            work_height - margin_y,
+            lower_start + margin_y,
+        )
+        background_stats = estimate_background_gray(
+            gray_array,
+            (
+                margin_x,
+                calibration_start,
+                max(1, work_width - 2 * margin_x),
+                max(
+                    1,
+                    work_height
+                    - margin_y
+                    - calibration_start,
+                ),
+            ),
+            sample_stride=cfg.PIECE_BACKGROUND_SAMPLE_STRIDE,
+            histogram_bins=(
+                cfg.PIECE_BACKGROUND_HISTOGRAM_BINS
+            ),
+        )
+    if (
+        threshold is None
+        and segmentation_mode == "background_delta"
+        and background_stats["sample_count"]
+        >= cfg.PIECE_BACKGROUND_MIN_SAMPLES
+    ):
+        piece_threshold = background_difference_threshold(
+            background_stats,
+            cfg.PIECE_BACKGROUND_DELTA_GRAY,
+            cfg.PIECE_BACKGROUND_NOISE_MARGIN_GRAY,
+            cfg.PIECE_BACKGROUND_MAX_DELTA_GRAY,
+        )
+        threshold_mode = "background_delta"
+    elif threshold is None:
+        piece_threshold = int(cfg.WHITE_GRAY_THRESHOLD)
+        threshold_mode = (
+            "background_delta_fallback"
+            if segmentation_mode == "background_delta"
+            else "fixed_native"
+        )
+    else:
+        piece_threshold = max(
+            0, min(255, int(threshold))
+        )
+        threshold_mode = (
+            "background_delta_override"
+            if segmentation_mode == "background_delta"
+            else "fixed_native"
+        )
     if region == "upper":
         detection_regions = [(margin_y, upper_end)]
     elif region == "lower":
@@ -5600,7 +6986,6 @@ def detect_pieces_from_canmv_image(
                 (blob, region_start, region_end)
             )
     PERF_STATS.add_stage("blob_ms", blob_started)
-    gray_array = gray_image.to_numpy_ref()
     observations = []
     rejected = {
         "area": 0,
@@ -5610,6 +6995,9 @@ def detect_pieces_from_canmv_image(
     boundary_steps = 0
     pixel_reads = 0
     fallback_count = 0
+    primary_boundary_ok_count = 0
+    ordered_fallback_ok_count = 0
+    boundary_failure_reasons = {}
     trace_failures = {}
     for blob, region_start, region_end in blob_regions:
         rect = tuple(_blob_value(blob, "rect", None))
@@ -5636,16 +7024,29 @@ def detect_pieces_from_canmv_image(
                 gray_array,
                 blob,
                 piece_threshold,
-            pixels_per_mm_x,
-            pixels_per_mm_y,
+                pixels_per_mm_x,
+                pixels_per_mm_y,
             )
         )
         boundary_steps += trace_diagnostics.get(
             "boundary_steps", 0
         )
         pixel_reads += trace_diagnostics.get("pixel_reads", 0)
+        if trace_diagnostics.get("boundary_primary_ok", False):
+            primary_boundary_ok_count += 1
         if trace_diagnostics.get("fallback", False):
             fallback_count += 1
+        if trace_diagnostics.get(
+            "boundary_fallback_ordered_ok", False
+        ):
+            ordered_fallback_ok_count += 1
+        failure_reason = trace_diagnostics.get(
+            "boundary_failure_reason", ""
+        )
+        if failure_reason:
+            boundary_failure_reasons[failure_reason] = (
+                boundary_failure_reasons.get(failure_reason, 0) + 1
+            )
         if not trace_diagnostics.get("ok", False):
             reason = trace_diagnostics.get("reason", "unknown")
             trace_failures[reason] = (
@@ -5653,6 +7054,10 @@ def detect_pieces_from_canmv_image(
             )
         if polygon_mm is None:
             rejected["polygon"] += 1
+            if trace_diagnostics.get("ok", False):
+                trace_failures["fit_invalid"] = (
+                    trace_failures.get("fit_invalid", 0) + 1
+                )
             continue
         polygon_area_mm2 = polygon_area(polygon_mm)
         hull_pixels = max(
@@ -5668,8 +7073,8 @@ def detect_pieces_from_canmv_image(
             0.0,
             min(1.0, 0.60 * convexity + 0.40),
         )
-        observations.append(
-            PieceObservation(
+        try:
+            observation = PieceObservation(
                 "",
                 boundary_px,
                 polygon_mm,
@@ -5677,18 +7082,46 @@ def detect_pieces_from_canmv_image(
                 area_mm2=polygon_area_mm2,
                 confidence=confidence,
             )
-        )
+        except ValueError:
+            rejected["polygon"] += 1
+            trace_failures["piece_invalid"] = (
+                trace_failures.get("piece_invalid", 0) + 1
+            )
+            continue
+        observations.append(observation)
 
     observations.sort(key=lambda piece: piece.area_mm2, reverse=True)
     if len(observations) > cfg.MAX_PIECE_COUNT:
         observations = observations[: cfg.MAX_PIECE_COUNT]
+    detected_vertex_counts = [
+        len(piece.polygon_mm) for piece in observations
+    ]
     diagnostics = {
         "rectified": gray_image,
         "mask": None,
-        "divider_y_mm": cfg.DIVIDER_Y_MM,
-        "divider_detected": False,
+        "divider_y_mm": active_divider_y_mm,
+        "divider_detected": divider_y_mm is not None,
         "threshold": float(piece_threshold),
-        "threshold_mode": "fixed_native",
+        "threshold_mode": threshold_mode,
+        "segmentation_mode": segmentation_mode,
+        "background_gray": background_stats[
+            "background_gray"
+        ],
+        "background_high_gray": background_stats[
+            "background_high_gray"
+        ],
+        "background_spread_gray": background_stats[
+            "background_spread_gray"
+        ],
+        "background_sample_count": background_stats[
+            "sample_count"
+        ],
+        "threshold_delta_gray": (
+            float(piece_threshold)
+            - background_stats["background_gray"]
+            if background_stats["sample_count"] > 0
+            else 0.0
+        ),
         "raw_contours": len(blob_regions),
         "rejected": rejected,
         "detection_end_row": upper_end,
@@ -5699,7 +7132,14 @@ def detect_pieces_from_canmv_image(
         "boundary_steps": boundary_steps,
         "pixel_reads": pixel_reads,
         "boundary_fallback_count": fallback_count,
+        "boundary_primary_ok": primary_boundary_ok_count,
+        "boundary_fallback_used": fallback_count,
+        "boundary_fallback_ordered_ok": (
+            ordered_fallback_ok_count
+        ),
+        "boundary_failure_reason": boundary_failure_reasons,
         "trace_failures": trace_failures,
+        "detected_vertex_counts": detected_vertex_counts,
     }
     return observations, diagnostics
 
@@ -5898,6 +7338,77 @@ def _quad_point(corners, u, v):
     )
 
 
+def _unit_square_transform(corners):
+    """Return a projective unit-square-to-quadrilateral transform."""
+    x0, y0 = corners[0]
+    x1, y1 = corners[1]
+    x2, y2 = corners[2]
+    x3, y3 = corners[3]
+    dx1 = x1 - x2
+    dx2 = x3 - x2
+    dy1 = y1 - y2
+    dy2 = y3 - y2
+    projective_x = x0 - x1 + x2 - x3
+    projective_y = y0 - y1 + y2 - y3
+    if (
+        abs(projective_x) <= 1e-9
+        and abs(projective_y) <= 1e-9
+    ):
+        g = 0.0
+        h = 0.0
+    else:
+        denominator = dx1 * dy2 - dx2 * dy1
+        if abs(denominator) <= 1e-9:
+            return None
+        g = (
+            projective_x * dy2
+            - dx2 * projective_y
+        ) / denominator
+        h = (
+            dx1 * projective_y
+            - projective_x * dy1
+        ) / denominator
+    return (
+        x1 - x0 + g * x1,
+        x3 - x0 + h * x3,
+        x0,
+        y1 - y0 + g * y1,
+        y3 - y0 + h * y3,
+        y0,
+        g,
+        h,
+    )
+
+
+def _projective_point(transform, u, v):
+    denominator = (
+        transform[6] * u + transform[7] * v + 1.0
+    )
+    if abs(denominator) <= 1e-9:
+        return None
+    return (
+        (
+            transform[0] * u
+            + transform[1] * v
+            + transform[2]
+        )
+        / denominator,
+        (
+            transform[3] * u
+            + transform[4] * v
+            + transform[5]
+        )
+        / denominator,
+    )
+
+
+def _projective_quad_point(corners, u, v):
+    transform = _unit_square_transform(corners)
+    if transform is None:
+        return None
+    return _projective_point(transform, u, v)
+
+
 def _inside_gray(gray_image, corners):
     values = []
     for v in (0.18, 0.36, 0.64, 0.82):
@@ -5919,6 +7430,313 @@ def _inside_gray(gray_image, corners):
     # Median resists white fragments and the horizontal divider.
     middle = len(values) // 2
     return 0.5 * (values[middle - 1] + values[middle])
+
+
+def _gray_at(gray_image, x, y):
+    value = gray_image.get_pixel(int(round(x)), int(round(y)))
+    if isinstance(value, tuple):
+        value = value[0]
+    return float(value)
+
+
+def _median(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return 0.5 * (
+        float(ordered[middle - 1])
+        + float(ordered[middle])
+    )
+
+
+def _divider_line_probe(gray_image, corners, inside_gray):
+    """Estimate divider v(u) inside one physically ordered A4 candidate."""
+    nominal_fraction = (
+        cfg.DIVIDER_Y_MM / cfg.A4_HEIGHT_MM
+    )
+    result = {
+        "detected": False,
+        "line_found": False,
+        "reject_reason": "",
+        "center_fraction": nominal_fraction,
+        "left_fraction": nominal_fraction,
+        "right_fraction": nominal_fraction,
+        "divider_y_mm": cfg.DIVIDER_Y_MM,
+        "slope_mm": 0.0,
+        "coverage": 0.0,
+        "residual_px": 0.0,
+        "confidence": 0.0,
+    }
+    if not cfg.ENABLE_DYNAMIC_DIVIDER:
+        return result
+    transform = _unit_square_transform(corners)
+    if transform is None:
+        result["reject_reason"] = "projective_transform"
+        return result
+    side_pixels = 0.5 * (
+        _distance(corners[0], corners[3])
+        + _distance(corners[1], corners[2])
+    )
+    if side_pixels <= 4.0:
+        return result
+    pixel_fraction = 1.0 / side_pixels
+    half_range_fraction = (
+        cfg.DIVIDER_SEARCH_HALF_RANGE_MM
+        / cfg.A4_HEIGHT_MM
+    )
+    scan_steps = max(
+        2,
+        int(
+            half_range_fraction
+            / pixel_fraction
+            + 0.5
+        ),
+    )
+    sample_count = max(
+        7, int(cfg.DIVIDER_LINE_SAMPLE_COUNT)
+    )
+    minimum_bright_gray = max(
+        float(cfg.DIVIDER_LINE_MIN_GRAY),
+        float(inside_gray)
+        + float(cfg.DIVIDER_LINE_MIN_CONTRAST_GRAY),
+    )
+    samples = []
+    for index in range(sample_count):
+        u = 0.06 + 0.88 * index / max(
+            1, sample_count - 1
+        )
+        best_value = -1.0
+        scan_values = []
+        for offset in range(-scan_steps, scan_steps + 1):
+            fraction = (
+                nominal_fraction
+                + offset * pixel_fraction
+            )
+            if fraction <= 0.0 or fraction >= 1.0:
+                continue
+            point = _projective_point(transform, u, fraction)
+            if point is None:
+                continue
+            value = _gray_at(
+                gray_image, point[0], point[1]
+            )
+            scan_values.append((fraction, value))
+            best_value = max(best_value, value)
+        if best_value >= minimum_bright_gray:
+            # Use the centre of a multi-pixel painted/taped line rather than
+            # whichever bright edge happened to be visited first.
+            peak_fractions = [
+                item[0]
+                for item in scan_values
+                if item[1] >= max(
+                    minimum_bright_gray,
+                    best_value - 5.0,
+                )
+            ]
+            best_fraction = _median(peak_fractions)
+            samples.append((u, best_fraction))
+
+    minimum_hits = max(
+        5,
+        int(
+            sample_count
+            * cfg.DIVIDER_LINE_MIN_COVERAGE
+            + 0.5
+        ),
+    )
+    if len(samples) < minimum_hits:
+        result["reject_reason"] = "coverage"
+        return result
+    left = [item for item in samples if item[0] <= 0.35]
+    right = [item for item in samples if item[0] >= 0.65]
+    if len(left) < 2 or len(right) < 2:
+        result["reject_reason"] = "span"
+        return result
+    left_u = _median([item[0] for item in left])
+    right_u = _median([item[0] for item in right])
+    if right_u - left_u <= 0.2:
+        result["reject_reason"] = "span"
+        return result
+    left_v = _median([item[1] for item in left])
+    right_v = _median([item[1] for item in right])
+    slope = (right_v - left_v) / (right_u - left_u)
+    intercept = _median(
+        [item[1] - slope * item[0] for item in samples]
+    )
+    inliers = [
+        item
+        for item in samples
+        if abs(
+            item[1] - (intercept + slope * item[0])
+        )
+        * side_pixels
+        <= cfg.DIVIDER_LINE_MAX_RESIDUAL_PX
+    ]
+    if len(inliers) < minimum_hits:
+        result["reject_reason"] = "residual"
+        return result
+
+    # One least-squares refinement after the robust median initialization.
+    mean_u = sum(item[0] for item in inliers) / len(inliers)
+    mean_v = sum(item[1] for item in inliers) / len(inliers)
+    denominator = sum(
+        (item[0] - mean_u) * (item[0] - mean_u)
+        for item in inliers
+    )
+    if denominator > 1e-9:
+        slope = sum(
+            (item[0] - mean_u) * (item[1] - mean_v)
+            for item in inliers
+        ) / denominator
+    intercept = mean_v - slope * mean_u
+    residual_px = sum(
+        abs(item[1] - (intercept + slope * item[0]))
+        * side_pixels
+        for item in inliers
+    ) / len(inliers)
+    center_fraction = intercept + 0.5 * slope
+    if (
+        abs(center_fraction - nominal_fraction)
+        > half_range_fraction + 2.0 * pixel_fraction
+    ):
+        result["reject_reason"] = "position"
+        return result
+    left_fraction = intercept
+    right_fraction = intercept + slope
+    coverage = float(len(inliers)) / sample_count
+    residual_quality = max(
+        0.0,
+        1.0
+        - residual_px
+        / max(0.1, cfg.DIVIDER_LINE_MAX_RESIDUAL_PX),
+    )
+    slope_mm = (
+        (right_fraction - left_fraction)
+        * cfg.A4_HEIGHT_MM
+    )
+    result.update(
+        {
+            "line_found": True,
+            "center_fraction": center_fraction,
+            "left_fraction": left_fraction,
+            "right_fraction": right_fraction,
+            "divider_y_mm": (
+                center_fraction * cfg.A4_HEIGHT_MM
+            ),
+            "slope_mm": slope_mm,
+            "coverage": coverage,
+            "residual_px": residual_px,
+            "confidence": coverage * residual_quality,
+        }
+    )
+    if abs(slope_mm) > cfg.DIVIDER_LINE_MAX_SLOPE_MM:
+        result["reject_reason"] = "slope"
+        return result
+    result["detected"] = True
+    return result
+
+
+def _internal_edge_probe(gray_image, corners):
+    """Return evidence that a proposed edge lies inside the A4 surface.
+
+    A half of a landscape A4 cut by the physical divider has the same aspect
+    ratio as a complete A4 rotated by 90 degrees.  Geometry therefore cannot
+    reject it.  Probe symmetric points on both sides of every candidate edge:
+    if both sides repeatedly contain the same dark paper tone, that edge is an
+    internal divider rather than the outside paper boundary.
+    """
+    center_x = sum(point[0] for point in corners) * 0.25
+    center_y = sum(point[1] for point in corners) * 0.25
+    sample_count = max(1, int(cfg.A4_EDGE_PROBE_SAMPLES))
+    offset = float(cfg.A4_EDGE_PROBE_OFFSET_PX)
+    ratios = []
+    sample_counts = []
+    for edge_index, start in enumerate(corners):
+        end = corners[(edge_index + 1) % len(corners)]
+        dx = float(end[0]) - float(start[0])
+        dy = float(end[1]) - float(start[1])
+        length = math.sqrt(dx * dx + dy * dy)
+        if length <= 1.0:
+            ratios.append(0.0)
+            sample_counts.append(0)
+            continue
+
+        normal_x = -dy / length
+        normal_y = dx / length
+        midpoint_x = 0.5 * (float(start[0]) + float(end[0]))
+        midpoint_y = 0.5 * (float(start[1]) + float(end[1]))
+        # Select the normal pointing away from the quadrilateral centre.
+        if (
+            normal_x * (center_x - midpoint_x)
+            + normal_y * (center_y - midpoint_y)
+            > 0.0
+        ):
+            normal_x = -normal_x
+            normal_y = -normal_y
+
+        paper_samples = 0
+        same_surface_samples = 0
+        for sample_index in range(sample_count):
+            fraction = float(sample_index + 1) / float(
+                sample_count + 1
+            )
+            edge_x = float(start[0]) + fraction * dx
+            edge_y = float(start[1]) + fraction * dy
+            outside_x = edge_x + offset * normal_x
+            outside_y = edge_y + offset * normal_y
+            inside_x = edge_x - offset * normal_x
+            inside_y = edge_y - offset * normal_y
+            if (
+                outside_x < 0.0
+                or outside_y < 0.0
+                or outside_x > gray_image.width() - 1
+                or outside_y > gray_image.height() - 1
+                or inside_x < 0.0
+                or inside_y < 0.0
+                or inside_x > gray_image.width() - 1
+                or inside_y > gray_image.height() - 1
+            ):
+                continue
+            inside_gray = _gray_at(gray_image, inside_x, inside_y)
+            outside_gray = _gray_at(
+                gray_image, outside_x, outside_y
+            )
+            if inside_gray > cfg.A4_MAX_INSIDE_GRAY:
+                continue
+            paper_samples += 1
+            if (
+                outside_gray <= cfg.A4_MAX_INSIDE_GRAY
+                and abs(outside_gray - inside_gray)
+                <= cfg.A4_INTERNAL_EDGE_SIMILAR_GRAY_DELTA
+            ):
+                same_surface_samples += 1
+
+        sample_counts.append(paper_samples)
+        if paper_samples:
+            ratios.append(
+                float(same_surface_samples) / float(paper_samples)
+            )
+        else:
+            ratios.append(0.0)
+
+    internal_edges = [
+        edge_index
+        for edge_index, ratio in enumerate(ratios)
+        if (
+            sample_counts[edge_index]
+            >= cfg.A4_INTERNAL_EDGE_MIN_SAMPLES
+            and ratio >= cfg.A4_INTERNAL_EDGE_DARK_RATIO_MAX
+        )
+    ]
+    return {
+        "internal": bool(internal_edges),
+        "edge_ratios": ratios,
+        "edge_sample_counts": sample_counts,
+        "internal_edge_indices": internal_edges,
+    }
 
 
 def _count_bright_samples(gray_image, corners, side):
@@ -6079,6 +7897,29 @@ def _score_candidate(
     physical_corners, orientation = _physical_corner_order(
         gray_image, corners, ratio
     )
+    divider = _divider_line_probe(
+        gray_image, physical_corners, inside_gray
+    )
+    edge_probe = _internal_edge_probe(gray_image, corners)
+    if edge_probe["internal"] and not divider["detected"]:
+        return _reject(diagnostics, "internal_edge")
+    if edge_probe["internal"]:
+        # A slightly inset min_corners/find_rects edge can leave dark paper on
+        # both sides and look internal.  A continuous centre divider across
+        # the configured coverage is stronger evidence that this is the full
+        # A4 sheet.  A divider-generated half-sheet has no second centre line,
+        # so it still fails closed above.
+        diagnostics["divider_rescued_internal_edge"] = (
+            diagnostics.get("divider_rescued_internal_edge", 0) + 1
+        )
+    if cfg.A4_REQUIRE_DIVIDER_FOR_LOCK and not divider["detected"]:
+        reason = (
+            "divider_slope"
+            if divider.get("line_found", False)
+            else "divider"
+        )
+        return _reject(diagnostics, reason)
+    physical_corners = list(physical_corners)
     darkness_loss = inside_gray / 255.0
     magnitude_bonus = min(0.20, float(magnitude) / 80000.0)
     source_penalty = 0.0 if source == "rect" else 0.07
@@ -6099,9 +7940,19 @@ def _score_candidate(
         "area_ratio": area_ratio,
         "aspect_ratio": ratio,
         "inside_gray": inside_gray,
+        "edge_outside_dark_ratios": edge_probe["edge_ratios"],
+        "edge_probe_sample_counts": edge_probe[
+            "edge_sample_counts"
+        ],
         "source": source,
         "magnitude": float(magnitude),
         "orientation": orientation,
+        "divider_detected": divider["detected"],
+        "divider_y_mm": divider["divider_y_mm"],
+        "divider_slope_mm": divider["slope_mm"],
+        "divider_coverage": divider["coverage"],
+        "divider_residual_px": divider["residual_px"],
+        "divider_confidence": divider["confidence"],
     }
 
 
@@ -6148,11 +7999,22 @@ def _dark_blob_candidates(gray_image, diagnostics):
         )
         diagnostics["raw_dark_blobs"] = len(blobs)
         for blob in blobs:
+            contour_corners = getattr(blob, "corners", None)
+            if contour_corners is None:
+                raw_corners = blob.min_corners()
+                blob_source = "dark_blob_min_box"
+            else:
+                raw_corners = (
+                    contour_corners()
+                    if callable(contour_corners)
+                    else contour_corners
+                )
+                blob_source = "dark_blob_contour"
             candidate = _score_candidate(
                 gray_image,
-                blob.min_corners(),
+                raw_corners,
                 float(blob.pixels()),
-                "dark_blob",
+                blob_source,
                 diagnostics,
             )
             if candidate is not None:
@@ -6172,6 +8034,7 @@ def detect_a4_boundary(gray_image, source_frame_size):
         "rect_error": "",
         "blob_error": "",
         "valid_candidates": 0,
+        "divider_rescued_internal_edge": 0,
         "rejected": {},
     }
     candidates = _rect_candidates(gray_image, diagnostics)
@@ -6201,7 +8064,7 @@ def detect_a4_boundary(gray_image, source_frame_size):
 
 
 class A4BoundaryTracker:
-    """Adaptive smoothing that follows motion but suppresses edge jitter."""
+    """Confirm the initial A4 boundary, then retain an immutable calibration."""
 
     def __init__(self):
         self.corners_px = None
@@ -6212,8 +8075,16 @@ class A4BoundaryTracker:
         self.missed_frames = 0
         self.motion_px = 0.0
         self.locked = False
+        self.frozen = False
+        self.relock_confirm_count = 0
+        self.divider_y_mm = cfg.DIVIDER_Y_MM
+        self.divider_slope_mm = 0.0
+        self.divider_confidence = 0.0
+        self.divider_detected = False
 
     def update(self, candidate):
+        if self.frozen:
+            return self.state()
         if candidate is None:
             self.missed_frames += 1
             # Lock acquisition requires truly consecutive valid frames.
@@ -6225,6 +8096,11 @@ class A4BoundaryTracker:
                 self.source = ""
                 self.orientation = ""
                 self.motion_px = 0.0
+                self.relock_confirm_count = 0
+                self.divider_y_mm = cfg.DIVIDER_Y_MM
+                self.divider_slope_mm = 0.0
+                self.divider_confidence = 0.0
+                self.divider_detected = False
             elif self.missed_frames > cfg.A4_HOLD_MISSED_FRAMES:
                 self.corners_px = None
                 self.valid_frames = 0
@@ -6233,9 +8109,18 @@ class A4BoundaryTracker:
                 self.source = ""
                 self.orientation = ""
                 self.motion_px = 0.0
+                self.relock_confirm_count = 0
+                self.divider_y_mm = cfg.DIVIDER_Y_MM
+                self.divider_slope_mm = 0.0
+                self.divider_confidence = 0.0
+                self.divider_detected = False
             return self.state()
 
         detected = candidate["corners_px"]
+        divider_calibration_acquired = (
+            candidate.get("divider_detected", False)
+            and not self.divider_detected
+        )
         self.missed_frames = 0
         if self.corners_px is None:
             self.corners_px = [
@@ -6244,6 +8129,7 @@ class A4BoundaryTracker:
             ]
             self.motion_px = 0.0
             self.valid_frames = 1
+            self.relock_confirm_count = 0
         else:
             distances = [
                 _distance(current, observed)
@@ -6252,18 +8138,18 @@ class A4BoundaryTracker:
                 )
             ]
             self.motion_px = max(distances)
-            if self.motion_px > cfg.A4_RESET_MOTION_PX:
-                self.corners_px = [
-                    (float(point[0]), float(point[1]))
-                    for point in detected
-                ]
-                self.valid_frames = 1
-            else:
-                alpha = (
-                    cfg.A4_FAST_SMOOTH_ALPHA
-                    if self.motion_px >= cfg.A4_FAST_MOTION_PX
-                    else cfg.A4_SLOW_SMOOTH_ALPHA
-                )
+            if self.motion_px <= cfg.A4_LOCK_DEADBAND_PX:
+                # A fixed camera/A4 should not feed sub-deadband jitter into
+                # every later perspective transform.
+                if divider_calibration_acquired:
+                    self.corners_px = [
+                        (float(point[0]), float(point[1]))
+                        for point in detected
+                    ]
+                self.valid_frames += 1
+                self.relock_confirm_count = 0
+            elif self.motion_px <= cfg.A4_RELOCK_MOTION_PX:
+                alpha = cfg.A4_SLOW_SMOOTH_ALPHA
                 self.corners_px = [
                     (
                         current[0]
@@ -6276,25 +8162,76 @@ class A4BoundaryTracker:
                     )
                 ]
                 self.valid_frames += 1
+                self.relock_confirm_count = 0
+            else:
+                self.relock_confirm_count += 1
+            if (
+                self.motion_px > cfg.A4_RELOCK_MOTION_PX
+                and self.relock_confirm_count
+                >= cfg.A4_RELOCK_CONFIRM_FRAMES
+            ):
+                self.corners_px = [
+                    (float(point[0]), float(point[1]))
+                    for point in detected
+                ]
+                self.valid_frames = 1
+                self.relock_confirm_count = 0
 
         self.confidence = candidate["confidence"]
         self.source = candidate["source"]
         self.orientation = candidate.get("orientation", "")
+        if candidate.get("divider_detected", False):
+            observed_divider = candidate.get(
+                "divider_y_mm", cfg.DIVIDER_Y_MM
+            )
+            observed_slope = candidate.get(
+                "divider_slope_mm", 0.0
+            )
+            alpha = (
+                1.0
+                if not self.divider_detected
+                else cfg.DIVIDER_TRACK_ALPHA
+            )
+            self.divider_y_mm += alpha * (
+                observed_divider - self.divider_y_mm
+            )
+            self.divider_slope_mm += alpha * (
+                observed_slope - self.divider_slope_mm
+            )
+            self.divider_confidence = candidate.get(
+                "divider_confidence", 0.0
+            )
+            self.divider_detected = True
         self.locked = (
             self.valid_frames >= cfg.A4_LOCK_REQUIRED_FRAMES
         )
+        return self.state()
+
+    def freeze(self):
+        """Make the first locked calibration immutable until process restart."""
+        if self.locked and self.corners_px is not None:
+            self.frozen = True
+            self.motion_px = 0.0
+            self.missed_frames = 0
+            self.relock_confirm_count = 0
         return self.state()
 
     def state(self):
         return {
             "corners_px": self.corners_px,
             "locked": self.locked,
+            "frozen": self.frozen,
             "confidence": self.confidence,
             "source": self.source,
             "orientation": self.orientation,
             "valid_frames": self.valid_frames,
             "missed_frames": self.missed_frames,
             "motion_px": self.motion_px,
+            "relock_confirm_count": self.relock_confirm_count,
+            "divider_y_mm": self.divider_y_mm,
+            "divider_slope_mm": self.divider_slope_mm,
+            "divider_confidence": self.divider_confidence,
+            "divider_detected": self.divider_detected,
         }
 
 #!/usr/bin/env python3
@@ -6488,13 +8425,18 @@ def _source_screen_point(point_mm):
     )
 
 
-def _target_screen_point(point_mm):
+def _target_screen_point(point_mm, divider_y_mm=None):
     origin_x = 350
     origin_y = 44
     scale = 1.10
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
     return (
         int(origin_x + point_mm[0] * scale),
-        int(origin_y + (point_mm[1] - cfg.DIVIDER_Y_MM) * scale),
+        int(origin_y + (point_mm[1] - divider) * scale),
     )
 
 
@@ -6507,6 +8449,7 @@ def _render_status(
     fps,
     error,
     calibration_state=None,
+    divider_y_mm=None,
 ):
     canvas.clear()
     _draw_text(canvas, 12, 10, "K230 A4 PUZZLE V1", WHITE, 2)
@@ -6520,7 +8463,12 @@ def _render_status(
 
     # Current upper-half A4 schematic.
     source_width = int(cfg.A4_WIDTH_MM * 1.40)
-    source_height = int(cfg.DIVIDER_Y_MM * 1.40)
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
+    source_height = int(divider * 1.40)
     _draw_box(canvas, 18, 44, source_width, source_height, GRAY)
     _draw_text(canvas, 18, 263, "CURRENT / mm", GRAY)
     for index, piece in enumerate(pieces):
@@ -6549,14 +8497,18 @@ def _render_status(
     # Target lower-half A4 schematic.
     target_width = int(cfg.A4_WIDTH_MM * 1.10)
     target_height = int(
-        (cfg.A4_HEIGHT_MM - cfg.DIVIDER_Y_MM) * 1.10
+        (cfg.A4_HEIGHT_MM - divider) * 1.10
     )
     _draw_box(canvas, 350, 44, target_width, target_height, GRAY)
     _draw_text(canvas, 350, 225, "TARGET / mm", GRAY)
     if plan is not None and plan.valid:
         min_x, min_y, max_x, max_y = plan.target_rect
-        rect_a = _target_screen_point((min_x, min_y))
-        rect_b = _target_screen_point((max_x, max_y))
+        rect_a = _target_screen_point(
+            (min_x, min_y), divider
+        )
+        rect_b = _target_screen_point(
+            (max_x, max_y), divider
+        )
         _draw_box(
             canvas,
             rect_a[0],
@@ -6570,7 +8522,8 @@ def _render_status(
             polygon = plan.target_polygons.get(piece.piece_id)
             if polygon:
                 points = [
-                    _target_screen_point(point) for point in polygon
+                    _target_screen_point(point, divider)
+                    for point in polygon
                 ]
                 _draw_polyline(canvas, points, color)
                 operation = None
@@ -6580,7 +8533,8 @@ def _render_status(
                         break
                 if operation is not None:
                     centre = _target_screen_point(
-                        operation["target_center_mm"]
+                        operation["target_center_mm"],
+                        divider,
                     )
                     canvas.draw_cross(
                         centre[0],
@@ -6685,7 +8639,8 @@ def _print_plan(plan, pieces, frame_index):
         print(
             "PLAN_PERF,frame={},time_ms={},nodes={},edge_pairs={},"
             "filtered={},intersections={},aabb_rejects={},"
-            "rect_hypotheses={}".format(
+            "rect_hypotheses={},input_area_mm2={},"
+            "area_scale={}".format(
                 frame_index,
                 stats.get("plan_ms", 0),
                 stats.get(
@@ -6697,7 +8652,29 @@ def _print_plan(plan, pieces, frame_index):
                 ),
                 stats.get("polygon_intersection_calls", 0),
                 stats.get("aabb_reject_count", 0),
-                stats.get("rectangle_hypothesis_count", 0),
+                stats.get(
+                    "rectangle_hypothesis_count",
+                    stats.get(
+                        "corner_rectangle_hypothesis_count",
+                        0,
+                    ),
+                ),
+                (
+                    "{:.1f}".format(
+                        stats["input_piece_area_mm2"]
+                    )
+                    if stats.get("input_piece_area_mm2")
+                    is not None
+                    else "na"
+                ),
+                (
+                    "{:.4f}".format(
+                        stats["target_area_scale"]
+                    )
+                    if stats.get("target_area_scale")
+                    is not None
+                    else "na"
+                ),
             )
         )
     if not plan.valid:
@@ -6706,6 +8683,93 @@ def _print_plan(plan, pieces, frame_index):
                 frame_index, plan.reason.replace(",", ";")
             )
         )
+        if (
+            stats
+            and stats.get("candidate_pair_count_raw")
+            is not None
+        ):
+            if stats.get("limit_hit"):
+                failure_class = "search_limit"
+            elif stats.get("pruned_target_dimension", 0):
+                failure_class = "target_geometry"
+            elif stats.get("complete_state_count", 0):
+                failure_class = "rectangle_gate"
+            else:
+                failure_class = "seam_connectivity"
+
+            def stat_float(key):
+                value = stats.get(key)
+                return (
+                    "{:.1f}".format(value)
+                    if value is not None
+                    else "na"
+                )
+
+            print(
+                "PLAN_FAIL_DETAIL,frame={},class={},complete={},"
+                "max_depth={},seam_pairs={},rect_range_reject={},"
+                "input_area_mm2={},target_area_mm2={},"
+                "area_error_pct={},area_scale={},"
+                "target_size_reject={},closest_size={}x{},"
+                "size_error_mm={},closest_gap_mm2={},"
+                "pruned_boundary={},pruned_dimension={},"
+                "corner_reason={},corner_nodes={},corner_depth={},"
+                "corner_complete={},corner_overlap_reject={}".format(
+                    frame_index,
+                    failure_class,
+                    stats.get("complete_state_count", 0),
+                    stats.get("max_depth", 0),
+                    stats.get(
+                        "candidate_pair_count_filtered", 0
+                    ),
+                    stats.get("pruned_rect_range", 0),
+                    stat_float("input_piece_area_mm2"),
+                    stat_float("target_area_mm2"),
+                    stat_float("input_area_error_pct"),
+                    (
+                        "{:.4f}".format(
+                            stats["target_area_scale"]
+                        )
+                        if stats.get("target_area_scale")
+                        is not None
+                        else "na"
+                    ),
+                    stats.get(
+                        "pruned_target_dimension", 0
+                    ),
+                    stat_float("closest_target_long_mm"),
+                    stat_float("closest_target_short_mm"),
+                    stat_float(
+                        "closest_target_dimension_error_mm"
+                    ),
+                    stat_float("closest_target_gap_mm2"),
+                    stats.get("pruned_boundary", 0),
+                    stats.get("pruned_dimension", 0),
+                    str(
+                        stats.get(
+                            "corner_failure_reason", "not_attempted"
+                        )
+                    ).replace(",", ";"),
+                    stats.get("corner_search_nodes", 0),
+                    stats.get("corner_max_depth", 0),
+                    stats.get("corner_complete_state_count", 0),
+                    stats.get("corner_pruned_overlap", 0),
+                )
+            )
+        for piece in pieces:
+            vertices = "|".join(
+                "{:.1f}:{:.1f}".format(point[0], point[1])
+                for point in piece.polygon_mm
+            )
+            print(
+                "PLAN_INPUT,frame={},id={},area_mm2={:.1f},"
+                "vertices={}".format(
+                    frame_index,
+                    piece.piece_id,
+                    piece.area_mm2,
+                    vertices,
+                )
+            )
         return
     target_width = (
         plan.target_rect[2] - plan.target_rect[0]
@@ -6759,6 +8823,14 @@ def _plan_key(pieces):
                 int(round(piece.centroid_mm[0] * 2.0)),
                 int(round(piece.centroid_mm[1] * 2.0)),
                 int(round(piece.current_orientation_deg * 2.0)),
+                int(round(piece.area_mm2 * 2.0)),
+                tuple(
+                    (
+                        int(round(point[0] * 2.0)),
+                        int(round(point[1] * 2.0)),
+                    )
+                    for point in piece.polygon_mm
+                ),
             )
         )
     return tuple(values)
@@ -6813,13 +8885,16 @@ def main():
         ]
         print(
             "START,frame_width={},frame_height={},work={}x{},"
-            "backend=image-native,debug_camera={},auto_a4={}".format(
+            "backend=image-native,debug_camera={},auto_a4={},"
+            "plan_debug={},plan_debug_ms={}".format(
                 cfg.FRAME_WIDTH,
                 cfg.FRAME_HEIGHT,
                 cfg.CANMV_WORK_WIDTH,
                 cfg.CANMV_WORK_HEIGHT,
                 int(cfg.DEBUG_SHOW_CAMERA),
                 int(cfg.AUTO_CALIBRATE_A4),
+                int(cfg.ENABLE_PLAN_DEBUG),
+                cfg.PLAN_DEBUG_INTERVAL_MS,
             )
         )
 
@@ -6909,7 +8984,18 @@ def main():
                 # invalidates the plan immediately; sub-threshold jitter must
                 # not rerun the beam search every frame.
                 if not last_stable or active_plan is None:
-                    active_plan = plan_rectangle_assembly(pieces)
+                    begin_plan_debug(
+                        "fixed_rectangle"
+                        if cfg.TARGET_RECT_SIZE_MM is not None
+                        else "outer_first",
+                        len(pieces),
+                    )
+                    try:
+                        active_plan = plan_rectangle_assembly(
+                            pieces
+                        )
+                    finally:
+                        end_plan_debug()
                     active_plan_key = key
                     _print_plan(active_plan, pieces, frame_index)
 

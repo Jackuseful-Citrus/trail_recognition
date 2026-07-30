@@ -7,7 +7,9 @@ import numpy as np
 
 from puzzle_geometry import polygon_area, polygon_is_convex
 from puzzle_vision import (
+    _component_boundary,
     _ordered_contour_polygon,
+    _refine_vertices_with_lines,
     trace_ordered_boundary,
 )
 
@@ -173,6 +175,53 @@ class OrderedBoundaryTests(unittest.TestCase):
         )
         self.assertFalse(diagnostics["ok"])
         self.assertEqual(diagnostics["reason"], "max_steps")
+
+    def test_flood_fallback_retraces_an_ordered_component(self):
+        image = np.zeros((64, 64), dtype=np.uint8)
+        image[2, 2] = 255
+        cv2.rectangle(image, (18, 16), (52, 48), 255, -1)
+        primary, primary_diagnostics = trace_ordered_boundary(
+            image, (0, 0, 64, 64), 180
+        )
+        self.assertFalse(primary_diagnostics["ok"])
+        self.assertEqual(
+            primary_diagnostics["reason"], "isolated_pixel"
+        )
+        boundary, fallback = _component_boundary(
+            image,
+            (0, 0, 64, 64),
+            (35, 32),
+            180,
+        )
+        self.assertTrue(fallback["ok"], fallback)
+        self.assertEqual(fallback["reason"], "fallback_ok")
+        self.assertGreater(len(boundary), 100)
+        cyclic = boundary[1:] + boundary[:1]
+        self.assertTrue(
+            all(
+                max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+                <= 1.0
+                for a, b in zip(boundary, cyclic)
+            )
+        )
+        polygon = _ordered_contour_polygon(boundary)
+        self.assertIsNotNone(polygon)
+        self.assertEqual(len(polygon), 4)
+
+    def test_line_refinement_accepts_two_mm_but_rejects_four(self):
+        contour = []
+        for x in range(0, 41, 2):
+            contour.extend(((float(x), 0.0), (float(x), 30.0)))
+        for y in range(2, 30, 2):
+            contour.extend(((0.0, float(y)), (40.0, float(y))))
+        two_mm = [(-2.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)]
+        refined = _refine_vertices_with_lines(contour, two_mm)
+        self.assertAlmostEqual(refined[0][0], 0.0, places=5)
+        self.assertNotEqual(refined[0], two_mm[0])
+
+        four_mm = [(-4.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)]
+        rejected = _refine_vertices_with_lines(contour, four_mm)
+        self.assertEqual(rejected[0], four_mm[0])
 
 
 if __name__ == "__main__":

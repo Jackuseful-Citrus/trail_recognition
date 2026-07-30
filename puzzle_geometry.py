@@ -17,6 +17,7 @@ GEOMETRY_COUNTERS = {
     "polygon_intersection_calls": 0,
     "aabb_reject_count": 0,
 }
+PLAN_DEBUG_STATE = None
 
 
 def reset_geometry_counters():
@@ -28,13 +29,136 @@ def geometry_counters_snapshot():
     return dict(GEOMETRY_COUNTERS)
 
 
-def _geometry_exitpoint(counter, interval=32):
-    """Keep long planner searches interruptible from CanMV IDE."""
-    if counter % interval != 0:
+def begin_plan_debug(planner, piece_count):
+    """Start one low-frequency planner heartbeat session."""
+    global PLAN_DEBUG_STATE
+    if not getattr(cfg, "ENABLE_PLAN_DEBUG", False):
+        PLAN_DEBUG_STATE = None
+        return
+    reset_geometry_counters()
+    now = ticks_ms()
+    PLAN_DEBUG_STATE = {
+        "planner": str(planner),
+        "stage": "dispatch",
+        "started_ms": now,
+        "last_report_ms": now,
+        "piece_count": int(piece_count),
+        "depth": 0,
+        "states": 0,
+        "expanded": 0,
+        "nodes": 0,
+        "work": 0,
+        "best_score": None,
+    }
+
+
+def update_plan_debug(
+    stage=None,
+    depth=None,
+    states=None,
+    expanded=None,
+    nodes=None,
+    best_score=None,
+):
+    """Update heartbeat fields without reading the clock or printing."""
+    state = PLAN_DEBUG_STATE
+    if state is None:
+        return
+    if stage is not None:
+        state["stage"] = str(stage)
+    if depth is not None:
+        state["depth"] = int(depth)
+    if states is not None:
+        state["states"] = int(states)
+    if expanded is not None:
+        state["expanded"] = int(expanded)
+    if nodes is not None:
+        state["nodes"] = int(nodes)
+    if best_score is not None:
+        state["best_score"] = float(best_score)
+
+
+def plan_debug_heartbeat(force=False):
+    """Print progress only when the configured wall-clock interval elapsed."""
+    state = PLAN_DEBUG_STATE
+    if state is None:
+        return False
+    now = ticks_ms()
+    elapsed_since_report = ticks_diff(
+        now, state["last_report_ms"]
+    )
+    interval_ms = max(
+        250,
+        int(getattr(cfg, "PLAN_DEBUG_INTERVAL_MS", 2000)),
+    )
+    if not force and elapsed_since_report < interval_ms:
+        return False
+    elapsed_ms = max(
+        0, ticks_diff(now, state["started_ms"])
+    )
+    best_score = state["best_score"]
+    best_text = (
+        "na"
+        if best_score is None
+        else "{:.4f}".format(best_score)
+    )
+    print(
+        "PLAN_DEBUG,planner={},stage={},elapsed_ms={},pieces={},"
+        "depth={},states={},expanded={},nodes={},work={},"
+        "best_score={},intersections={},aabb_rejects={}".format(
+            state["planner"],
+            state["stage"],
+            elapsed_ms,
+            state["piece_count"],
+            state["depth"],
+            state["states"],
+            state["expanded"],
+            state["nodes"],
+            state["work"],
+            best_text,
+            GEOMETRY_COUNTERS["polygon_intersection_calls"],
+            GEOMETRY_COUNTERS["aabb_reject_count"],
+        )
+    )
+    state["last_report_ms"] = now
+    return True
+
+
+def end_plan_debug():
+    """End the active heartbeat session without adding another log line."""
+    global PLAN_DEBUG_STATE
+    PLAN_DEBUG_STATE = None
+
+
+def _plan_debug_work(amount=1):
+    state = PLAN_DEBUG_STATE
+    if state is not None:
+        state["work"] += int(amount)
+
+
+def _plan_debug_checkpoint(interval=32):
+    """Poll time/IDE only once per small batch of expensive helper calls."""
+    state = PLAN_DEBUG_STATE
+    if state is None:
+        return
+    state["work"] += 1
+    if state["work"] % max(1, int(interval)) != 0:
         return
     exitpoint = getattr(os, "exitpoint", None)
     if exitpoint is not None:
         exitpoint()
+    plan_debug_heartbeat()
+
+
+def _geometry_exitpoint(counter, interval=32):
+    """Keep long planner searches interruptible from CanMV IDE."""
+    if counter % interval != 0:
+        return
+    _plan_debug_work(interval)
+    exitpoint = getattr(os, "exitpoint", None)
+    if exitpoint is not None:
+        exitpoint()
+    plan_debug_heartbeat()
 
 
 class PieceObservation:
@@ -868,6 +992,18 @@ class EdgeCandidateGraph:
 def build_edge_candidate_graph(pieces, tolerant=False):
     """Build the complete seam candidate graph once before DFS."""
     started = ticks_ms()
+    update_plan_debug(
+        stage=(
+            "candidate_graph_tolerant"
+            if tolerant
+            else "candidate_graph_strict"
+        ),
+        depth=0,
+        states=0,
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
     graph = EdgeCandidateGraph()
     edges_by_piece = []
     for piece_index, piece in enumerate(pieces):
@@ -894,6 +1030,8 @@ def build_edge_candidate_graph(pieces, tolerant=False):
             pair_candidates = []
             for desc_a in edges_by_piece[piece_a]:
                 for desc_b in edges_by_piece[piece_b]:
+                    if PLAN_DEBUG_STATE is not None:
+                        _plan_debug_checkpoint()
                     graph.raw_pair_count += 1
                     if not _edge_length_matches(
                         desc_a.length,
@@ -909,6 +1047,9 @@ def build_edge_candidate_graph(pieces, tolerant=False):
                     )
                     pair_candidates.append(candidate)
                     graph.candidates.append(candidate)
+                    update_plan_debug(
+                        expanded=len(graph.candidates),
+                    )
                     for key in (
                         (piece_a, desc_a.edge_index),
                         (piece_b, desc_b.edge_index),
@@ -1564,6 +1705,8 @@ def _boundary_anchor_candidates(polygon, width, height, rectangle):
         for neighbor_index in neighbors:
             for corner_index, (corner, directions) in enumerate(corners):
                 for direction_index, direction in enumerate(directions):
+                    if PLAN_DEBUG_STATE is not None:
+                        _plan_debug_checkpoint()
                     transform = _transform_from_vertex_direction(
                         polygon,
                         vertex_index,
@@ -1593,6 +1736,12 @@ def _boundary_anchor_candidates(polygon, width, height, rectangle):
                             "polygon": candidate,
                             "transform": transform,
                             "outside": outside,
+                            "boundary": _boundary_contact_length(
+                                candidate,
+                                width,
+                                height,
+                                cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                            ),
                             "anchor": {
                                 "type": "boundary",
                                 "vertex_index": vertex_index,
@@ -1606,6 +1755,9 @@ def _boundary_anchor_candidates(polygon, width, height, rectangle):
 
 
 def _fixed_state_key(state):
+    cached = state.get("pose_entries")
+    if cached is not None:
+        return cached
     result = []
     for index, transform in enumerate(state["transforms"]):
         if transform is None:
@@ -1622,9 +1774,45 @@ def _fixed_state_key(state):
     return tuple(result)
 
 
+def _fixed_pose_entry(piece_index, polygon, transform):
+    center = polygon_centroid(polygon)
+    return (
+        int(piece_index),
+        int(round(center[0])),
+        int(round(center[1])),
+        int(round(transform[4])),
+    )
+
+
+def _fixed_extended_state_key(
+    state, new_index, candidate
+):
+    entries = state.get("pose_entries")
+    if entries is None:
+        entries = tuple(
+            _fixed_pose_entry(
+                index,
+                state["polygons"][index],
+                state["transforms"][index],
+            )
+            for index in state["placed"]
+        )
+    new_entry = _fixed_pose_entry(
+        new_index,
+        candidate["polygon"],
+        candidate["transform"],
+    )
+    return tuple(sorted(entries + (new_entry,)))
+
+
 def _fixed_partial_rank(
     state, rectangle, width, height
 ):
+    cached = state.get("partial_rank")
+    if cached is not None:
+        return cached
+    if PLAN_DEBUG_STATE is not None:
+        _plan_debug_checkpoint()
     outside = 0.0
     overlap = 0.0
     boundary = 0.0
@@ -1647,6 +1835,8 @@ def _fixed_partial_rank(
 
 
 def _fixed_complete_metrics(polygons, rectangle, width, height):
+    if PLAN_DEBUG_STATE is not None:
+        _plan_debug_checkpoint()
     outside = 0.0
     overlap = 0.0
     inside_sum = 0.0
@@ -1714,6 +1904,8 @@ def _fixed_edge_candidates(
             a0 = fixed_polygon[fixed_edge]
             a1 = fixed_polygon[(fixed_edge + 1) % len(fixed_polygon)]
             for new_edge in range(len(new_polygon)):
+                if PLAN_DEBUG_STATE is not None:
+                    _plan_debug_checkpoint()
                 if not _edge_length_matches(
                     fixed_lengths[fixed_edge],
                     new_lengths[new_edge],
@@ -1759,6 +1951,12 @@ def _fixed_edge_candidates(
                         "polygon": candidate,
                         "transform": transform,
                         "outside": outside,
+                        "boundary": _boundary_contact_length(
+                            candidate,
+                            rectangle[1][0],
+                            rectangle[2][1],
+                            cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                        ),
                         "anchor": {
                             "type": "seam",
                             "piece_a_index": fixed_index,
@@ -1838,12 +2036,25 @@ def _plan_fixed_rectangle(pieces, size_mm):
     height = float(size_mm[1])
     rectangle = _fixed_rectangle_polygon(width, height)
     count = len(pieces)
-    boundary_candidates = [
-        _boundary_anchor_candidates(
+    update_plan_debug(
+        stage="fixed_boundary_anchors",
+        depth=0,
+        states=0,
+        expanded=0,
+        nodes=0,
+    )
+    boundary_candidates = []
+    boundary_candidate_count = 0
+    for piece in pieces:
+        candidates = _boundary_anchor_candidates(
             piece.polygon_mm, width, height, rectangle
         )
-        for piece in pieces
-    ]
+        boundary_candidates.append(candidates)
+        boundary_candidate_count += len(candidates)
+        update_plan_debug(
+            states=boundary_candidate_count,
+        )
+        plan_debug_heartbeat()
     states = []
     for piece_index in range(count):
         for candidate in boundary_candidates[piece_index]:
@@ -1858,6 +2069,20 @@ def _plan_fixed_rectangle(pieces, size_mm):
                     "transforms": transforms,
                     "seams": [],
                     "anchors": [candidate["anchor"]],
+                    "outside_sum": candidate["outside"],
+                    "overlap_sum": 0.0,
+                    "boundary_sum": candidate["boundary"],
+                    "partial_rank": (
+                        5.0 * candidate["outside"]
+                        - 0.5 * candidate["boundary"]
+                    ),
+                    "pose_entries": (
+                        _fixed_pose_entry(
+                            piece_index,
+                            candidate["polygon"],
+                            candidate["transform"],
+                        ),
+                    ),
                 }
             )
     if not states:
@@ -1867,10 +2092,25 @@ def _plan_fixed_rectangle(pieces, size_mm):
         )
 
     nodes = len(states)
+    update_plan_debug(
+        stage="fixed_seed_states",
+        states=len(states),
+        expanded=0,
+        nodes=nodes,
+    )
+    plan_debug_heartbeat()
     work_counter = 0
     for _depth in range(1, count):
         expanded = []
         seen = set()
+        update_plan_debug(
+            stage="fixed_expand",
+            depth=_depth,
+            states=len(states),
+            expanded=0,
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
         for state in states:
             work_counter += 1
             _geometry_exitpoint(work_counter)
@@ -1891,6 +2131,11 @@ def _plan_fixed_rectangle(pieces, size_mm):
                 for candidate in candidates:
                     work_counter += 1
                     _geometry_exitpoint(work_counter)
+                    key = _fixed_extended_state_key(
+                        state, new_index, candidate
+                    )
+                    if key in seen:
+                        continue
                     overlap = 0.0
                     for placed_index in state["placed"]:
                         overlap += polygon_overlap_area(
@@ -1920,12 +2165,30 @@ def _plan_fixed_rectangle(pieces, size_mm):
                         "transforms": transforms,
                         "seams": seams,
                         "anchors": anchors,
+                        "outside_sum": (
+                            state["outside_sum"]
+                            + candidate["outside"]
+                        ),
+                        "overlap_sum": (
+                            state["overlap_sum"] + overlap
+                        ),
+                        "boundary_sum": (
+                            state["boundary_sum"]
+                            + candidate["boundary"]
+                        ),
+                        "pose_entries": key,
                     }
-                    key = _fixed_state_key(new_state)
-                    if key in seen:
-                        continue
+                    new_state["partial_rank"] = (
+                        5.0 * new_state["outside_sum"]
+                        + 20.0 * new_state["overlap_sum"]
+                        - 0.5 * new_state["boundary_sum"]
+                    )
                     seen.add(key)
                     expanded.append(new_state)
+            update_plan_debug(
+                expanded=len(expanded),
+                nodes=nodes + len(expanded),
+            )
         nodes += len(expanded)
         if not expanded:
             return PlanResult(
@@ -1933,15 +2196,37 @@ def _plan_fixed_rectangle(pieces, size_mm):
                 search_nodes=nodes,
                 mode="fixed_tolerant",
             )
+        update_plan_debug(
+            stage="fixed_rank",
+            states=len(expanded),
+            expanded=len(expanded),
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
         expanded.sort(
             key=lambda state: _fixed_partial_rank(
                 state, rectangle, width, height
             )
         )
         states = expanded[: cfg.FIXED_RECT_BEAM_WIDTH]
+        update_plan_debug(
+            stage="fixed_beam",
+            states=len(states),
+            expanded=len(expanded),
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
 
     best = None
     best_metrics = None
+    update_plan_debug(
+        stage="fixed_evaluate",
+        depth=count,
+        states=len(states),
+        expanded=0,
+        nodes=nodes,
+    )
+    plan_debug_heartbeat()
     for state in states:
         work_counter += 1
         _geometry_exitpoint(work_counter)
@@ -1968,6 +2253,9 @@ def _plan_fixed_rectangle(pieces, size_mm):
         ):
             best = state
             best_metrics = metrics
+            update_plan_debug(
+                best_score=best_metrics["score"],
+            )
     if best is None:
         return PlanResult(
             reason="no complete fixed rectangle candidate",
@@ -2224,6 +2512,116 @@ def _outer_first_complete_metrics(polygons):
     }
 
 
+def _target_rectangle_dimensions(target_size_mm):
+    """Return both axis orientations for one configured target size."""
+    if target_size_mm is None:
+        return []
+    width = float(target_size_mm[0])
+    height = float(target_size_mm[1])
+    if width <= EPS or height <= EPS:
+        return []
+    result = [(width, height)]
+    if abs(width - height) > EPS:
+        result.append((height, width))
+    return result
+
+
+def _normalize_pieces_for_known_target(
+    pieces, target_size_mm
+):
+    """Correct a small common contour scale bias from known total area."""
+    if target_size_mm is None:
+        return pieces, 1.0
+    target_area = (
+        float(target_size_mm[0])
+        * float(target_size_mm[1])
+    )
+    observed_area = sum(
+        piece.area_mm2 for piece in pieces
+    )
+    if target_area <= EPS or observed_area <= EPS:
+        return pieces, 1.0
+    scale = math.sqrt(target_area / observed_area)
+    if (
+        abs(scale - 1.0)
+        > cfg.KNOWN_TARGET_MAX_AREA_SCALE_DELTA
+    ):
+        return pieces, 1.0
+    if abs(scale - 1.0) <= 1e-6:
+        return pieces, 1.0
+    normalized = []
+    for piece in pieces:
+        center_x, center_y = piece.centroid_mm
+        polygon = [
+            (
+                center_x + (point[0] - center_x) * scale,
+                center_y + (point[1] - center_y) * scale,
+            )
+            for point in piece.polygon_mm
+        ]
+        value = PieceObservation(
+            piece.piece_id,
+            piece.contour_px,
+            polygon,
+            centroid_mm=piece.centroid_mm,
+            confidence=piece.confidence,
+            rotation_ambiguous=piece.rotation_ambiguous,
+            centroid_fallback=piece.centroid_fallback,
+        )
+        value.stable = piece.stable
+        normalized.append(value)
+    return normalized, scale
+
+
+def _known_target_gate_reason(
+    metrics, width, height, target_size_mm
+):
+    """Reject tolerant assemblies that are not the configured rectangle."""
+    if target_size_mm is None:
+        return None
+    target_long = max(
+        float(target_size_mm[0]),
+        float(target_size_mm[1]),
+    )
+    target_short = min(
+        float(target_size_mm[0]),
+        float(target_size_mm[1]),
+    )
+    actual_long = max(float(width), float(height))
+    actual_short = min(float(width), float(height))
+    outside = metrics.get("outside_mm2", 0.0)
+    overlap = metrics.get("overlap_mm2", 0.0)
+    gap = metrics.get("fill_gap_mm2", 0.0)
+    dimension_error = max(
+        abs(actual_long - target_long),
+        abs(actual_short - target_short),
+    )
+    if (
+        dimension_error
+        <= cfg.KNOWN_TARGET_DIMENSION_TOLERANCE_MM
+        and metrics["score"] <= cfg.FIXED_RECT_SCORE_THRESHOLD
+        and outside <= cfg.FIXED_RECT_MAX_OUTSIDE_MM2
+        and overlap <= cfg.FIXED_RECT_MAX_OVERLAP_MM2
+        and gap <= cfg.FIXED_RECT_MAX_GAP_MM2
+    ):
+        return None
+    return (
+        "known target gate actual={:.1f}x{:.1f},"
+        "target={:.1f}x{:.1f},dim_error={:.1f},"
+        "score={:.4f},outside={:.1f},overlap={:.1f},gap={:.1f}"
+    ).format(
+        actual_long,
+        actual_short,
+        target_long,
+        target_short,
+        dimension_error,
+        metrics["score"],
+        outside,
+        overlap,
+        gap,
+    )
+
+
 def _corner_dimension_candidates(pieces, tolerant):
     """Infer plausible unknown rectangle sizes from corner-adjacent edges."""
     angle_tolerance = (
@@ -2435,6 +2833,12 @@ def _corner_anchor_candidates(
                             "polygon": candidate,
                             "transform": transform,
                             "outside": outside,
+                            "boundary": _boundary_contact_length(
+                                candidate,
+                                width,
+                                height,
+                                cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                            ),
                             "anchor": {
                                 "type": "boundary",
                                 "piece_index": piece_index,
@@ -2539,6 +2943,12 @@ def _fixed_graph_edge_candidates(
                     "polygon": candidate,
                     "transform": transform,
                     "outside": outside,
+                    "boundary": _boundary_contact_length(
+                        candidate,
+                        rectangle[1][0],
+                        rectangle[2][1],
+                        cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM,
+                    ),
                     "candidate_cost": match.geometric_cost,
                     "anchor": {
                         "type": "seam",
@@ -2559,7 +2969,11 @@ def _fixed_graph_edge_candidates(
 
 
 def _plan_corner_hybrid_rectangle(
-    pieces, tolerant, candidate_graph, plan_started_ms=None
+    pieces,
+    tolerant,
+    candidate_graph,
+    plan_started_ms=None,
+    target_size_mm=None,
 ):
     """Anchor reliable corner pieces, then attach non-corner pieces by seams."""
     mode = (
@@ -2567,9 +2981,17 @@ def _plan_corner_hybrid_rectangle(
         if tolerant
         else "corner_outer_strict"
     )
-    all_dimensions = _corner_dimension_candidates(
-        pieces, tolerant
-    )
+    if target_size_mm is None:
+        all_dimensions = _corner_dimension_candidates(
+            pieces, tolerant
+        )
+    else:
+        # A known prototype must not be replaced by a rectangle size inferred
+        # from noisy edges. Searching only its two orientations is both safer
+        # and substantially cheaper than ranking many dimension hypotheses.
+        all_dimensions = _target_rectangle_dimensions(
+            target_size_mm
+        )
     dimensions = all_dimensions[
         : max(1, cfg.MAX_RECTANGLE_HYPOTHESES)
     ]
@@ -2577,7 +2999,26 @@ def _plan_corner_hybrid_rectangle(
         "rectangle_hypothesis_raw_count": len(all_dimensions),
         "rectangle_hypothesis_count": len(dimensions),
         "rectangle_hypotheses_used": len(dimensions),
+        "boundary_anchor_count": 0,
+        "seed_state_count": 0,
+        "expanded_candidate_count": 0,
+        "pruned_overlap": 0,
+        "complete_state_count": 0,
+        "pruned_outer_edge": 0,
+        "max_depth": 0,
     }
+    update_plan_debug(
+        stage=(
+            "corner_dimensions_tolerant"
+            if tolerant
+            else "corner_dimensions_strict"
+        ),
+        depth=0,
+        states=len(dimensions),
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
     PERF_STATS.increment(
         "rectangle_hypothesis_count", len(dimensions)
     )
@@ -2614,6 +3055,10 @@ def _plan_corner_hybrid_rectangle(
             )
             for index, piece in enumerate(pieces)
         ]
+        plan_stats["boundary_anchor_count"] += sum(
+            len(candidates)
+            for candidates in boundary_candidates
+        )
         states = []
         for piece_index, candidates in enumerate(
             boundary_candidates
@@ -2633,10 +3078,28 @@ def _plan_corner_hybrid_rectangle(
                         "corners": {
                             candidate["corner_index"]
                         },
+                        "outside_sum": candidate["outside"],
+                        "overlap_sum": 0.0,
+                        "boundary_sum": candidate["boundary"],
+                        "partial_rank": (
+                            5.0 * candidate["outside"]
+                            - 0.5 * candidate["boundary"]
+                        ),
+                        "pose_entries": (
+                            _fixed_pose_entry(
+                                piece_index,
+                                candidate["polygon"],
+                                candidate["transform"],
+                            ),
+                        ),
                     }
                 )
         if not states:
             continue
+        plan_stats["seed_state_count"] += len(states)
+        plan_stats["max_depth"] = max(
+            plan_stats["max_depth"], 1
+        )
         states.sort(
             key=lambda state: _fixed_partial_rank(
                 state, rectangle, width, height
@@ -2646,6 +3109,18 @@ def _plan_corner_hybrid_rectangle(
             : cfg.OUTER_FIRST_CORNER_BEAM_WIDTH
         ]
         nodes += len(states)
+        update_plan_debug(
+            stage=(
+                "corner_expand_tolerant"
+                if tolerant
+                else "corner_expand_strict"
+            ),
+            depth=1,
+            states=len(states),
+            expanded=0,
+            nodes=nodes,
+        )
+        plan_debug_heartbeat()
 
         for _depth in range(1, count):
             expanded = []
@@ -2689,7 +3164,13 @@ def _plan_corner_hybrid_rectangle(
                     for candidate in candidates[
                         : cfg.OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE
                     ]:
+                        plan_stats["expanded_candidate_count"] += 1
                         nodes += 1
+                        update_plan_debug(
+                            depth=_depth,
+                            expanded=len(expanded),
+                            nodes=nodes,
+                        )
                         _geometry_exitpoint(nodes)
                         if (
                             nodes
@@ -2707,6 +3188,11 @@ def _plan_corner_hybrid_rectangle(
                             timed_out = True
                             limit_hit = True
                             break
+                        key = _fixed_extended_state_key(
+                            state, new_index, candidate
+                        )
+                        if key in seen:
+                            continue
                         overlap = 0.0
                         for placed_index in state["placed"]:
                             overlap += polygon_overlap_area(
@@ -2719,6 +3205,7 @@ def _plan_corner_hybrid_rectangle(
                             else cfg.OVERLAP_AREA_TOLERANCE_MM2
                         )
                         if overlap > overlap_limit:
+                            plan_stats["pruned_overlap"] += 1
                             continue
                         polygons = list(state["polygons"])
                         transforms = list(state["transforms"])
@@ -2745,12 +3232,30 @@ def _plan_corner_hybrid_rectangle(
                             "seams": seams,
                             "anchors": anchors,
                             "corners": corners,
+                            "outside_sum": (
+                                state["outside_sum"]
+                                + candidate["outside"]
+                            ),
+                            "overlap_sum": (
+                                state["overlap_sum"] + overlap
+                            ),
+                            "boundary_sum": (
+                                state["boundary_sum"]
+                                + candidate["boundary"]
+                            ),
+                            "pose_entries": key,
                         }
-                        key = _fixed_state_key(new_state)
-                        if key in seen:
-                            continue
+                        new_state["partial_rank"] = (
+                            5.0 * new_state["outside_sum"]
+                            + 20.0 * new_state["overlap_sum"]
+                            - 0.5 * new_state["boundary_sum"]
+                        )
                         seen.add(key)
                         expanded.append(new_state)
+                        plan_stats["max_depth"] = max(
+                            plan_stats["max_depth"],
+                            len(new_state["placed"]),
+                        )
                     if limit_hit:
                         break
                 if limit_hit:
@@ -2766,12 +3271,25 @@ def _plan_corner_hybrid_rectangle(
             states = expanded[
                 : cfg.OUTER_FIRST_CORNER_BEAM_WIDTH
             ]
+            update_plan_debug(
+                stage=(
+                    "corner_rank_tolerant"
+                    if tolerant
+                    else "corner_rank_strict"
+                ),
+                depth=_depth + 1,
+                states=len(states),
+                expanded=len(expanded),
+                nodes=nodes,
+            )
+            plan_debug_heartbeat()
             if limit_hit:
                 break
 
         for state in states:
             if len(state["placed"]) != count:
                 continue
+            plan_stats["complete_state_count"] += 1
             metrics = _fixed_complete_metrics(
                 state["polygons"],
                 rectangle,
@@ -2779,7 +3297,9 @@ def _plan_corner_hybrid_rectangle(
                 height,
             )
             boundary_tolerance = (
-                cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
+                cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM
+                if target_size_mm is not None
+                else cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
                 if tolerant
                 else cfg.OUTER_EDGE_TOLERANCE_MM
             )
@@ -2796,6 +3316,7 @@ def _plan_corner_hybrid_rectangle(
                 },
                 tolerance=boundary_tolerance,
             ):
+                plan_stats["pruned_outer_edge"] += 1
                 continue
             if (
                 best_metrics is None
@@ -2805,6 +3326,9 @@ def _plan_corner_hybrid_rectangle(
                 best_metrics = metrics
                 best_width = width
                 best_height = height
+                update_plan_debug(
+                    best_score=best_metrics["score"],
+                )
         if (
             best_metrics is not None
             and best_metrics["score"]
@@ -2815,6 +3339,9 @@ def _plan_corner_hybrid_rectangle(
             break
 
     if best is None:
+        plan_stats["limit_hit"] = bool(limit_hit)
+        plan_stats["timed_out"] = bool(timed_out)
+        plan_stats["search_nodes"] = nodes
         return PlanResult(
             reason=(
                 "corner-outer plan time limit reached"
@@ -2827,25 +3354,48 @@ def _plan_corner_hybrid_rectangle(
             mode=mode,
             plan_stats=plan_stats,
         )
+    known_target_rejection = _known_target_gate_reason(
+        best_metrics,
+        best_width,
+        best_height,
+        target_size_mm,
+    )
+    plan_stats["limit_hit"] = bool(limit_hit)
+    plan_stats["timed_out"] = bool(timed_out)
+    plan_stats["search_nodes"] = nodes
+    plan_stats["best_complete_score"] = best_metrics["score"]
+    plan_stats["best_complete_gap_mm2"] = best_metrics[
+        "fill_gap_mm2"
+    ]
+    plan_stats["best_complete_overlap_mm2"] = best_metrics[
+        "overlap_mm2"
+    ]
+    plan_stats["best_complete_outside_mm2"] = best_metrics[
+        "outside_mm2"
+    ]
     score_limit = (
         cfg.TOLERANT_RECTANGLE_SCORE_THRESHOLD
-        if tolerant
+        if tolerant and target_size_mm is None
         else cfg.FIXED_RECT_SCORE_THRESHOLD
     )
     gap_limit = (
         cfg.TOLERANT_MAX_FILL_GAP_RATIO
         * best_width
         * best_height
-        if tolerant
+        if tolerant and target_size_mm is None
+        else cfg.FIXED_RECT_MAX_GAP_MM2
+        if target_size_mm is not None
         else cfg.RECT_FILL_GAP_TOLERANCE_MM2
     )
     if (
-        best_metrics["score"] > score_limit
+        known_target_rejection is not None
+        or best_metrics["score"] > score_limit
         or best_metrics["fill_gap_mm2"] > gap_limit
     ):
         return PlanResult(
             reason=(
-                "corner-outer metrics score={:.4f},gap={:.1f}"
+                known_target_rejection
+                or "corner-outer metrics score={:.4f},gap={:.1f}"
             ).format(
                 best_metrics["score"],
                 best_metrics["fill_gap_mm2"],
@@ -2854,6 +3404,8 @@ def _plan_corner_hybrid_rectangle(
             search_nodes=nodes,
             mode=mode,
             fill_gap_mm2=best_metrics["fill_gap_mm2"],
+            overlap_mm2=best_metrics["overlap_mm2"],
+            outside_mm2=best_metrics["outside_mm2"],
             plan_stats=plan_stats,
         )
     operations, target_polygons, target_rect = (
@@ -3140,7 +3692,13 @@ def _outer_graph_state_candidates(
 
 
 def plan_outer_first_rectangle(
-    pieces, tolerant_fallback=True, _tolerant=False
+    pieces,
+    tolerant_fallback=True,
+    _tolerant=False,
+    target_size_mm=None,
+    _area_normalized=False,
+    _input_piece_area_mm2=None,
+    _target_area_scale=1.0,
 ):
     """Plan an unknown 2..4-piece rectangle from its outside edges first.
 
@@ -3163,6 +3721,18 @@ def plan_outer_first_rectangle(
             mode="outer_first",
         )
 
+    if _area_normalized:
+        input_piece_area_mm2 = _input_piece_area_mm2
+        target_area_scale = _target_area_scale
+    else:
+        input_piece_area_mm2 = sum(
+            piece.area_mm2 for piece in pieces
+        )
+        pieces, target_area_scale = (
+            _normalize_pieces_for_known_target(
+                pieces, target_size_mm
+            )
+        )
     plan_started_ms = ticks_ms()
     reset_geometry_counters()
     candidate_graph = build_edge_candidate_graph(
@@ -3189,9 +3759,34 @@ def plan_outer_first_rectangle(
         )
         stats["candidate_graph_ms"] = candidate_graph.build_ms
         stats["dfs_nodes_expanded"] = plan.search_nodes
+        stats["input_piece_area_mm2"] = (
+            input_piece_area_mm2
+        )
+        stats["target_area_scale"] = target_area_scale
+        if target_size_mm is not None:
+            target_area_mm2 = (
+                float(target_size_mm[0])
+                * float(target_size_mm[1])
+            )
+            stats["target_area_mm2"] = target_area_mm2
+            stats["input_area_error_pct"] = (
+                100.0
+                * abs(input_piece_area_mm2 - target_area_mm2)
+                / max(EPS, target_area_mm2)
+            )
         stats["plan_ms"] = max(
             0, ticks_diff(ticks_ms(), plan_started_ms)
         )
+        corner_failure = corner_plan_holder[0]
+        if corner_failure is not None and not corner_failure.valid:
+            stats["corner_failure_reason"] = (
+                corner_failure.reason
+            )
+            stats["corner_search_nodes"] = (
+                corner_failure.search_nodes
+            )
+            for key, value in corner_failure.plan_stats.items():
+                stats["corner_{}".format(key)] = value
         plan.plan_stats = stats
         PERF_STATS.add_stage(
             "plan_ms", elapsed_ms=stats["plan_ms"]
@@ -3204,6 +3799,7 @@ def plan_outer_first_rectangle(
         else "outer_first_strict"
     )
 
+    corner_plan_holder = [None]
     corner_attempted = _outer_should_try_corner_first(
         pieces, tolerant=_tolerant
     )
@@ -3213,7 +3809,9 @@ def plan_outer_first_rectangle(
             tolerant=_tolerant,
             candidate_graph=candidate_graph,
             plan_started_ms=plan_started_ms,
+            target_size_mm=target_size_mm,
         )
+        corner_plan_holder[0] = corner_plan
         if corner_plan.valid:
             return finalize(corner_plan)
 
@@ -3224,7 +3822,9 @@ def plan_outer_first_rectangle(
                 tolerant=_tolerant,
                 candidate_graph=candidate_graph,
                 plan_started_ms=plan_started_ms,
+                target_size_mm=target_size_mm,
             )
+            corner_plan_holder[0] = corner_plan
             if corner_plan.valid:
                 corner_plan.search_nodes += nodes
                 return finalize(corner_plan)
@@ -3237,6 +3837,12 @@ def plan_outer_first_rectangle(
                 pieces,
                 tolerant_fallback=False,
                 _tolerant=True,
+                target_size_mm=target_size_mm,
+                _area_normalized=True,
+                _input_piece_area_mm2=(
+                    input_piece_area_mm2
+                ),
+                _target_area_scale=target_area_scale,
             )
         return finalize(
             PlanResult(
@@ -3283,6 +3889,16 @@ def plan_outer_first_rectangle(
         "limit_hit": False,
         "exact_solution": False,
         "timed_out": False,
+        "complete_state_count": 0,
+        "pruned_rect_range": 0,
+        "pruned_target_dimension": 0,
+        "pruned_complete_boundary": 0,
+        "max_depth": 1,
+        "closest_target_dimension_error_mm": None,
+        "closest_target_long_mm": None,
+        "closest_target_short_mm": None,
+        "closest_target_score": None,
+        "closest_target_gap_mm2": None,
         "pruned_endpoint": 0,
         "pruned_side": 0,
         "pruned_overlap": 0,
@@ -3295,6 +3911,18 @@ def plan_outer_first_rectangle(
     roots = _outer_first_root_candidates(
         pieces, tolerant=_tolerant
     )
+    update_plan_debug(
+        stage=(
+            "outer_roots_tolerant"
+            if _tolerant
+            else "outer_roots_strict"
+        ),
+        depth=0,
+        states=len(roots),
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
 
     for root_number, root in enumerate(roots):
         if state["nodes"] >= min(
@@ -3311,6 +3939,17 @@ def plan_outer_first_rectangle(
             state["limit_hit"] = True
             break
         state["nodes"] += 1
+        update_plan_debug(
+            stage=(
+                "outer_dfs_tolerant"
+                if _tolerant
+                else "outer_dfs_strict"
+            ),
+            depth=1,
+            states=len(roots),
+            expanded=root_number,
+            nodes=state["nodes"],
+        )
         _geometry_exitpoint(state["nodes"])
         root_index = root["piece_index"]
         root_edge = root["edge_index"]
@@ -3345,6 +3984,7 @@ def plan_outer_first_rectangle(
                 state["limit_hit"] = True
                 return
             if len(placed_indices) == count:
+                state["complete_state_count"] += 1
                 candidate_polygons = [
                     placed_polygons[index]
                     for index in range(count)
@@ -3353,9 +3993,55 @@ def plan_outer_first_rectangle(
                     candidate_polygons
                 )
                 if metrics is None:
+                    state["pruned_rect_range"] += 1
                     return
+                if target_size_mm is not None:
+                    rect = metrics["rect"]
+                    actual_long = max(
+                        rect["width"], rect["height"]
+                    )
+                    actual_short = min(
+                        rect["width"], rect["height"]
+                    )
+                    target_long = max(target_size_mm)
+                    target_short = min(target_size_mm)
+                    dimension_error = max(
+                        abs(actual_long - target_long),
+                        abs(actual_short - target_short),
+                    )
+                    closest_error = state[
+                        "closest_target_dimension_error_mm"
+                    ]
+                    if (
+                        closest_error is None
+                        or dimension_error < closest_error
+                    ):
+                        state[
+                            "closest_target_dimension_error_mm"
+                        ] = dimension_error
+                        state["closest_target_long_mm"] = (
+                            actual_long
+                        )
+                        state["closest_target_short_mm"] = (
+                            actual_short
+                        )
+                        state["closest_target_score"] = metrics[
+                            "score"
+                        ]
+                        state["closest_target_gap_mm2"] = metrics[
+                            "fill_gap_mm2"
+                        ]
+                    if (
+                        dimension_error
+                        > cfg.KNOWN_TARGET_DIMENSION_TOLERANCE_MM
+                    ):
+                        state["pruned_dimension"] += 1
+                        state["pruned_target_dimension"] += 1
+                        return
                 boundary_tolerance = (
-                    cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
+                    cfg.FIXED_RECT_BOUNDARY_TOLERANCE_MM
+                    if target_size_mm is not None
+                    else cfg.CORRESPONDING_VERTEX_TOLERANCE_MM
                     if _tolerant
                     else cfg.OUTER_EDGE_TOLERANCE_MM
                 )
@@ -3364,6 +4050,7 @@ def plan_outer_first_rectangle(
                     metrics["rect"],
                     tolerance=boundary_tolerance,
                 ):
+                    state["pruned_complete_boundary"] += 1
                     return
                 if metrics["score"] < best["score"]:
                     best["score"] = metrics["score"]
@@ -3380,6 +4067,9 @@ def plan_outer_first_rectangle(
                     ]
                     if metrics["score"] <= 1e-6:
                         state["exact_solution"] = True
+                    update_plan_debug(
+                        best_score=best["score"],
+                    )
                 return
 
             candidates = _outer_graph_state_candidates(
@@ -3425,6 +4115,13 @@ def plan_outer_first_rectangle(
                     }
                 )
                 next_indices = placed_indices + [new_index]
+                state["max_depth"] = max(
+                    state["max_depth"], len(next_indices)
+                )
+                update_plan_debug(
+                    depth=len(next_indices),
+                    nodes=state["nodes"],
+                )
                 state_key = []
                 for index in sorted(next_indices):
                     center = polygon_centroid(
@@ -3466,16 +4163,83 @@ def plan_outer_first_rectangle(
             break
 
     if best["metrics"] is None:
-        reason = (
-            "outer-first search limit reached"
-            if state["limit_hit"]
-            else "no outside-edge rectangle assembly"
-        )
+        if state["limit_hit"]:
+            reason = (
+                "outer-first search limit reached; nodes={};"
+                "max_depth={}; complete={}"
+            ).format(
+                state["nodes"],
+                state["max_depth"],
+                state["complete_state_count"],
+            )
+        elif (
+            target_size_mm is not None
+            and state["complete_state_count"] > 0
+            and state["closest_target_dimension_error_mm"]
+            is not None
+        ):
+            reason = (
+                "no outside-edge rectangle assembly: complete candidates "
+                "miss target; complete={};rect_range_reject={};"
+                "target_size_reject={};closest={:.1f}x{:.1f};"
+                "target={:.1f}x{:.1f};size_error={:.1f};"
+                "closest_gap={:.1f};seam_pairs={}"
+            ).format(
+                state["complete_state_count"],
+                state["pruned_rect_range"],
+                state["pruned_target_dimension"],
+                state["closest_target_long_mm"],
+                state["closest_target_short_mm"],
+                max(target_size_mm),
+                min(target_size_mm),
+                state["closest_target_dimension_error_mm"],
+                state["closest_target_gap_mm2"],
+                candidate_graph.filtered_pair_count,
+            )
+        elif state["complete_state_count"] > 0:
+            reason = (
+                "no outside-edge rectangle assembly: complete candidates "
+                "failed rectangle gates; complete={};rect_range_reject={};"
+                "outer_edge_reject={};seam_pairs={}"
+            ).format(
+                state["complete_state_count"],
+                state["pruned_rect_range"],
+                state["pruned_complete_boundary"],
+                candidate_graph.filtered_pair_count,
+            )
+        else:
+            reason = (
+                "no outside-edge rectangle assembly: seam graph did not "
+                "complete all pieces; max_depth={}/{};seam_pairs={};"
+                "pruned_boundary={};pruned_dimension={}"
+            ).format(
+                state["max_depth"],
+                count,
+                candidate_graph.filtered_pair_count,
+                state["pruned_boundary"],
+                state["pruned_dimension"],
+            )
         return failed(reason, nodes=state["nodes"])
 
+    rect = best["metrics"]["rect"]
+    known_target_rejection = _known_target_gate_reason(
+        best["metrics"],
+        rect["width"],
+        rect["height"],
+        target_size_mm,
+    )
+    if known_target_rejection is not None:
+        return failed(
+            known_target_rejection,
+            score=best["score"],
+            nodes=state["nodes"],
+            fill_gap=best["metrics"]["fill_gap_mm2"],
+        )
     score_threshold = (
         cfg.TOLERANT_RECTANGLE_SCORE_THRESHOLD
-        if _tolerant
+        if _tolerant and target_size_mm is None
+        else cfg.FIXED_RECT_SCORE_THRESHOLD
+        if target_size_mm is not None
         else cfg.RECTANGLE_SCORE_THRESHOLD
     )
     if best["score"] > score_threshold:
@@ -3488,11 +4252,13 @@ def plan_outer_first_rectangle(
             fill_gap=best["metrics"]["fill_gap_mm2"],
         )
     gap_tolerance = cfg.RECT_FILL_GAP_TOLERANCE_MM2
-    if _tolerant:
+    if _tolerant and target_size_mm is None:
         gap_tolerance = (
             cfg.TOLERANT_MAX_FILL_GAP_RATIO
             * best["metrics"]["rect"]["area"]
         )
+    elif target_size_mm is not None:
+        gap_tolerance = cfg.FIXED_RECT_MAX_GAP_MM2
     if best["metrics"]["fill_gap_mm2"] > gap_tolerance:
         return failed(
             "best outer-first gap {:.1f} exceeds {:.1f}".format(
@@ -3566,6 +4332,18 @@ def plan_rectangle_assembly(
             return fixed_plan
 
     mode = "tolerant" if _tolerant else "strict"
+    update_plan_debug(
+        stage=(
+            "tolerant_dfs"
+            if _tolerant
+            else "strict_dfs"
+        ),
+        depth=1,
+        states=1,
+        expanded=0,
+        nodes=0,
+    )
+    plan_debug_heartbeat()
 
     def failed(reason, score=None, nodes=0, fill_gap=None):
         if (
@@ -3610,6 +4388,10 @@ def plan_rectangle_assembly(
             state["limit_hit"] = True
             return
         state["nodes"] += 1
+        update_plan_debug(
+            depth=len(placed_indices),
+            nodes=state["nodes"],
+        )
         _geometry_exitpoint(state["nodes"])
         depth = len(placed_indices)
         if depth == count:
@@ -3632,6 +4414,9 @@ def plan_rectangle_assembly(
                 best["polygons"] = [list(poly) for poly in candidate_polygons]
                 best["transforms"] = list(placed_transforms)
                 best["seams"] = [dict(seam) for seam in seam_stack]
+                update_plan_debug(
+                    best_score=best["score"],
+                )
             return
 
         unplaced = [i for i in range(count) if i not in placed_indices]
@@ -3910,12 +4695,53 @@ def _representative_track_observation(track):
 class PieceTracker:
     """Maintain shape-aware stable IDs and per-piece motion state."""
 
-    def __init__(self):
+    def __init__(self, expected_count=None):
+        self.expected_count = (
+            None
+            if expected_count is None
+            else max(1, int(expected_count))
+        )
+        self.reset()
+
+    def reset(self, expected_count=None):
+        if expected_count is not None:
+            self.expected_count = max(1, int(expected_count))
         self.tracks = []
         self.next_id = 1
         self.last_count = None
 
     def _new_track(self, observation):
+        limit = (
+            self.expected_count
+            if self.expected_count is not None
+            else cfg.MAX_PIECE_COUNT
+        )
+        reusable = [
+            track
+            for track in self.tracks
+            if track.missed > cfg.TRACK_MAX_MISSED_FRAMES
+        ]
+        if reusable:
+            track = max(reusable, key=lambda item: item.missed)
+            observation.piece_id = track.piece_id
+            track.last = observation
+            track.history = [
+                (
+                    observation.centroid_mm,
+                    observation.current_orientation_deg,
+                )
+            ]
+            track.samples = [observation]
+            track.missed = 0
+            track.stable = False
+            return track
+        active_count = sum(
+            1
+            for track in self.tracks
+            if track.missed <= cfg.TRACK_MAX_MISSED_FRAMES
+        )
+        if active_count >= limit:
+            return None
         piece_id = "P{}".format(self.next_id)
         self.next_id += 1
         observation.piece_id = piece_id
@@ -3924,21 +4750,12 @@ class PieceTracker:
         return track
 
     def update(self, observations):
-        count_changed = (
-            self.last_count is not None
-            and self.last_count != len(observations)
-        )
         self.last_count = len(observations)
         active = [
             track
             for track in self.tracks
             if track.missed <= cfg.TRACK_MAX_MISSED_FRAMES
         ]
-        if count_changed:
-            for track in active:
-                track.history = []
-                track.samples = []
-                track.stable = False
         candidates = []
         for track_index, track in enumerate(active):
             for obs_index, observation in enumerate(observations):
@@ -3960,9 +4777,6 @@ class PieceTracker:
         for track in active:
             if track not in [pair[0] for pair in assignments]:
                 track.missed += 1
-                track.stable = False
-                track.history = []
-                track.samples = []
 
         stable_representatives = {}
         for track, observation in assignments:
@@ -4001,9 +4815,20 @@ class PieceTracker:
                     _angle_difference_deg(base_angle, sample[1], period=angle_period)
                     for sample in track.history
                 )
+                areas = sorted(
+                    sample.area_mm2 for sample in track.samples
+                )
+                median_area = areas[len(areas) // 2]
+                area_spread = max(
+                    abs(area - median_area)
+                    / max(EPS, median_area)
+                    for area in areas
+                )
                 track.stable = (
                     center_spread <= cfg.CENTER_STABLE_TOLERANCE_MM
                     and angle_spread <= cfg.ANGLE_STABLE_TOLERANCE_DEG
+                    and area_spread
+                    <= cfg.AREA_STABLE_TOLERANCE_RATIO
                 )
             observation.stable = track.stable
             if track.stable:
@@ -4018,19 +4843,36 @@ class PieceTracker:
 
         for obs_index, observation in enumerate(observations):
             if obs_index not in used_observations:
-                self._new_track(observation)
+                track = self._new_track(observation)
+                if track is not None:
+                    used_observations.add(obs_index)
 
-        for index, observation in enumerate(observations):
+        tracked_observations = [
+            observation
+            for observation in observations
+            if observation.piece_id
+        ]
+        for index, observation in enumerate(tracked_observations):
             representative = stable_representatives.get(
                 observation.piece_id
             )
             if representative is not None:
-                observations[index] = representative
-        observations.sort(key=lambda observation: int(observation.piece_id[1:]))
+                tracked_observations[index] = representative
+        observations = tracked_observations
+        observations.sort(
+            key=lambda observation: int(observation.piece_id[1:])
+        )
+        count_ready = (
+            len(observations) == self.expected_count
+            if self.expected_count is not None
+            else (
+                cfg.MIN_PIECE_COUNT
+                <= len(observations)
+                <= cfg.MAX_PIECE_COUNT
+            )
+        )
         all_stable = (
-            not count_changed
-            and
-            cfg.MIN_PIECE_COUNT <= len(observations) <= cfg.MAX_PIECE_COUNT
+            count_ready
             and all(observation.stable for observation in observations)
         )
         return observations, all_stable

@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/lvreng/puzzle-vision-simulator.git",
+  "commit": "e9eb2e0fb945c348eedd0b0fa9258f5518d2892f",
+  "retrieved_for_analysis": "2026-07-30",
+  "tracked_source_policy": "The upstream checkout is runtime-fetched into .upstream and is not copied into this repository because the inspected upstream commit has no repository-level license file."
+}
+

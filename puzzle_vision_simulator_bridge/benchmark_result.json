@@ -1,0 +1,76 @@
+{
+  "input": {
+    "image": "/home/jjjack/Desktop/eccom/trail_recognition/sample_puzzle.jpg",
+    "piece_count": 4,
+    "vertex_counts": [
+      3,
+      4,
+      4,
+      4
+    ],
+    "timing_scope": "planner only; identical PieceObservation input"
+  },
+  "planners": {
+    "upstream_bridge_local_validation": {
+      "median_ms": 102.32408599404152,
+      "min_ms": 101.4680960070109,
+      "max_ms": 132.0131090033101,
+      "rounds": 7,
+      "valid": false,
+      "mode": "upstream_bridge_auto_local",
+      "score": 0.11395766642612584,
+      "fill_gap_mm2": 281.63081962395063,
+      "overlap_mm2": 31.500403359935262,
+      "outside_mm2": 252.7970829306687,
+      "search_nodes": 0,
+      "reason": "upstream proposal rejected by local gates: outside_mm2=252.8>250.0; overlap_mm2=31.5>30.0; fill_gap_mm2=281.6>220.0"
+    },
+    "local_outer_first": {
+      "median_ms": 46.91782800364308,
+      "min_ms": 45.55084700405132,
+      "max_ms": 48.388652998255566,
+      "rounds": 7,
+      "valid": true,
+      "mode": "corner_outer_strict",
+      "score": 0.031757453540142214,
+      "fill_gap_mm2": 85.64321826679497,
+      "overlap_mm2": 4.147904510149601,
+      "outside_mm2": 84.1619804233103,
+      "search_nodes": 1120,
+      "reason": "ok"
+    },
+    "upstream_then_outer_fallback": {
+      "median_ms": 149.08121099870186,
+      "min_ms": 147.72852799796965,
+      "max_ms": 158.69748299883213,
+      "rounds": 7,
+      "valid": true,
+      "mode": "bridge_outer_fallback/corner_outer_strict",
+      "score": 0.031757453540142214,
+      "fill_gap_mm2": 85.64321826679497,
+      "overlap_mm2": 4.147904510149601,
+      "outside_mm2": 84.1619804233103,
+      "search_nodes": 1120,
+      "reason": "ok"
+    },
+    "local_fixed_default_dispatch": {
+      "median_ms": 2175.857203998021,
+      "min_ms": 2169.1398800030584,
+      "max_ms": 2181.3433630013606,
+      "rounds": 3,
+      "valid": true,
+      "mode": "fixed_tolerant",
+      "score": 0.031757453540141055,
+      "fill_gap_mm2": 85.64321826679407,
+      "overlap_mm2": 4.147904510148464,
+      "outside_mm2": 84.16198042330996,
+      "search_nodes": 2730,
+      "reason": "ok"
+    }
+  },
+  "ratios": {
+    "fixed_over_upstream": 21.264369799743182,
+    "fixed_over_outer_first": 46.375915011007535,
+    "upstream_over_outer_first": 2.1809212051780458
+  }
+}

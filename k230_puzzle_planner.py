@@ -19,7 +19,12 @@ from puzzle_a4_boundary import (
     A4BoundaryTracker,
     detect_a4_boundary,
 )
-from puzzle_geometry import PieceTracker, plan_rectangle_assembly
+from puzzle_geometry import (
+    PieceTracker,
+    begin_plan_debug,
+    end_plan_debug,
+    plan_rectangle_assembly,
+)
 from puzzle_vision import detect_pieces_from_canmv_image
 
 
@@ -196,13 +201,18 @@ def _source_screen_point(point_mm):
     )
 
 
-def _target_screen_point(point_mm):
+def _target_screen_point(point_mm, divider_y_mm=None):
     origin_x = 350
     origin_y = 44
     scale = 1.10
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
     return (
         int(origin_x + point_mm[0] * scale),
-        int(origin_y + (point_mm[1] - cfg.DIVIDER_Y_MM) * scale),
+        int(origin_y + (point_mm[1] - divider) * scale),
     )
 
 
@@ -215,6 +225,7 @@ def _render_status(
     fps,
     error,
     calibration_state=None,
+    divider_y_mm=None,
 ):
     canvas.clear()
     _draw_text(canvas, 12, 10, "K230 A4 PUZZLE V1", WHITE, 2)
@@ -228,7 +239,12 @@ def _render_status(
 
     # Current upper-half A4 schematic.
     source_width = int(cfg.A4_WIDTH_MM * 1.40)
-    source_height = int(cfg.DIVIDER_Y_MM * 1.40)
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
+    source_height = int(divider * 1.40)
     _draw_box(canvas, 18, 44, source_width, source_height, GRAY)
     _draw_text(canvas, 18, 263, "CURRENT / mm", GRAY)
     for index, piece in enumerate(pieces):
@@ -257,14 +273,18 @@ def _render_status(
     # Target lower-half A4 schematic.
     target_width = int(cfg.A4_WIDTH_MM * 1.10)
     target_height = int(
-        (cfg.A4_HEIGHT_MM - cfg.DIVIDER_Y_MM) * 1.10
+        (cfg.A4_HEIGHT_MM - divider) * 1.10
     )
     _draw_box(canvas, 350, 44, target_width, target_height, GRAY)
     _draw_text(canvas, 350, 225, "TARGET / mm", GRAY)
     if plan is not None and plan.valid:
         min_x, min_y, max_x, max_y = plan.target_rect
-        rect_a = _target_screen_point((min_x, min_y))
-        rect_b = _target_screen_point((max_x, max_y))
+        rect_a = _target_screen_point(
+            (min_x, min_y), divider
+        )
+        rect_b = _target_screen_point(
+            (max_x, max_y), divider
+        )
         _draw_box(
             canvas,
             rect_a[0],
@@ -278,7 +298,8 @@ def _render_status(
             polygon = plan.target_polygons.get(piece.piece_id)
             if polygon:
                 points = [
-                    _target_screen_point(point) for point in polygon
+                    _target_screen_point(point, divider)
+                    for point in polygon
                 ]
                 _draw_polyline(canvas, points, color)
                 operation = None
@@ -288,7 +309,8 @@ def _render_status(
                         break
                 if operation is not None:
                     centre = _target_screen_point(
-                        operation["target_center_mm"]
+                        operation["target_center_mm"],
+                        divider,
                     )
                     canvas.draw_cross(
                         centre[0],
@@ -393,7 +415,8 @@ def _print_plan(plan, pieces, frame_index):
         print(
             "PLAN_PERF,frame={},time_ms={},nodes={},edge_pairs={},"
             "filtered={},intersections={},aabb_rejects={},"
-            "rect_hypotheses={}".format(
+            "rect_hypotheses={},input_area_mm2={},"
+            "area_scale={}".format(
                 frame_index,
                 stats.get("plan_ms", 0),
                 stats.get(
@@ -405,7 +428,29 @@ def _print_plan(plan, pieces, frame_index):
                 ),
                 stats.get("polygon_intersection_calls", 0),
                 stats.get("aabb_reject_count", 0),
-                stats.get("rectangle_hypothesis_count", 0),
+                stats.get(
+                    "rectangle_hypothesis_count",
+                    stats.get(
+                        "corner_rectangle_hypothesis_count",
+                        0,
+                    ),
+                ),
+                (
+                    "{:.1f}".format(
+                        stats["input_piece_area_mm2"]
+                    )
+                    if stats.get("input_piece_area_mm2")
+                    is not None
+                    else "na"
+                ),
+                (
+                    "{:.4f}".format(
+                        stats["target_area_scale"]
+                    )
+                    if stats.get("target_area_scale")
+                    is not None
+                    else "na"
+                ),
             )
         )
     if not plan.valid:
@@ -414,6 +459,93 @@ def _print_plan(plan, pieces, frame_index):
                 frame_index, plan.reason.replace(",", ";")
             )
         )
+        if (
+            stats
+            and stats.get("candidate_pair_count_raw")
+            is not None
+        ):
+            if stats.get("limit_hit"):
+                failure_class = "search_limit"
+            elif stats.get("pruned_target_dimension", 0):
+                failure_class = "target_geometry"
+            elif stats.get("complete_state_count", 0):
+                failure_class = "rectangle_gate"
+            else:
+                failure_class = "seam_connectivity"
+
+            def stat_float(key):
+                value = stats.get(key)
+                return (
+                    "{:.1f}".format(value)
+                    if value is not None
+                    else "na"
+                )
+
+            print(
+                "PLAN_FAIL_DETAIL,frame={},class={},complete={},"
+                "max_depth={},seam_pairs={},rect_range_reject={},"
+                "input_area_mm2={},target_area_mm2={},"
+                "area_error_pct={},area_scale={},"
+                "target_size_reject={},closest_size={}x{},"
+                "size_error_mm={},closest_gap_mm2={},"
+                "pruned_boundary={},pruned_dimension={},"
+                "corner_reason={},corner_nodes={},corner_depth={},"
+                "corner_complete={},corner_overlap_reject={}".format(
+                    frame_index,
+                    failure_class,
+                    stats.get("complete_state_count", 0),
+                    stats.get("max_depth", 0),
+                    stats.get(
+                        "candidate_pair_count_filtered", 0
+                    ),
+                    stats.get("pruned_rect_range", 0),
+                    stat_float("input_piece_area_mm2"),
+                    stat_float("target_area_mm2"),
+                    stat_float("input_area_error_pct"),
+                    (
+                        "{:.4f}".format(
+                            stats["target_area_scale"]
+                        )
+                        if stats.get("target_area_scale")
+                        is not None
+                        else "na"
+                    ),
+                    stats.get(
+                        "pruned_target_dimension", 0
+                    ),
+                    stat_float("closest_target_long_mm"),
+                    stat_float("closest_target_short_mm"),
+                    stat_float(
+                        "closest_target_dimension_error_mm"
+                    ),
+                    stat_float("closest_target_gap_mm2"),
+                    stats.get("pruned_boundary", 0),
+                    stats.get("pruned_dimension", 0),
+                    str(
+                        stats.get(
+                            "corner_failure_reason", "not_attempted"
+                        )
+                    ).replace(",", ";"),
+                    stats.get("corner_search_nodes", 0),
+                    stats.get("corner_max_depth", 0),
+                    stats.get("corner_complete_state_count", 0),
+                    stats.get("corner_pruned_overlap", 0),
+                )
+            )
+        for piece in pieces:
+            vertices = "|".join(
+                "{:.1f}:{:.1f}".format(point[0], point[1])
+                for point in piece.polygon_mm
+            )
+            print(
+                "PLAN_INPUT,frame={},id={},area_mm2={:.1f},"
+                "vertices={}".format(
+                    frame_index,
+                    piece.piece_id,
+                    piece.area_mm2,
+                    vertices,
+                )
+            )
         return
     target_width = (
         plan.target_rect[2] - plan.target_rect[0]
@@ -467,6 +599,14 @@ def _plan_key(pieces):
                 int(round(piece.centroid_mm[0] * 2.0)),
                 int(round(piece.centroid_mm[1] * 2.0)),
                 int(round(piece.current_orientation_deg * 2.0)),
+                int(round(piece.area_mm2 * 2.0)),
+                tuple(
+                    (
+                        int(round(point[0] * 2.0)),
+                        int(round(point[1] * 2.0)),
+                    )
+                    for point in piece.polygon_mm
+                ),
             )
         )
     return tuple(values)
@@ -521,13 +661,16 @@ def main():
         ]
         print(
             "START,frame_width={},frame_height={},work={}x{},"
-            "backend=image-native,debug_camera={},auto_a4={}".format(
+            "backend=image-native,debug_camera={},auto_a4={},"
+            "plan_debug={},plan_debug_ms={}".format(
                 cfg.FRAME_WIDTH,
                 cfg.FRAME_HEIGHT,
                 cfg.CANMV_WORK_WIDTH,
                 cfg.CANMV_WORK_HEIGHT,
                 int(cfg.DEBUG_SHOW_CAMERA),
                 int(cfg.AUTO_CALIBRATE_A4),
+                int(cfg.ENABLE_PLAN_DEBUG),
+                cfg.PLAN_DEBUG_INTERVAL_MS,
             )
         )
 
@@ -617,7 +760,18 @@ def main():
                 # invalidates the plan immediately; sub-threshold jitter must
                 # not rerun the beam search every frame.
                 if not last_stable or active_plan is None:
-                    active_plan = plan_rectangle_assembly(pieces)
+                    begin_plan_debug(
+                        "fixed_rectangle"
+                        if cfg.TARGET_RECT_SIZE_MM is not None
+                        else "outer_first",
+                        len(pieces),
+                    )
+                    try:
+                        active_plan = plan_rectangle_assembly(
+                            pieces
+                        )
+                    finally:
+                        end_plan_debug()
                     active_plan_key = key
                     _print_plan(active_plan, pieces, frame_index)
 

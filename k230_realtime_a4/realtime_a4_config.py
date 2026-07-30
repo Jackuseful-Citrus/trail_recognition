@@ -1,12 +1,28 @@
-"""Configuration overrides for shake-tolerant automatic A4 tracking."""
+"""Configuration overrides for the fixed, manually calibrated A4 runtime."""
 
 from puzzle_config import *
 
 
-# Normal contest mode: show the camera automatically while acquiring A4, keep
-# the green locked outline briefly, then switch to the result canvas without a
-# manual configuration change.  Set DEBUG_SHOW_CAMERA only when a persistent
-# raw-camera diagnostic view is explicitly needed.
+# Fixed manual calibration in physical A4 order: TL, TR, BR, BL.  Because the
+# A4 is landscape in the camera and the fragment half is on image-left, these
+# physical labels appear as image BL, image TL, image TR, image BR.  This set
+# was copied from the previously stable A4_LOCK log.  The realtime loop never
+# searches for, smooths, or updates these points.
+AUTO_CALIBRATE_A4 = False
+A4_CORNERS_PX = [
+    (133.0, 441.0),
+    (140.0, 78.0),
+    (619.0, 83.0),
+    (614.0, 449.0),
+]
+# The separator is the physical midpoint of the fixed A4 coordinate system.
+# Do not let the white line participate in calibration or alter the split.
+ENABLE_DYNAMIC_DIVIDER = False
+A4_REQUIRE_DIVIDER_FOR_LOCK = False
+
+# Show the fixed green calibration outline briefly at startup, then switch to
+# the result canvas. Set DEBUG_SHOW_CAMERA only when the outline should remain
+# visible continuously.
 DEBUG_SHOW_CAMERA = False
 A4_AUTO_SEARCH_PREVIEW = True
 A4_LOCK_PREVIEW_HOLD_FRAMES = 20
@@ -40,6 +56,14 @@ A4_TOP_SIDE = "auto"
 A4_DARK_THRESHOLD = 135
 A4_MAX_INSIDE_GRAY = 178.0
 A4_DARK_BLOB_MIN_AREA_RATIO = 0.03
+# The internal divider can outline a half-sheet whose aspect ratio is again
+# A-series-valid. Probe across each edge and reject it when dark paper
+# continues outside the proposed boundary.
+A4_EDGE_PROBE_OFFSET_PX = 8.0
+A4_EDGE_PROBE_SAMPLES = 9
+A4_INTERNAL_EDGE_SIMILAR_GRAY_DELTA = 24.0
+A4_INTERNAL_EDGE_DARK_RATIO_MAX = 0.67
+A4_INTERNAL_EDGE_MIN_SAMPLES = 5
 
 # Dynamic corner tracker. Large motion follows quickly; sub-pixel edge jitter
 # is smoothed more strongly. A few missed frames may reuse the last boundary.
@@ -105,6 +129,17 @@ STABLE_WINDOW_FRAMES = 8
 REQUIRED_STABLE_FRAMES = 4
 CENTER_STABLE_TOLERANCE_MM = 4.0
 ANGLE_STABLE_TOLERANCE_DEG = 8.0
+
+# Planning can take much longer on MicroPython than on desktop CPython. Emit
+# one compact progress heartbeat every two seconds so an IDE interrupt still
+# leaves evidence of the active stage and search growth.
+ENABLE_PLAN_DEBUG = True
+PLAN_DEBUG_INTERVAL_MS = 2000
+# Fixed-size beam search performs more than 100k exact polygon intersections
+# for the current four-piece sample and takes tens of seconds on K230. The
+# candidate-graph outer-first planner returns the same desktop solution with
+# roughly 2.6k intersections and has explicit node/wall-clock limits.
+PREFER_OUTER_FIRST_PLANNER = True
 
 # At 240x336, a hand-cut corner can move by several pixels between perspective
 # corrections. Remove shallow raster corners more consistently before temporal

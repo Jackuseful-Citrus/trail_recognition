@@ -159,6 +159,39 @@ class VisionRegressionTests(unittest.TestCase):
         self.assertEqual(dark_threshold, 100)
         self.assertEqual(bright_threshold, 150)
 
+    def test_canmv_native_detection_uses_live_divider_position(self):
+        width = cfg.CANMV_WORK_WIDTH
+        height = cfg.CANMV_WORK_HEIGHT
+        gray = np.full((height, width), 25, dtype=np.uint8)
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+        divider_y_mm = cfg.DIVIDER_Y_MM - 6.0
+        _, diagnostics = detect_pieces_from_canmv_image(
+            _FakeCanMVGrayImage(gray),
+            corners,
+            (width, height),
+            divider_y_mm=divider_y_mm,
+        )
+        self.assertTrue(diagnostics["divider_detected"])
+        self.assertAlmostEqual(
+            diagnostics["divider_y_mm"],
+            divider_y_mm,
+        )
+        pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
+        expected_end = max(
+            2,
+            int(divider_y_mm * pixels_per_mm_y + 0.5)
+            - int(2.0 * pixels_per_mm_y + 0.5),
+        )
+        self.assertEqual(
+            diagnostics["detection_end_row"],
+            expected_end,
+        )
+
     def test_canmv_background_delta_detects_under_two_exposures(self):
         width = cfg.CANMV_WORK_WIDTH
         height = cfg.CANMV_WORK_HEIGHT

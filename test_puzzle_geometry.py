@@ -7,6 +7,7 @@ import puzzle_config as cfg
 from puzzle_geometry import (
     PieceObservation,
     PieceTracker,
+    _known_target_gate_reason,
     edge_lengths,
     interior_angles,
     match_piece_across_frames,
@@ -247,9 +248,98 @@ class GeometryTests(unittest.TestCase):
         # whichever noisy fit happened to arrive on the final frame.
         self.assertEqual(len(output[0].polygon_mm), 4)
 
+    def test_tracker_holds_ids_and_history_through_count_dip(self):
+        polygons = [
+            [(0, 0), (40, 0), (35, 22), (0, 20)],
+            [(60, 0), (92, 0), (88, 25), (62, 28)],
+            [(0, 55), (35, 52), (18, 82)],
+            [(65, 55), (105, 55), (103, 82), (66, 85)],
+        ]
+        tracker = PieceTracker(expected_count=4)
+        output = []
+        for _ in range(cfg.REQUIRED_STABLE_FRAMES + 1):
+            output, stable = tracker.update(
+                [
+                    PieceObservation("", [], polygon)
+                    for polygon in polygons
+                ]
+            )
+        self.assertTrue(stable)
+        original_ids = [piece.piece_id for piece in output]
+        history_lengths = {
+            track.piece_id: len(track.history)
+            for track in tracker.tracks
+        }
+
+        partial, stable = tracker.update(
+            [
+                PieceObservation("", [], polygon)
+                for polygon in polygons[:3]
+            ]
+        )
+        self.assertFalse(stable)
+        self.assertEqual(
+            [piece.piece_id for piece in partial],
+            original_ids[:3],
+        )
+        missing_track = next(
+            track
+            for track in tracker.tracks
+            if track.piece_id == original_ids[3]
+        )
+        self.assertEqual(
+            len(missing_track.history),
+            history_lengths[original_ids[3]],
+        )
+        self.assertTrue(missing_track.stable)
+
+        recovered, stable = tracker.update(
+            [
+                PieceObservation("", [], polygon)
+                for polygon in polygons
+            ]
+        )
+        self.assertTrue(stable)
+        self.assertEqual(
+            [piece.piece_id for piece in recovered], original_ids
+        )
+        self.assertLessEqual(tracker.next_id, 5)
+
     def test_rectangle_score(self):
         rectangle = [(0, 0), (100, 0), (100, 60), (0, 60)]
         self.assertAlmostEqual(score_rectangle_assembly([rectangle]), 0.0)
+
+    def test_known_target_gate_rejects_logged_open_fan_plan(self):
+        metrics = {
+            "score": 0.2609,
+            "fill_gap_mm2": 2197.3,
+            "overlap_mm2": 0.0,
+            "outside_mm2": 0.0,
+        }
+        reason = _known_target_gate_reason(
+            metrics,
+            105.3,
+            80.0,
+            (100.0, 60.0),
+        )
+        self.assertIsNotNone(reason)
+        self.assertIn("actual=105.3x80.0", reason)
+        self.assertIn("gap=2197.3", reason)
+
+        accepted_metrics = {
+            "score": 0.0318,
+            "fill_gap_mm2": 85.7,
+            "overlap_mm2": 4.2,
+            "outside_mm2": 84.2,
+        }
+        self.assertIsNone(
+            _known_target_gate_reason(
+                accepted_metrics,
+                100.0,
+                60.0,
+                (100.0, 60.0),
+            )
+        )
 
     def test_four_piece_rectangle_planning(self):
         source_polygons = [
@@ -292,6 +382,59 @@ class GeometryTests(unittest.TestCase):
         )
         self.assertLessEqual(max_x, cfg.A4_WIDTH_MM - cfg.TARGET_MARGIN_MM)
         self.assertLessEqual(max_y, cfg.A4_HEIGHT_MM - cfg.TARGET_MARGIN_MM)
+
+    def test_known_target_corrects_small_common_scale_bias(self):
+        source_polygons = [
+            [(0, 0), (50, 30), (0, 60)],
+            [(0, 0), (100, 0), (50, 30)],
+            [(100, 0), (100, 60), (50, 30)],
+            [(100, 60), (0, 60), (50, 30)],
+        ]
+        pieces = []
+        for index, polygon in enumerate(source_polygons):
+            center = polygon_centroid(polygon)
+            scaled = [
+                (
+                    center[0] + (point[0] - center[0]) * 1.02,
+                    center[1] + (point[1] - center[1]) * 1.02,
+                )
+                for point in polygon
+            ]
+            angle_deg = (20.0, -35.0, 75.0, 130.0)[index]
+            angle = math.radians(angle_deg)
+            pieces.append(
+                PieceObservation(
+                    "S{}".format(index + 1),
+                    [],
+                    transform_polygon(
+                        scaled,
+                        (
+                            math.cos(angle),
+                            math.sin(angle),
+                            20.0 + index * 35.0,
+                            30.0 + index * 17.0,
+                            angle_deg,
+                        ),
+                    ),
+                    confidence=0.95,
+                )
+            )
+        plan = plan_outer_first_rectangle(
+            pieces,
+            target_size_mm=(100.0, 60.0),
+        )
+        self.assertTrue(plan.valid, plan.reason)
+        self.assertAlmostEqual(
+            plan.plan_stats["target_area_scale"],
+            1.0 / 1.02,
+            places=6,
+        )
+        width = plan.target_rect[2] - plan.target_rect[0]
+        height = plan.target_rect[3] - plan.target_rect[1]
+        self.assertEqual(
+            sorted((round(width, 1), round(height, 1))),
+            [60.0, 100.0],
+        )
 
     def test_outer_first_unknown_sizes_and_piece_counts(self):
         cases = [
@@ -417,6 +560,75 @@ class GeometryTests(unittest.TestCase):
         )
         self.assertLess(plan.max_vertex_error_mm, 2.0)
         self.assertLess(plan.score, 0.05)
+
+    def test_outer_first_failure_explains_target_geometry_mismatch(self):
+        pieces = [
+            PieceObservation(
+                "P1",
+                [],
+                [(18.5, 92.2), (82.6, 138.0), (54.5, 40.8)],
+            ),
+            PieceObservation(
+                "P2",
+                [],
+                [
+                    (90.5, 39.0),
+                    (164.3, 53.2),
+                    (169.6, 22.2),
+                    (67.7, 18.6),
+                ],
+            ),
+            PieceObservation(
+                "P3",
+                [],
+                [
+                    (90.5, 89.5),
+                    (137.9, 98.4),
+                    (170.5, 73.6),
+                    (163.4, 63.8),
+                ],
+            ),
+            PieceObservation(
+                "P4",
+                [],
+                [
+                    (151.1, 118.8),
+                    (137.1, 135.6),
+                    (173.1, 135.6),
+                    (172.2, 115.3),
+                ],
+            ),
+        ]
+        plan = plan_outer_first_rectangle(
+            pieces,
+            target_size_mm=(100.0, 60.0),
+        )
+        self.assertFalse(plan.valid)
+        self.assertIn(
+            "complete candidates miss target", plan.reason
+        )
+        self.assertIn("closest=", plan.reason)
+        self.assertGreater(
+            plan.plan_stats["complete_state_count"], 0
+        )
+        self.assertGreater(
+            plan.plan_stats["pruned_target_dimension"], 0
+        )
+        self.assertGreater(
+            plan.plan_stats[
+                "closest_target_dimension_error_mm"
+            ],
+            cfg.KNOWN_TARGET_DIMENSION_TOLERANCE_MM,
+        )
+        self.assertIn(
+            "corner_failure_reason", plan.plan_stats
+        )
+        self.assertEqual(
+            plan.plan_stats["target_area_mm2"], 6000.0
+        )
+        self.assertLess(
+            plan.plan_stats["input_area_error_pct"], 6.0
+        )
 
 
 if __name__ == "__main__":

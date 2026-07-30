@@ -275,18 +275,35 @@ def _refine_vertices_with_lines(contour, polygon):
         return list(polygon)
     groups = [[] for _ in polygon]
     for point in contour:
-        nearest = min(
-            range(len(polygon)),
-            key=lambda index: _point_line_distance(
-                point,
-                polygon[index],
-                polygon[(index + 1) % len(polygon)],
-            ),
-        )
+        distances = [
+            (
+                _point_line_distance(
+                    point,
+                    polygon[index],
+                    polygon[(index + 1) % len(polygon)],
+                ),
+                index,
+            )
+            for index in range(len(polygon))
+        ]
+        distances.sort()
+        # A vertex belongs equally to two adjacent sides. Excluding numerical
+        # ties keeps the fitted lines independent of ring start/direction.
+        if (
+            len(distances) > 1
+            and abs(distances[0][0] - distances[1][0])
+            <= cfg.GEOMETRY_EPSILON_MM
+        ):
+            continue
+        nearest = distances[0][1]
         groups[nearest].append(point)
     lines = []
     for index, points in enumerate(groups):
-        fitted = _fit_line(points)
+        fitted = (
+            _fit_line(points)
+            if len(points) >= cfg.LINE_FIT_MIN_POINTS
+            else None
+        )
         if (
             fitted is None
             or fitted[2] > cfg.LINE_FIT_MAX_ERROR_MM
@@ -307,7 +324,7 @@ def _refine_vertices_with_lines(contour, polygon):
     result = []
     # Line fitting should reduce raster jitter, not move a hand-cut vertex by
     # several millimetres and thereby change the puzzle geometry.
-    maximum_shift = cfg.GEOMETRY_EPSILON_MM
+    maximum_shift = cfg.LINE_REFINE_MAX_SHIFT_MM
     for index, original in enumerate(polygon):
         point = _infinite_line_intersection(
             lines[(index - 1) % len(lines)],
@@ -322,6 +339,14 @@ def _refine_vertices_with_lines(contour, polygon):
             result.append(original)
         else:
             result.append(point)
+    original_area = polygon_area(polygon)
+    refined_area = polygon_area(result)
+    if (
+        original_area <= 1e-9
+        or abs(refined_area - original_area) / original_area
+        > cfg.LINE_REFINE_MAX_AREA_CHANGE_RATIO
+    ):
+        return list(polygon)
     return result
 
 
@@ -861,13 +886,40 @@ def _nearest_white_pixel(
     return best
 
 
+class _ComponentMaskRow:
+    __slots__ = ("data", "offset")
+
+    def __init__(self, data, offset):
+        self.data = data
+        self.offset = int(offset)
+
+    def __getitem__(self, x):
+        return self.data[self.offset + int(x)]
+
+
+class _ComponentMask:
+    """Minimal 2-D bytearray view accepted by trace_ordered_boundary."""
+
+    __slots__ = ("data", "shape", "width")
+
+    def __init__(self, data, width, height):
+        self.data = data
+        self.width = int(width)
+        self.shape = (int(height), int(width))
+
+    def __getitem__(self, y):
+        return _ComponentMaskRow(
+            self.data, int(y) * self.width
+        )
+
+
 def _component_boundary(
     gray_array,
     rect,
     center,
     threshold,
 ):
-    """Flood one thresholded component and return only its boundary pixels."""
+    """Flood-isolate one component, then Moore-trace its ordered boundary."""
     array_height = int(gray_array.shape[0])
     array_width = int(gray_array.shape[1])
     x0 = max(0, int(rect[0]))
@@ -876,8 +928,16 @@ def _component_boundary(
     y1 = min(array_height, y0 + max(1, int(rect[3])))
     width = x1 - x0
     height = y1 - y0
+    diagnostics = {
+        "ok": False,
+        "reason": "",
+        "pixel_reads": 0,
+        "boundary_steps": 0,
+        "component_pixels": 0,
+    }
     if width <= 0 or height <= 0:
-        return []
+        diagnostics["reason"] = "fallback_empty_bbox"
+        return [], diagnostics
 
     seed = _nearest_white_pixel(
         gray_array,
@@ -890,7 +950,8 @@ def _component_boundary(
         threshold,
     )
     if seed is None:
-        return []
+        diagnostics["reason"] = "fallback_no_seed"
+        return [], diagnostics
 
     # One byte per bounding-box pixel is predictable and much smaller than a
     # Python set of coordinate tuples on MicroPython.
@@ -898,7 +959,6 @@ def _component_boundary(
     seed_index = (seed[1] - y0) * width + (seed[0] - x0)
     visited[seed_index] = 1
     stack = [seed_index]
-    boundary = []
     neighbor_offsets = (
         (-1, -1),
         (0, -1),
@@ -921,8 +981,8 @@ def _component_boundary(
         y = y0 + local_y
         if not _pixel_is_white(gray_array, x, y, threshold):
             continue
+        diagnostics["component_pixels"] += 1
 
-        is_boundary = False
         for dx, dy in neighbor_offsets:
             nx = x + dx
             ny = y + dy
@@ -935,15 +995,31 @@ def _component_boundary(
                     gray_array, nx, ny, threshold
                 )
             ):
-                is_boundary = True
                 continue
             neighbor_index = (ny - y0) * width + (nx - x0)
             if not visited[neighbor_index]:
                 visited[neighbor_index] = 1
                 stack.append(neighbor_index)
-        if is_boundary:
-            boundary.append((float(x), float(y)))
-    return boundary
+    local_mask = _ComponentMask(visited, width, height)
+    boundary, trace = trace_ordered_boundary(
+        local_mask,
+        (0, 0, width, height),
+        1,
+    )
+    diagnostics["ok"] = bool(trace["ok"])
+    diagnostics["reason"] = (
+        "fallback_ok"
+        if trace["ok"]
+        else "fallback_{}".format(trace["reason"])
+    )
+    diagnostics["pixel_reads"] = trace["pixel_reads"]
+    diagnostics["boundary_steps"] = trace["boundary_steps"]
+    if not trace["ok"]:
+        return [], diagnostics
+    return [
+        (point[0] + x0, point[1] + y0)
+        for point in boundary
+    ], diagnostics
 
 
 def _cross(origin, a, b):
@@ -1044,6 +1120,16 @@ def _extract_canmv_polygon(
     boundary_px, trace_diagnostics = trace_ordered_boundary(
         gray_array, rect, threshold
     )
+    trace_diagnostics["boundary_primary_ok"] = bool(
+        trace_diagnostics["ok"]
+    )
+    trace_diagnostics["boundary_fallback_used"] = False
+    trace_diagnostics["boundary_fallback_ordered_ok"] = False
+    trace_diagnostics["boundary_failure_reason"] = (
+        ""
+        if trace_diagnostics["ok"]
+        else trace_diagnostics["reason"]
+    )
     if (
         not trace_diagnostics["ok"]
         or len(boundary_px) < cfg.BOUNDARY_TRACE_MIN_POINTS
@@ -1053,15 +1139,41 @@ def _extract_canmv_polygon(
                 "contour_ms", contour_started
             )
             return None, boundary_px, trace_diagnostics
-        boundary_px = _component_boundary(
+        boundary_px, fallback_diagnostics = _component_boundary(
             gray_array, rect, center, threshold
         )
         trace_diagnostics["fallback"] = True
+        trace_diagnostics["boundary_fallback_used"] = True
+        trace_diagnostics["boundary_fallback_ordered_ok"] = bool(
+            fallback_diagnostics["ok"]
+        )
+        trace_diagnostics["ok"] = bool(
+            fallback_diagnostics["ok"]
+        )
+        trace_diagnostics["reason"] = fallback_diagnostics["reason"]
+        trace_diagnostics["boundary_failure_reason"] = (
+            ""
+            if fallback_diagnostics["ok"]
+            else fallback_diagnostics["reason"]
+        )
+        trace_diagnostics["pixel_reads"] += fallback_diagnostics[
+            "pixel_reads"
+        ]
+        trace_diagnostics["boundary_steps"] += fallback_diagnostics[
+            "boundary_steps"
+        ]
         PERF_STATS.increment("boundary_fallback_count")
     else:
         trace_diagnostics["fallback"] = False
     PERF_STATS.add_stage("contour_ms", contour_started)
-    if len(boundary_px) < cfg.MIN_POLYGON_VERTICES:
+    if (
+        not trace_diagnostics["ok"]
+        or len(boundary_px) < cfg.MIN_POLYGON_VERTICES
+    ):
+        if not trace_diagnostics["boundary_failure_reason"]:
+            trace_diagnostics["boundary_failure_reason"] = (
+                "ordered_boundary_too_short"
+            )
         return None, boundary_px, trace_diagnostics
 
     fit_started = PERF_STATS.mark()
@@ -1097,6 +1209,7 @@ def detect_pieces_from_canmv_image(
     source_frame_size,
     region="upper",
     threshold=None,
+    divider_y_mm=None,
 ):
     """Detect pieces with CanMV v1.6 native image APIs, without ``cv2``.
 
@@ -1127,8 +1240,16 @@ def detect_pieces_from_canmv_image(
 
     pixels_per_mm_x = float(work_width - 1) / cfg.A4_WIDTH_MM
     pixels_per_mm_y = float(work_height - 1) / cfg.A4_HEIGHT_MM
+    active_divider_y_mm = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else max(
+            0.0,
+            min(cfg.A4_HEIGHT_MM, float(divider_y_mm)),
+        )
+    )
     nominal_divider = int(
-        cfg.DIVIDER_Y_MM * pixels_per_mm_y + 0.5
+        active_divider_y_mm * pixels_per_mm_y + 0.5
     )
     upper_end = max(
         2,
@@ -1268,6 +1389,9 @@ def detect_pieces_from_canmv_image(
     boundary_steps = 0
     pixel_reads = 0
     fallback_count = 0
+    primary_boundary_ok_count = 0
+    ordered_fallback_ok_count = 0
+    boundary_failure_reasons = {}
     trace_failures = {}
     for blob, region_start, region_end in blob_regions:
         rect = tuple(_blob_value(blob, "rect", None))
@@ -1302,8 +1426,21 @@ def detect_pieces_from_canmv_image(
             "boundary_steps", 0
         )
         pixel_reads += trace_diagnostics.get("pixel_reads", 0)
+        if trace_diagnostics.get("boundary_primary_ok", False):
+            primary_boundary_ok_count += 1
         if trace_diagnostics.get("fallback", False):
             fallback_count += 1
+        if trace_diagnostics.get(
+            "boundary_fallback_ordered_ok", False
+        ):
+            ordered_fallback_ok_count += 1
+        failure_reason = trace_diagnostics.get(
+            "boundary_failure_reason", ""
+        )
+        if failure_reason:
+            boundary_failure_reasons[failure_reason] = (
+                boundary_failure_reasons.get(failure_reason, 0) + 1
+            )
         if not trace_diagnostics.get("ok", False):
             reason = trace_diagnostics.get("reason", "unknown")
             trace_failures[reason] = (
@@ -1356,8 +1493,8 @@ def detect_pieces_from_canmv_image(
     diagnostics = {
         "rectified": gray_image,
         "mask": None,
-        "divider_y_mm": cfg.DIVIDER_Y_MM,
-        "divider_detected": False,
+        "divider_y_mm": active_divider_y_mm,
+        "divider_detected": divider_y_mm is not None,
         "threshold": float(piece_threshold),
         "threshold_mode": threshold_mode,
         "segmentation_mode": segmentation_mode,
@@ -1389,6 +1526,12 @@ def detect_pieces_from_canmv_image(
         "boundary_steps": boundary_steps,
         "pixel_reads": pixel_reads,
         "boundary_fallback_count": fallback_count,
+        "boundary_primary_ok": primary_boundary_ok_count,
+        "boundary_fallback_used": fallback_count,
+        "boundary_fallback_ordered_ok": (
+            ordered_fallback_ok_count
+        ),
+        "boundary_failure_reason": boundary_failure_reasons,
         "trace_failures": trace_failures,
         "detected_vertex_counts": detected_vertex_counts,
     }
