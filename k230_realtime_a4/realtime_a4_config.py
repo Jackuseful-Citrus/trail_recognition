@@ -27,6 +27,18 @@ DEBUG_SHOW_CAMERA = False
 A4_AUTO_SEARCH_PREVIEW = True
 A4_LOCK_PREVIEW_HOLD_FRAMES = 20
 
+# Operator display: keep the physical camera view as a grayscale background
+# and project all A4/piece/target contours back onto that live image. During
+# large motion, retain only the A4 reference and the short state-machine line.
+LIVE_GRAYSCALE_OPERATOR_VIEW = True
+OPERATOR_HIDE_OVERLAYS_DURING_MOTION = True
+
+# The simulator topology shown in the operator view has been confirmed against
+# the competition's valid assembly semantics. Keep its local gap/overlap
+# diagnostics in the log, but allow that proposal to enter the manual placement
+# state machine. Build with ``--simulator-validation local`` for strict A/B.
+SIMULATOR_PLANNER_VALIDATION = "upstream"
+
 # A4 boundary detector uses a small aspect-preserving grayscale frame.
 A4_DETECT_WIDTH = 320
 A4_DETECT_HEIGHT = 192

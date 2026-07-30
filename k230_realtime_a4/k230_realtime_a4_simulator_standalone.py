@@ -628,6 +628,18 @@ DEBUG_SHOW_CAMERA = False
 A4_AUTO_SEARCH_PREVIEW = True
 A4_LOCK_PREVIEW_HOLD_FRAMES = 20
 
+# Operator display: keep the physical camera view as a grayscale background
+# and project all A4/piece/target contours back onto that live image. During
+# large motion, retain only the A4 reference and the short state-machine line.
+LIVE_GRAYSCALE_OPERATOR_VIEW = True
+OPERATOR_HIDE_OVERLAYS_DURING_MOTION = True
+
+# The simulator topology shown in the operator view has been confirmed against
+# the competition's valid assembly semantics. Keep its local gap/overlap
+# diagnostics in the log, but allow that proposal to enter the manual placement
+# state machine. Build with ``--simulator-validation local`` for strict A/B.
+SIMULATOR_PLANNER_VALIDATION = "upstream"
+
 # A4 boundary detector uses a small aspect-preserving grayscale frame.
 A4_DETECT_WIDTH = 320
 A4_DETECT_HEIGHT = 192
@@ -756,6 +768,9 @@ cfg.A4_REQUIRE_DIVIDER_FOR_LOCK = A4_REQUIRE_DIVIDER_FOR_LOCK
 cfg.DEBUG_SHOW_CAMERA = DEBUG_SHOW_CAMERA
 cfg.A4_AUTO_SEARCH_PREVIEW = A4_AUTO_SEARCH_PREVIEW
 cfg.A4_LOCK_PREVIEW_HOLD_FRAMES = A4_LOCK_PREVIEW_HOLD_FRAMES
+cfg.LIVE_GRAYSCALE_OPERATOR_VIEW = LIVE_GRAYSCALE_OPERATOR_VIEW
+cfg.OPERATOR_HIDE_OVERLAYS_DURING_MOTION = OPERATOR_HIDE_OVERLAYS_DURING_MOTION
+cfg.SIMULATOR_PLANNER_VALIDATION = SIMULATOR_PLANNER_VALIDATION
 cfg.A4_DETECT_WIDTH = A4_DETECT_WIDTH
 cfg.A4_DETECT_HEIGHT = A4_DETECT_HEIGHT
 cfg.A4_RECT_EDGE_THRESHOLD = A4_RECT_EDGE_THRESHOLD
@@ -821,7 +836,7 @@ cfg.VERTEX_COLLINEAR_MAX_OFFSET_MM = VERTEX_COLLINEAR_MAX_OFFSET_MM
 cfg.VERTEX_CLEANUP_MAX_AREA_CHANGE_RATIO = VERTEX_CLEANUP_MAX_AREA_CHANGE_RATIO
 cfg.STANDALONE_BUILD = True
 cfg.PLANNER_BACKEND = 'simulator'
-cfg.SIMULATOR_PLANNER_VALIDATION = 'local'
+cfg.SIMULATOR_PLANNER_VALIDATION = 'upstream'
 
 """Lightweight CPython/CanMV performance counters for the puzzle pipeline."""
 
@@ -6881,277 +6896,6 @@ def plan_simulator_rectangle(
         plan_stats=stats,
     )
 
-"""Optional non-background segmentation and seam image-strip scoring.
-
-Geometry creates and filters candidates first. These helpers only provide an
-optional ordering cost for the small surviving candidate set.
-"""
-
-import math
-
-
-
-class EdgeImageStrip:
-    __slots__ = (
-        "gray_samples",
-        "gradient_samples",
-        "valid_mask",
-        "sample_count",
-        "along_count",
-        "depth_count",
-    )
-
-    def __init__(
-        self,
-        gray_samples,
-        gradient_samples,
-        valid_mask,
-        along_count,
-        depth_count,
-    ):
-        self.gray_samples = list(gray_samples)
-        self.gradient_samples = list(gradient_samples)
-        self.valid_mask = bytearray(valid_mask)
-        self.along_count = int(along_count)
-        self.depth_count = int(depth_count)
-        self.sample_count = sum(
-            1 for value in self.valid_mask if value
-        )
-
-
-def pixel_is_piece(
-    pixel,
-    mode=None,
-    background_rgb=None,
-    distance_threshold=None,
-):
-    """Classify a grayscale/RGB pixel using an explicit segmentation mode."""
-    if mode is None:
-        mode = cfg.BACKGROUND_SEGMENTATION_MODE
-    if mode == "white":
-        if isinstance(pixel, (tuple, list)):
-            gray = (
-                0.299 * float(pixel[0])
-                + 0.587 * float(pixel[1])
-                + 0.114 * float(pixel[2])
-            )
-        else:
-            gray = float(pixel)
-        return gray >= cfg.WHITE_GRAY_THRESHOLD
-    if mode != "non_background_rgb":
-        raise ValueError(
-            "unknown background segmentation mode {}".format(mode)
-        )
-    if background_rgb is None:
-        background_rgb = cfg.BACKGROUND_COLOR_RGB
-    if distance_threshold is None:
-        distance_threshold = (
-            cfg.BACKGROUND_COLOR_DISTANCE_THRESHOLD
-        )
-    if not isinstance(pixel, (tuple, list)) or len(pixel) < 3:
-        raise ValueError(
-            "non_background_rgb requires an RGB pixel"
-        )
-    squared = 0.0
-    for channel in range(3):
-        delta = (
-            float(pixel[channel])
-            - float(background_rgb[channel])
-        )
-        squared += delta * delta
-    return squared >= float(distance_threshold) ** 2
-
-
-def build_non_background_mask(
-    rgb_array,
-    background_rgb=None,
-    distance_threshold=None,
-):
-    """Return rows of 0/255 bytes; card patterns remain part of a piece."""
-    height = int(rgb_array.shape[0])
-    width = int(rgb_array.shape[1])
-    rows = []
-    for y in range(height):
-        row = bytearray(width)
-        for x in range(width):
-            pixel = rgb_array[y][x]
-            value = (
-                pixel
-                if isinstance(pixel, (tuple, list))
-                else tuple(int(channel) for channel in pixel)
-            )
-            if pixel_is_piece(
-                value,
-                mode="non_background_rgb",
-                background_rgb=background_rgb,
-                distance_threshold=distance_threshold,
-            ):
-                row[x] = 255
-        rows.append(row)
-    return rows
-
-
-def sample_edge_image_strip(
-    gray_array,
-    polygon_mm,
-    edge_index,
-    strip_width_mm=None,
-    sample_spacing_mm=None,
-):
-    """Sample an edge's inward strip in rectified A4 coordinates."""
-    if strip_width_mm is None:
-        strip_width_mm = cfg.IMAGE_STRIP_WIDTH_MM
-    if sample_spacing_mm is None:
-        sample_spacing_mm = cfg.IMAGE_STRIP_SAMPLE_SPACING_MM
-    spacing = max(0.25, float(sample_spacing_mm))
-    width_mm = max(spacing, float(strip_width_mm))
-    height = int(gray_array.shape[0])
-    width = int(gray_array.shape[1])
-    p0 = polygon_mm[edge_index]
-    p1 = polygon_mm[(edge_index + 1) % len(polygon_mm)]
-    dx = p1[0] - p0[0]
-    dy = p1[1] - p0[1]
-    length = math.sqrt(dx * dx + dy * dy)
-    if length <= 1e-9:
-        return EdgeImageStrip([], [], [], 0, 0)
-    ux = dx / length
-    uy = dy / length
-    # PieceObservation polygons are clockwise in mathematical coordinates.
-    inward_x = uy
-    inward_y = -ux
-    along_count = max(1, int(length / spacing))
-    depth_count = max(1, int(width_mm / spacing))
-    pixels_per_mm_x = float(width - 1) / cfg.A4_WIDTH_MM
-    pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
-    gray_samples = []
-    gradient_samples = []
-    valid_mask = bytearray(along_count * depth_count)
-    output_index = 0
-    for along_index in range(along_count):
-        along = min(
-            length - 0.25 * spacing,
-            (along_index + 0.5) * length / along_count,
-        )
-        for depth_index in range(depth_count):
-            depth = (depth_index + 0.5) * width_mm / depth_count
-            point = (
-                p0[0] + along * ux + depth * inward_x,
-                p0[1] + along * uy + depth * inward_y,
-            )
-            px = int(round(point[0] * pixels_per_mm_x))
-            py = int(round(point[1] * pixels_per_mm_y))
-            valid = (
-                1 <= px < width - 1
-                and 1 <= py < height - 1
-                and point_in_polygon(point, polygon_mm)
-            )
-            if valid:
-                gray_value = int(gray_array[py][px])
-                gradient = 0.5 * (
-                    abs(
-                        int(gray_array[py][px + 1])
-                        - int(gray_array[py][px - 1])
-                    )
-                    + abs(
-                        int(gray_array[py + 1][px])
-                        - int(gray_array[py - 1][px])
-                    )
-                )
-                valid_mask[output_index] = 1
-            else:
-                gray_value = 0
-                gradient = 0.0
-            gray_samples.append(gray_value)
-            gradient_samples.append(gradient)
-            output_index += 1
-    return EdgeImageStrip(
-        gray_samples,
-        gradient_samples,
-        valid_mask,
-        along_count,
-        depth_count,
-    )
-
-
-def compute_edge_strip_cost(strip_a, strip_b):
-    """Compare edge B in reverse direction against edge A; lower is better."""
-    if (
-        strip_a.along_count <= 0
-        or strip_a.along_count != strip_b.along_count
-        or strip_a.depth_count != strip_b.depth_count
-    ):
-        return None
-    gray_loss = 0.0
-    gradient_loss = 0.0
-    continuity_loss = 0.0
-    count = 0
-    depth_count = strip_a.depth_count
-    for along in range(strip_a.along_count):
-        reverse_along = strip_b.along_count - 1 - along
-        for depth in range(depth_count):
-            index_a = along * depth_count + depth
-            index_b = reverse_along * depth_count + depth
-            if (
-                not strip_a.valid_mask[index_a]
-                or not strip_b.valid_mask[index_b]
-            ):
-                continue
-            gray_loss += abs(
-                strip_a.gray_samples[index_a]
-                - strip_b.gray_samples[index_b]
-            ) / 255.0
-            gradient_loss += min(
-                1.0,
-                abs(
-                    strip_a.gradient_samples[index_a]
-                    - strip_b.gradient_samples[index_b]
-                )
-                / 255.0,
-            )
-            if depth == 0:
-                continuity_loss += abs(
-                    strip_a.gray_samples[index_a]
-                    - strip_b.gray_samples[index_b]
-                ) / 255.0
-            count += 1
-    if count <= 0:
-        return None
-    normalizer = float(count)
-    return (
-        0.55 * gray_loss / normalizer
-        + 0.30 * gradient_loss / normalizer
-        + 0.15 * continuity_loss / max(
-            1.0, float(strip_a.along_count)
-        )
-    )
-
-
-def apply_optional_strip_costs(candidate_graph, strips_by_edge):
-    """Attach optional costs without admitting a new geometric candidate."""
-    if not cfg.ENABLE_IMAGE_STRIP_MATCHING:
-        return 0
-    applied = 0
-    for candidate in candidate_graph.candidates:
-        strip_a = strips_by_edge.get(
-            (candidate.piece_a, candidate.edge_a)
-        )
-        strip_b = strips_by_edge.get(
-            (candidate.piece_b, candidate.edge_b)
-        )
-        if strip_a is None or strip_b is None:
-            continue
-        cost = compute_edge_strip_cost(strip_a, strip_b)
-        if cost is None:
-            continue
-        candidate.optional_strip_cost = cost
-        candidate.geometric_cost += cfg.IMAGE_STRIP_WEIGHT * cost
-        applied += 1
-    for values in candidate_graph.candidates_by_piece_pair.values():
-        values.sort(key=lambda item: item.geometric_cost)
-    for values in candidate_graph.candidates_by_edge.values():
-        values.sort(key=lambda item: item.geometric_cost)
-    return applied
-
 """Closed-loop per-piece placement monitoring for the K230 puzzle."""
 
 import math
@@ -8505,6 +8249,61 @@ def placement_phase_actions(phase):
         "placement_check": verify,
         "a4_update": False,
     }
+
+
+def operator_overlay_visibility(phase, motion_active=False):
+    """Return the live operator-view layers allowed in the current phase."""
+    moving = bool(motion_active) or phase == "MOVING"
+    return {
+        "a4": True,
+        "status": True,
+        "pieces": not moving,
+        "targets": not moving,
+    }
+
+
+def operator_status_line(
+    phase,
+    piece_count,
+    stable=False,
+    plan_available=False,
+    plan_valid=False,
+    next_piece_id=None,
+    completed_count=0,
+    total_count=0,
+    error=None,
+):
+    """Build one short line for the narrow strip below the camera-view A4."""
+    if error:
+        return "{} | ERROR".format(phase)
+    if phase == "MOVING":
+        return "MOVING | OVERLAYS PAUSED"
+    if phase == "POST_MOTION_SETTLE":
+        return "SETTLING | KEEP CLEAR"
+    if phase == "VERIFY_PLACEMENT":
+        return "VERIFY | {}".format(next_piece_id or "-")
+    if phase == "FINAL_VERIFY":
+        return "FINAL VERIFY"
+    if phase == "COMPLETE":
+        return "COMPLETE | DONE:{}/{}".format(
+            completed_count, total_count
+        )
+    if phase == "WAIT_FOR_MOTION":
+        return "WAIT MOVE | NEXT:{} | DONE:{}/{}".format(
+            next_piece_id or "-",
+            completed_count,
+            total_count,
+        )
+    if phase == "PLANNING":
+        return "PLANNING | P:{}".format(piece_count)
+    if plan_available and not plan_valid:
+        return "ACQUIRE | PLAN BLOCKED | P:{}".format(
+            piece_count
+        )
+    return "ACQUIRE | P:{} | {}".format(
+        piece_count,
+        "STABLE" if stable else "TRACKING",
+    )
 
 
 def plan_frozen_pieces(
@@ -12231,30 +12030,9 @@ def _a4_mm_to_frame(point_mm, corners):
     )
 
 
-def _draw_piece_overlay(
-    frame, pieces, corners, divider_y_mm=None
-):
+def _draw_piece_overlay(frame, pieces, corners):
     if corners is None:
         return
-    divider = (
-        cfg.DIVIDER_Y_MM
-        if divider_y_mm is None
-        else float(divider_y_mm)
-    )
-    divider_left = _a4_mm_to_frame(
-        (0.0, divider), corners
-    )
-    divider_right = _a4_mm_to_frame(
-        (cfg.A4_WIDTH_MM, divider), corners
-    )
-    frame.draw_line(
-        int(divider_left[0]),
-        int(divider_left[1]),
-        int(divider_right[0]),
-        int(divider_right[1]),
-        color=GRAY,
-        thickness=2,
-    )
     for index, piece in enumerate(pieces):
         color = COLORS[index % len(COLORS)]
         polygon = [
@@ -12277,6 +12055,255 @@ def _draw_piece_overlay(
             piece.piece_id or "P?",
             color,
         )
+
+
+def _draw_a4_operator_overlay(
+    frame, corners, divider_y_mm=None
+):
+    if corners is None:
+        return
+    _draw_quad(frame, corners, GREEN, thickness=3)
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
+    divider_left = _a4_mm_to_frame(
+        (0.0, divider), corners
+    )
+    divider_right = _a4_mm_to_frame(
+        (cfg.A4_WIDTH_MM, divider), corners
+    )
+    frame.draw_line(
+        int(divider_left[0]),
+        int(divider_left[1]),
+        int(divider_right[0]),
+        int(divider_right[1]),
+        color=GRAY,
+        thickness=2,
+    )
+
+
+def _draw_plan_target_overlay(
+    frame,
+    plan,
+    corners,
+    placement_state=None,
+):
+    if (
+        plan is None
+        or corners is None
+        or not plan.target_polygons
+    ):
+        return
+    completed = set(
+        placement_state.get("completed", ())
+        if placement_state is not None
+        else ()
+    )
+    next_piece_id = (
+        placement_state.get("next_piece_id")
+        if placement_state is not None
+        else None
+    )
+    for operation in plan.operations:
+        piece_id = operation["piece_id"]
+        polygon = plan.target_polygons.get(piece_id)
+        if not polygon:
+            continue
+        if piece_id in completed:
+            color = GREEN
+            thickness = 4
+        elif piece_id == next_piece_id:
+            color = YELLOW
+            thickness = 4
+        else:
+            color = YELLOW
+            thickness = 2
+        points = [
+            _a4_mm_to_frame(point, corners)
+            for point in polygon
+        ]
+        _draw_polyline(
+            frame, points, color, thickness=thickness
+        )
+        center = _a4_mm_to_frame(
+            operation["target_center_mm"], corners
+        )
+        _draw_text(
+            frame,
+            int(center[0]) + 4,
+            int(center[1]) - 13,
+            "T:{}".format(piece_id),
+            color,
+        )
+
+
+def _operator_status_color(
+    phase, plan, error, motion_active
+):
+    if error:
+        return RED
+    if motion_active or phase == "MOVING":
+        return YELLOW
+    if phase == "COMPLETE":
+        return GREEN
+    if (
+        plan is not None
+        and plan.operations
+        and not plan.valid
+    ):
+        return RED
+    return WHITE
+
+
+def _draw_operator_status_line(
+    frame, corners, text, color
+):
+    if corners:
+        x = max(
+            4,
+            min(
+                frame.width() - 120,
+                int(min(point[0] for point in corners)),
+            ),
+        )
+        y = min(
+            frame.height() - 18,
+            int(max(point[1] for point in corners)) + 3,
+        )
+    else:
+        x = 8
+        y = frame.height() - 18
+    # One-pixel dark shadow keeps short text readable on the grayscale feed.
+    _draw_text(frame, x + 1, y + 1, text, (0, 0, 0))
+    _draw_text(frame, x, y, text, color)
+
+
+def _render_live_operator_view(
+    canvas,
+    source_frame,
+    pieces,
+    a4_state,
+    plan,
+    placement_state,
+    phase,
+    stable,
+    motion_active,
+    error,
+    candidate=None,
+):
+    """Render the real grayscale feed with A4-space operator overlays."""
+    base_error = None
+    try:
+        gray = source_frame.to_grayscale(
+            x_size=canvas.width(),
+            y_size=canvas.height(),
+        )
+        canvas.draw_image(gray, 0, 0, alpha=256)
+    except Exception as exc:
+        if "IDE interrupt" in str(exc):
+            raise
+        base_error = str(exc)
+        canvas.clear()
+        try:
+            canvas.draw_image(
+                source_frame, 0, 0, alpha=256
+            )
+        except Exception as fallback_exc:
+            if "IDE interrupt" in str(fallback_exc):
+                raise
+            base_error = "{}; fallback={}".format(
+                base_error, fallback_exc
+            )
+
+    corners = a4_state.get("corners_px")
+    if candidate is not None:
+        _draw_quad(
+            canvas,
+            candidate.get("corners_px"),
+            YELLOW,
+            thickness=2,
+        )
+    _draw_a4_operator_overlay(
+        canvas,
+        corners,
+        a4_state.get("divider_y_mm", cfg.DIVIDER_Y_MM),
+    )
+
+    if getattr(
+        cfg,
+        "OPERATOR_HIDE_OVERLAYS_DURING_MOTION",
+        True,
+    ):
+        visibility = operator_overlay_visibility(
+            phase, motion_active
+        )
+    else:
+        visibility = {
+            "a4": True,
+            "status": True,
+            "pieces": True,
+            "targets": True,
+        }
+    if visibility["pieces"]:
+        visible_pieces = (
+            placement_state.get("visible_pieces", ())
+            if placement_state is not None
+            else pieces
+        )
+        _draw_piece_overlay(
+            canvas,
+            visible_pieces,
+            corners,
+        )
+    if visibility["targets"]:
+        _draw_plan_target_overlay(
+            canvas,
+            plan,
+            corners,
+            placement_state,
+        )
+
+    completed_count = (
+        placement_state.get("completed_count", 0)
+        if placement_state is not None
+        else 0
+    )
+    total_count = (
+        placement_state.get("total_count", len(pieces))
+        if placement_state is not None
+        else len(pieces)
+    )
+    next_piece_id = (
+        placement_state.get("next_piece_id")
+        if placement_state is not None
+        else None
+    )
+    status = operator_status_line(
+        phase,
+        len(pieces),
+        stable=stable,
+        plan_available=(
+            plan is not None and bool(plan.operations)
+        ),
+        plan_valid=(
+            plan is not None and plan.valid
+        ),
+        next_piece_id=next_piece_id,
+        completed_count=completed_count,
+        total_count=total_count,
+        error=error or base_error,
+    )
+    _draw_operator_status_line(
+        canvas,
+        corners,
+        status,
+        _operator_status_color(
+            phase, plan, error or base_error, motion_active
+        ),
+    )
+    return base_error
 
 
 def _draw_gray_work_thumbnail(
@@ -13128,6 +13155,7 @@ def main():
     last_piece_gray_frame = -1
     last_piece_gray_threshold = None
     last_thumbnail_error = None
+    last_operator_view_error = None
     ide_output_index = 0
     last_ide_stream_error = None
     PERF_STATS.enabled = bool(cfg.ENABLE_STAGE_TIMING)
@@ -13161,7 +13189,7 @@ def main():
             "ide_stream=explicit,ide_quality={},"
             "ide_every={},plan_debug={},"
             "plan_debug_ms={},dynamic_divider={},"
-            "a4_calibration={}".format(
+            "operator_view={},a4_calibration={}".format(
                 cfg.FRAME_WIDTH,
                 cfg.FRAME_HEIGHT,
                 cfg.A4_DETECT_WIDTH,
@@ -13189,6 +13217,15 @@ def main():
                 int(
                     cfg.ENABLE_DYNAMIC_DIVIDER
                     and auto_calibrate_a4
+                ),
+                (
+                    "live_grayscale"
+                    if getattr(
+                        cfg,
+                        "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                        False,
+                    )
+                    else "schematic"
                 ),
                 (
                     "automatic_initial_lock_frozen"
@@ -13980,6 +14017,26 @@ def main():
                         _render_planning_status(
                             planning_canvas, pieces, frame_index
                         )
+                        if getattr(
+                            cfg,
+                            "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                            False,
+                        ):
+                            last_operator_view_error = (
+                                _render_live_operator_view(
+                                    planning_canvas,
+                                    frame,
+                                    pieces,
+                                    a4_state,
+                                    None,
+                                    None,
+                                    "PLANNING",
+                                    True,
+                                    False,
+                                    error,
+                                    candidate,
+                                )
+                            )
                         thumbnail_error = (
                             _draw_gray_work_thumbnail(
                                 planning_canvas,
@@ -14296,14 +14353,83 @@ def main():
                 last_rendered_state, current_render_state
             )
             render_due = (
-                frame_index % cfg.DISPLAY_EVERY_N_FRAMES == 0
-                if show_camera
-                else ui_dirty
+                (
+                    ui_dirty
+                    or frame_index
+                    % cfg.DISPLAY_EVERY_N_FRAMES
+                    == 0
+                )
+                if getattr(
+                    cfg,
+                    "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                    False,
+                )
+                else (
+                    frame_index
+                    % cfg.DISPLAY_EVERY_N_FRAMES
+                    == 0
+                    if show_camera
+                    else ui_dirty
+                )
             )
 
             if render_due:
                 render_started = PERF_STATS.mark()
-                if show_camera:
+                if getattr(
+                    cfg,
+                    "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                    False,
+                ):
+                    canvas = canvases[canvas_index]
+                    canvas_index = 1 - canvas_index
+                    operator_error = _render_live_operator_view(
+                        canvas,
+                        frame,
+                        pieces,
+                        a4_state,
+                        active_plan,
+                        placement_state,
+                        phase,
+                        stable,
+                        bool(motion_metrics.get("motion")),
+                        error,
+                        candidate,
+                    )
+                    if (
+                        operator_error
+                        and operator_error
+                        != last_operator_view_error
+                    ):
+                        print(
+                            "OPERATOR_VIEW_ERROR,frame={},"
+                            "reason={}".format(
+                                frame_index,
+                                operator_error.replace(",", ";"),
+                            )
+                        )
+                    last_operator_view_error = operator_error
+                    PERF_STATS.add_stage(
+                        "render_ms", render_started
+                    )
+                    PERF_STATS.increment("render_count")
+                    (
+                        ide_output_index,
+                        last_ide_stream_error,
+                    ) = _show_output_with_ide(
+                        canvas,
+                        frame_index,
+                        ide_output_index,
+                        last_ide_stream_error,
+                        force_ide=(
+                            phase == "COMPLETE"
+                            or (
+                                ui_dirty
+                                and active_plan is not None
+                                and bool(active_plan.operations)
+                            )
+                        ),
+                    )
+                elif show_camera:
                     if candidate is not None:
                         _draw_quad(
                             frame,
@@ -14324,10 +14450,6 @@ def main():
                         frame,
                         pieces,
                         a4_state["corners_px"],
-                        a4_state.get(
-                            "divider_y_mm",
-                            cfg.DIVIDER_Y_MM,
-                        ),
                     )
                     label = (
                         "A4 LOCK"

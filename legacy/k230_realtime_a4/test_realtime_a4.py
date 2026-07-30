@@ -26,6 +26,8 @@ from puzzle_realtime_state import (
     a4_detection_interval,
     bottom_right_thumbnail_rect,
     phase_allows_vision,
+    operator_overlay_visibility,
+    operator_status_line,
     placement_phase_actions,
     plan_frozen_pieces,
     placement_ui_key,
@@ -544,6 +546,55 @@ class AutomaticA4Tests(unittest.TestCase):
 
 
 class RealtimeDisplayStateTests(unittest.TestCase):
+    def test_operator_view_hides_piece_layers_during_motion(self):
+        waiting = operator_overlay_visibility(
+            "WAIT_FOR_MOTION", False
+        )
+        self.assertTrue(waiting["a4"])
+        self.assertTrue(waiting["status"])
+        self.assertTrue(waiting["pieces"])
+        self.assertTrue(waiting["targets"])
+
+        moving = operator_overlay_visibility(
+            "WAIT_FOR_MOTION", True
+        )
+        self.assertTrue(moving["a4"])
+        self.assertTrue(moving["status"])
+        self.assertFalse(moving["pieces"])
+        self.assertFalse(moving["targets"])
+        self.assertEqual(
+            operator_overlay_visibility("MOVING"),
+            moving,
+        )
+
+    def test_operator_status_line_is_short_and_state_specific(self):
+        self.assertEqual(
+            operator_status_line(
+                "WAIT_FOR_MOTION",
+                4,
+                plan_available=True,
+                plan_valid=True,
+                next_piece_id="P2",
+                completed_count=1,
+                total_count=4,
+            ),
+            "WAIT MOVE | NEXT:P2 | DONE:1/4",
+        )
+        self.assertEqual(
+            operator_status_line("MOVING", 4),
+            "MOVING | OVERLAYS PAUSED",
+        )
+        self.assertEqual(
+            operator_status_line(
+                "ACQUIRE",
+                4,
+                stable=True,
+                plan_available=True,
+                plan_valid=False,
+            ),
+            "ACQUIRE | PLAN BLOCKED | P:4",
+        )
+
     def _placement_state(self, completed=None, next_id="P1"):
         return {
             "completed": set(completed or ()),

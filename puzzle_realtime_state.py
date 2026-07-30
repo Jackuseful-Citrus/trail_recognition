@@ -154,6 +154,61 @@ def placement_phase_actions(phase):
     }
 
 
+def operator_overlay_visibility(phase, motion_active=False):
+    """Return the live operator-view layers allowed in the current phase."""
+    moving = bool(motion_active) or phase == "MOVING"
+    return {
+        "a4": True,
+        "status": True,
+        "pieces": not moving,
+        "targets": not moving,
+    }
+
+
+def operator_status_line(
+    phase,
+    piece_count,
+    stable=False,
+    plan_available=False,
+    plan_valid=False,
+    next_piece_id=None,
+    completed_count=0,
+    total_count=0,
+    error=None,
+):
+    """Build one short line for the narrow strip below the camera-view A4."""
+    if error:
+        return "{} | ERROR".format(phase)
+    if phase == "MOVING":
+        return "MOVING | OVERLAYS PAUSED"
+    if phase == "POST_MOTION_SETTLE":
+        return "SETTLING | KEEP CLEAR"
+    if phase == "VERIFY_PLACEMENT":
+        return "VERIFY | {}".format(next_piece_id or "-")
+    if phase == "FINAL_VERIFY":
+        return "FINAL VERIFY"
+    if phase == "COMPLETE":
+        return "COMPLETE | DONE:{}/{}".format(
+            completed_count, total_count
+        )
+    if phase == "WAIT_FOR_MOTION":
+        return "WAIT MOVE | NEXT:{} | DONE:{}/{}".format(
+            next_piece_id or "-",
+            completed_count,
+            total_count,
+        )
+    if phase == "PLANNING":
+        return "PLANNING | P:{}".format(piece_count)
+    if plan_available and not plan_valid:
+        return "ACQUIRE | PLAN BLOCKED | P:{}".format(
+            piece_count
+        )
+    return "ACQUIRE | P:{} | {}".format(
+        piece_count,
+        "STABLE" if stable else "TRACKING",
+    )
+
+
 def plan_frozen_pieces(
     pieces,
     target_rect_size_mm,

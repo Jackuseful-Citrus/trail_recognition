@@ -1,6 +1,6 @@
 # K230 固定四点手动 A4 拼图识别
 
-当前实时入口已回退为固定四点手动标定。板端只需运行：
+当前实时入口使用固定四点手动标定。板端只需运行：
 
 ```text
 k230_realtime_a4_standalone.py
@@ -20,6 +20,24 @@ k230_realtime_a4_simulator_standalone.py
 不要在 `>>>` 后输入命令。CanMV IDE 不自动同步本地依赖，因此首轮实机测试应使用上述
 单文件版。
 
+## 实景操作视图
+
+LCD/IDE Preview 默认保持真实相机的灰度画面作为基底，不再在规划后切换到纯黑示意
+画布。实时叠加内容为：
+
+- 绿色粗线：固定 A4 外框；
+- 灰线：A4 上下区域分界；
+- 彩色轮廓与 `P1...`：当前识别或最近一次验证确认的真实碎片边缘；
+- 黄色轮廓与 `T:P1...`：规划得到的 A4 下半区目标位置；下一块采用更粗轮廓；
+- 绿色目标轮廓：已经确认完成的目标位置；
+- A4 在屏幕下方的窄边：一行简短状态机文本，例如
+  `WAIT MOVE | NEXT:P2 | DONE:1/4`。
+
+检测到大幅运动或状态进入 `MOVING` 后，画面只保留灰度实景、A4框、分界线和状态
+文本，实际/目标碎片轮廓全部暂时隐藏。运动结束并进入稳定阶段后轮廓自动恢复。
+相关开关为 `LIVE_GRAYSCALE_OPERATOR_VIEW` 和
+`OPERATOR_HIDE_OVERLAYS_DURING_MOTION`。
+
 两个单文件的生成命令分别是：
 
 ```bash
@@ -27,12 +45,12 @@ python3 k230_realtime_a4/build_standalone.py
 python3 k230_realtime_a4/build_standalone.py --planner simulator
 ```
 
-模拟器后端默认 `SIMULATOR_PLANNER_VALIDATION="local"`：先按上游语义产生拼法，再
-通过本项目的 gap、overlap、outside 和尺寸 Gate，失败时不会进入机械放置阶段。
-`"upstream"` 只应用于仿真对照；它会保留 `local_gate_failures` 警告，但仍把上游
-提案标成有效，不应直接驱动硬件。可用
-`--simulator-validation upstream --output /tmp/simulator_proposal.py` 生成临时对照
-脚本，不要把该模式作为板端正式入口。
+根据已经确认的比赛正确拼法，simulator 测试 standalone 默认使用
+`SIMULATOR_PLANNER_VALIDATION="upstream"`，使正确提案进入手动放置状态机；原有
+gap、overlap、outside 和尺寸结果仍作为 `local_gate_failures` 输出，不会静默
+消失。若需复现旧的严格几何 A/B 判定，可使用
+`--simulator-validation local --output /tmp/simulator_local.py`，此模式下未通过
+旧 Gate 的提案只显示轮廓和 `PLAN BLOCKED`，不会进入搬运状态机。
 
 ## 手动标定
 

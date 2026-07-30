@@ -188,6 +188,22 @@ OUTER_FIRST_PARTIAL_BOUND_SLACK_MM = 12.0
 OUTER_FIRST_CORNER_MAX_SEARCH_NODES = 3000
 OUTER_FIRST_CORNER_BEAM_WIDTH = 128
 OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE = 32
+
+# ``lvreng/puzzle-vision-simulator`` compatible planner.  The K230 port keeps
+# the upstream candidate semantics (full-edge and T-junction partial matches),
+# but replaces NumPy/OpenCV masks with the local pure-Python polygon geometry.
+# ``local`` validation is fail-closed for real placement; ``upstream`` can be
+# selected explicitly for simulator-only A/B experiments.
+PLANNER_BACKEND = "outer_first"
+SIMULATOR_PLANNER_CUT_MODE = "auto"
+SIMULATOR_PLANNER_VALIDATION = "local"
+SIMULATOR_MATCH_REL_TOLERANCE = 0.12
+SIMULATOR_PARTIAL_MIN_RATIO = 0.22
+SIMULATOR_PARTIAL_MAX_RATIO = 0.88
+SIMULATOR_PARTIAL_MATCH_PENALTY = 0.15
+SIMULATOR_MAX_CANDIDATES = 80
+SIMULATOR_MAX_MATCHING_SETS = 4000
+SIMULATOR_POSE_OPTIMIZATION_STEPS = 20
 OUTER_FIRST_MAX_SEARCH_NODES = 1200
 OUTER_FIRST_BRANCH_LIMIT = 48
 MAX_RECTANGLE_HYPOTHESES = 12
@@ -470,6 +486,16 @@ cfg.OUTER_FIRST_PARTIAL_BOUND_SLACK_MM = OUTER_FIRST_PARTIAL_BOUND_SLACK_MM
 cfg.OUTER_FIRST_CORNER_MAX_SEARCH_NODES = OUTER_FIRST_CORNER_MAX_SEARCH_NODES
 cfg.OUTER_FIRST_CORNER_BEAM_WIDTH = OUTER_FIRST_CORNER_BEAM_WIDTH
 cfg.OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE = OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE
+cfg.PLANNER_BACKEND = PLANNER_BACKEND
+cfg.SIMULATOR_PLANNER_CUT_MODE = SIMULATOR_PLANNER_CUT_MODE
+cfg.SIMULATOR_PLANNER_VALIDATION = SIMULATOR_PLANNER_VALIDATION
+cfg.SIMULATOR_MATCH_REL_TOLERANCE = SIMULATOR_MATCH_REL_TOLERANCE
+cfg.SIMULATOR_PARTIAL_MIN_RATIO = SIMULATOR_PARTIAL_MIN_RATIO
+cfg.SIMULATOR_PARTIAL_MAX_RATIO = SIMULATOR_PARTIAL_MAX_RATIO
+cfg.SIMULATOR_PARTIAL_MATCH_PENALTY = SIMULATOR_PARTIAL_MATCH_PENALTY
+cfg.SIMULATOR_MAX_CANDIDATES = SIMULATOR_MAX_CANDIDATES
+cfg.SIMULATOR_MAX_MATCHING_SETS = SIMULATOR_MAX_MATCHING_SETS
+cfg.SIMULATOR_POSE_OPTIMIZATION_STEPS = SIMULATOR_POSE_OPTIMIZATION_STEPS
 cfg.OUTER_FIRST_MAX_SEARCH_NODES = OUTER_FIRST_MAX_SEARCH_NODES
 cfg.OUTER_FIRST_BRANCH_LIMIT = OUTER_FIRST_BRANCH_LIMIT
 cfg.MAX_RECTANGLE_HYPOTHESES = MAX_RECTANGLE_HYPOTHESES
@@ -602,6 +628,18 @@ DEBUG_SHOW_CAMERA = False
 A4_AUTO_SEARCH_PREVIEW = True
 A4_LOCK_PREVIEW_HOLD_FRAMES = 20
 
+# Operator display: keep the physical camera view as a grayscale background
+# and project all A4/piece/target contours back onto that live image. During
+# large motion, retain only the A4 reference and the short state-machine line.
+LIVE_GRAYSCALE_OPERATOR_VIEW = True
+OPERATOR_HIDE_OVERLAYS_DURING_MOTION = True
+
+# The simulator topology shown in the operator view has been confirmed against
+# the competition's valid assembly semantics. Keep its local gap/overlap
+# diagnostics in the log, but allow that proposal to enter the manual placement
+# state machine. Build with ``--simulator-validation local`` for strict A/B.
+SIMULATOR_PLANNER_VALIDATION = "upstream"
+
 # A4 boundary detector uses a small aspect-preserving grayscale frame.
 A4_DETECT_WIDTH = 320
 A4_DETECT_HEIGHT = 192
@@ -730,6 +768,9 @@ cfg.A4_REQUIRE_DIVIDER_FOR_LOCK = A4_REQUIRE_DIVIDER_FOR_LOCK
 cfg.DEBUG_SHOW_CAMERA = DEBUG_SHOW_CAMERA
 cfg.A4_AUTO_SEARCH_PREVIEW = A4_AUTO_SEARCH_PREVIEW
 cfg.A4_LOCK_PREVIEW_HOLD_FRAMES = A4_LOCK_PREVIEW_HOLD_FRAMES
+cfg.LIVE_GRAYSCALE_OPERATOR_VIEW = LIVE_GRAYSCALE_OPERATOR_VIEW
+cfg.OPERATOR_HIDE_OVERLAYS_DURING_MOTION = OPERATOR_HIDE_OVERLAYS_DURING_MOTION
+cfg.SIMULATOR_PLANNER_VALIDATION = SIMULATOR_PLANNER_VALIDATION
 cfg.A4_DETECT_WIDTH = A4_DETECT_WIDTH
 cfg.A4_DETECT_HEIGHT = A4_DETECT_HEIGHT
 cfg.A4_RECT_EDGE_THRESHOLD = A4_RECT_EDGE_THRESHOLD
@@ -794,6 +835,7 @@ cfg.VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG = VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG
 cfg.VERTEX_COLLINEAR_MAX_OFFSET_MM = VERTEX_COLLINEAR_MAX_OFFSET_MM
 cfg.VERTEX_CLEANUP_MAX_AREA_CHANGE_RATIO = VERTEX_CLEANUP_MAX_AREA_CHANGE_RATIO
 cfg.STANDALONE_BUILD = True
+cfg.PLANNER_BACKEND = 'outer_first'
 
 """Lightweight CPython/CanMV performance counters for the puzzle pipeline."""
 
@@ -7460,6 +7502,61 @@ def placement_phase_actions(phase):
     }
 
 
+def operator_overlay_visibility(phase, motion_active=False):
+    """Return the live operator-view layers allowed in the current phase."""
+    moving = bool(motion_active) or phase == "MOVING"
+    return {
+        "a4": True,
+        "status": True,
+        "pieces": not moving,
+        "targets": not moving,
+    }
+
+
+def operator_status_line(
+    phase,
+    piece_count,
+    stable=False,
+    plan_available=False,
+    plan_valid=False,
+    next_piece_id=None,
+    completed_count=0,
+    total_count=0,
+    error=None,
+):
+    """Build one short line for the narrow strip below the camera-view A4."""
+    if error:
+        return "{} | ERROR".format(phase)
+    if phase == "MOVING":
+        return "MOVING | OVERLAYS PAUSED"
+    if phase == "POST_MOTION_SETTLE":
+        return "SETTLING | KEEP CLEAR"
+    if phase == "VERIFY_PLACEMENT":
+        return "VERIFY | {}".format(next_piece_id or "-")
+    if phase == "FINAL_VERIFY":
+        return "FINAL VERIFY"
+    if phase == "COMPLETE":
+        return "COMPLETE | DONE:{}/{}".format(
+            completed_count, total_count
+        )
+    if phase == "WAIT_FOR_MOTION":
+        return "WAIT MOVE | NEXT:{} | DONE:{}/{}".format(
+            next_piece_id or "-",
+            completed_count,
+            total_count,
+        )
+    if phase == "PLANNING":
+        return "PLANNING | P:{}".format(piece_count)
+    if plan_available and not plan_valid:
+        return "ACQUIRE | PLAN BLOCKED | P:{}".format(
+            piece_count
+        )
+    return "ACQUIRE | P:{} | {}".format(
+        piece_count,
+        "STABLE" if stable else "TRACKING",
+    )
+
+
 def plan_frozen_pieces(
     pieces,
     target_rect_size_mm,
@@ -7467,12 +7564,13 @@ def plan_frozen_pieces(
     unknown_planner,
     allow_unknown_fallback=False,
     prefer_outer_first=False,
+    preferred_planner_name="outer_first",
 ):
     """Route one frozen input to the configured planner exactly once."""
     if target_rect_size_mm is None:
         return {
             "plan": unknown_planner(pieces),
-            "planner": "outer_first",
+            "planner": preferred_planner_name,
             "fallback_used": False,
         }
     if prefer_outer_first:
@@ -7481,7 +7579,7 @@ def plan_frozen_pieces(
                 pieces,
                 target_size_mm=target_rect_size_mm,
             ),
-            "planner": "outer_first",
+            "planner": preferred_planner_name,
             "fallback_used": False,
         }
     fixed_result = fixed_planner(pieces)
@@ -7496,7 +7594,7 @@ def plan_frozen_pieces(
             pieces,
             target_size_mm=target_rect_size_mm,
         ),
-        "planner": "outer_first",
+        "planner": preferred_planner_name,
         "fallback_used": True,
         "fixed_failure_reason": fixed_result.reason,
     }
@@ -10884,6 +10982,45 @@ def _print_plan(plan, pieces, frame_index):
                 ),
             )
         )
+        if str(stats.get("engine", "")).startswith(
+            "lvreng/puzzle-vision-simulator"
+        ):
+            print(
+                "SIMULATOR_PLAN_PERF,frame={},cut_mode={},"
+                "validation={},candidates={},full={},partial={},"
+                "sets={},selected={},selected_partial={},"
+                "limit_hit={},timed_out={},actual_size={}x{},"
+                "dimension_error_mm={},local_gate_failures={}".format(
+                    frame_index,
+                    stats.get("cut_mode", "auto"),
+                    stats.get("validation", "local"),
+                    stats.get("candidate_count", 0),
+                    stats.get("full_candidate_count", 0),
+                    stats.get("partial_candidate_count", 0),
+                    stats.get("matching_sets_evaluated", 0),
+                    stats.get("selected_match_count", 0),
+                    stats.get("selected_partial_match_count", 0),
+                    int(bool(stats.get("limit_hit"))),
+                    int(bool(stats.get("timed_out"))),
+                    (
+                        "{:.1f}".format(stats["actual_width_mm"])
+                        if stats.get("actual_width_mm") is not None
+                        else "na"
+                    ),
+                    (
+                        "{:.1f}".format(stats["actual_height_mm"])
+                        if stats.get("actual_height_mm") is not None
+                        else "na"
+                    ),
+                    (
+                        "{:.1f}".format(stats["dimension_error_mm"])
+                        if stats.get("dimension_error_mm") is not None
+                        else "na"
+                    ),
+                    "|".join(stats.get("local_gate_failures", ()))
+                    or "none",
+                )
+            )
     if not plan.valid:
         print(
             "PLAN_INVALID,frame={},reason={}".format(
@@ -10961,6 +11098,37 @@ def _print_plan(plan, pieces, frame_index):
                     stats.get("corner_max_depth", 0),
                     stats.get("corner_complete_state_count", 0),
                     stats.get("corner_pruned_overlap", 0),
+                )
+            )
+        elif str(stats.get("engine", "")).startswith(
+            "lvreng/puzzle-vision-simulator"
+        ):
+            if stats.get("timed_out") or stats.get("limit_hit"):
+                failure_class = "search_limit"
+            elif not stats.get("candidate_count"):
+                failure_class = "no_edge_candidates"
+            elif not stats.get("selected_match_count"):
+                failure_class = "no_connected_topology"
+            else:
+                failure_class = "local_geometry_gate"
+            print(
+                "PLAN_FAIL_DETAIL,frame={},class={},candidates={},"
+                "full={},partial={},sets={},selected={},"
+                "selected_partial={},actual_size={}x{},"
+                "dimension_error_mm={},local_gate_failures={}".format(
+                    frame_index,
+                    failure_class,
+                    stats.get("candidate_count", 0),
+                    stats.get("full_candidate_count", 0),
+                    stats.get("partial_candidate_count", 0),
+                    stats.get("matching_sets_evaluated", 0),
+                    stats.get("selected_match_count", 0),
+                    stats.get("selected_partial_match_count", 0),
+                    stats.get("actual_width_mm", "na"),
+                    stats.get("actual_height_mm", "na"),
+                    stats.get("dimension_error_mm", "na"),
+                    "|".join(stats.get("local_gate_failures", ()))
+                    or "none",
                 )
             )
         for piece in pieces:
@@ -11069,6 +11237,19 @@ PLACEMENT_PHASES = (
 )
 
 
+def _planner_selection():
+    backend = getattr(cfg, "PLANNER_BACKEND", "outer_first")
+    if backend == "simulator":
+        return "simulator", plan_simulator_rectangle, True
+    prefer_unknown = (
+        cfg.TARGET_RECT_SIZE_MM is None
+        or cfg.PREFER_OUTER_FIRST_PLANNER
+    )
+    if prefer_unknown:
+        return "outer_first", plan_outer_first_rectangle, True
+    return "fixed_rectangle", plan_outer_first_rectangle, False
+
+
 def _draw_quad(frame, corners, color, thickness=3):
     if corners is None:
         return
@@ -11100,30 +11281,9 @@ def _a4_mm_to_frame(point_mm, corners):
     )
 
 
-def _draw_piece_overlay(
-    frame, pieces, corners, divider_y_mm=None
-):
+def _draw_piece_overlay(frame, pieces, corners):
     if corners is None:
         return
-    divider = (
-        cfg.DIVIDER_Y_MM
-        if divider_y_mm is None
-        else float(divider_y_mm)
-    )
-    divider_left = _a4_mm_to_frame(
-        (0.0, divider), corners
-    )
-    divider_right = _a4_mm_to_frame(
-        (cfg.A4_WIDTH_MM, divider), corners
-    )
-    frame.draw_line(
-        int(divider_left[0]),
-        int(divider_left[1]),
-        int(divider_right[0]),
-        int(divider_right[1]),
-        color=GRAY,
-        thickness=2,
-    )
     for index, piece in enumerate(pieces):
         color = COLORS[index % len(COLORS)]
         polygon = [
@@ -11146,6 +11306,255 @@ def _draw_piece_overlay(
             piece.piece_id or "P?",
             color,
         )
+
+
+def _draw_a4_operator_overlay(
+    frame, corners, divider_y_mm=None
+):
+    if corners is None:
+        return
+    _draw_quad(frame, corners, GREEN, thickness=3)
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
+    divider_left = _a4_mm_to_frame(
+        (0.0, divider), corners
+    )
+    divider_right = _a4_mm_to_frame(
+        (cfg.A4_WIDTH_MM, divider), corners
+    )
+    frame.draw_line(
+        int(divider_left[0]),
+        int(divider_left[1]),
+        int(divider_right[0]),
+        int(divider_right[1]),
+        color=GRAY,
+        thickness=2,
+    )
+
+
+def _draw_plan_target_overlay(
+    frame,
+    plan,
+    corners,
+    placement_state=None,
+):
+    if (
+        plan is None
+        or corners is None
+        or not plan.target_polygons
+    ):
+        return
+    completed = set(
+        placement_state.get("completed", ())
+        if placement_state is not None
+        else ()
+    )
+    next_piece_id = (
+        placement_state.get("next_piece_id")
+        if placement_state is not None
+        else None
+    )
+    for operation in plan.operations:
+        piece_id = operation["piece_id"]
+        polygon = plan.target_polygons.get(piece_id)
+        if not polygon:
+            continue
+        if piece_id in completed:
+            color = GREEN
+            thickness = 4
+        elif piece_id == next_piece_id:
+            color = YELLOW
+            thickness = 4
+        else:
+            color = YELLOW
+            thickness = 2
+        points = [
+            _a4_mm_to_frame(point, corners)
+            for point in polygon
+        ]
+        _draw_polyline(
+            frame, points, color, thickness=thickness
+        )
+        center = _a4_mm_to_frame(
+            operation["target_center_mm"], corners
+        )
+        _draw_text(
+            frame,
+            int(center[0]) + 4,
+            int(center[1]) - 13,
+            "T:{}".format(piece_id),
+            color,
+        )
+
+
+def _operator_status_color(
+    phase, plan, error, motion_active
+):
+    if error:
+        return RED
+    if motion_active or phase == "MOVING":
+        return YELLOW
+    if phase == "COMPLETE":
+        return GREEN
+    if (
+        plan is not None
+        and plan.operations
+        and not plan.valid
+    ):
+        return RED
+    return WHITE
+
+
+def _draw_operator_status_line(
+    frame, corners, text, color
+):
+    if corners:
+        x = max(
+            4,
+            min(
+                frame.width() - 120,
+                int(min(point[0] for point in corners)),
+            ),
+        )
+        y = min(
+            frame.height() - 18,
+            int(max(point[1] for point in corners)) + 3,
+        )
+    else:
+        x = 8
+        y = frame.height() - 18
+    # One-pixel dark shadow keeps short text readable on the grayscale feed.
+    _draw_text(frame, x + 1, y + 1, text, (0, 0, 0))
+    _draw_text(frame, x, y, text, color)
+
+
+def _render_live_operator_view(
+    canvas,
+    source_frame,
+    pieces,
+    a4_state,
+    plan,
+    placement_state,
+    phase,
+    stable,
+    motion_active,
+    error,
+    candidate=None,
+):
+    """Render the real grayscale feed with A4-space operator overlays."""
+    base_error = None
+    try:
+        gray = source_frame.to_grayscale(
+            x_size=canvas.width(),
+            y_size=canvas.height(),
+        )
+        canvas.draw_image(gray, 0, 0, alpha=256)
+    except Exception as exc:
+        if "IDE interrupt" in str(exc):
+            raise
+        base_error = str(exc)
+        canvas.clear()
+        try:
+            canvas.draw_image(
+                source_frame, 0, 0, alpha=256
+            )
+        except Exception as fallback_exc:
+            if "IDE interrupt" in str(fallback_exc):
+                raise
+            base_error = "{}; fallback={}".format(
+                base_error, fallback_exc
+            )
+
+    corners = a4_state.get("corners_px")
+    if candidate is not None:
+        _draw_quad(
+            canvas,
+            candidate.get("corners_px"),
+            YELLOW,
+            thickness=2,
+        )
+    _draw_a4_operator_overlay(
+        canvas,
+        corners,
+        a4_state.get("divider_y_mm", cfg.DIVIDER_Y_MM),
+    )
+
+    if getattr(
+        cfg,
+        "OPERATOR_HIDE_OVERLAYS_DURING_MOTION",
+        True,
+    ):
+        visibility = operator_overlay_visibility(
+            phase, motion_active
+        )
+    else:
+        visibility = {
+            "a4": True,
+            "status": True,
+            "pieces": True,
+            "targets": True,
+        }
+    if visibility["pieces"]:
+        visible_pieces = (
+            placement_state.get("visible_pieces", ())
+            if placement_state is not None
+            else pieces
+        )
+        _draw_piece_overlay(
+            canvas,
+            visible_pieces,
+            corners,
+        )
+    if visibility["targets"]:
+        _draw_plan_target_overlay(
+            canvas,
+            plan,
+            corners,
+            placement_state,
+        )
+
+    completed_count = (
+        placement_state.get("completed_count", 0)
+        if placement_state is not None
+        else 0
+    )
+    total_count = (
+        placement_state.get("total_count", len(pieces))
+        if placement_state is not None
+        else len(pieces)
+    )
+    next_piece_id = (
+        placement_state.get("next_piece_id")
+        if placement_state is not None
+        else None
+    )
+    status = operator_status_line(
+        phase,
+        len(pieces),
+        stable=stable,
+        plan_available=(
+            plan is not None and bool(plan.operations)
+        ),
+        plan_valid=(
+            plan is not None and plan.valid
+        ),
+        next_piece_id=next_piece_id,
+        completed_count=completed_count,
+        total_count=total_count,
+        error=error or base_error,
+    )
+    _draw_operator_status_line(
+        canvas,
+        corners,
+        status,
+        _operator_status_color(
+            phase, plan, error or base_error, motion_active
+        ),
+    )
+    return base_error
 
 
 def _draw_gray_work_thumbnail(
@@ -11997,6 +12406,7 @@ def main():
     last_piece_gray_frame = -1
     last_piece_gray_threshold = None
     last_thumbnail_error = None
+    last_operator_view_error = None
     ide_output_index = 0
     last_ide_stream_error = None
     PERF_STATS.enabled = bool(cfg.ENABLE_STAGE_TIMING)
@@ -12030,7 +12440,7 @@ def main():
             "ide_stream=explicit,ide_quality={},"
             "ide_every={},plan_debug={},"
             "plan_debug_ms={},dynamic_divider={},"
-            "a4_calibration={}".format(
+            "operator_view={},a4_calibration={}".format(
                 cfg.FRAME_WIDTH,
                 cfg.FRAME_HEIGHT,
                 cfg.A4_DETECT_WIDTH,
@@ -12040,14 +12450,7 @@ def main():
                 cfg.A4_DETECT_INTERVAL_ACQUIRE,
                 cfg.PIECE_DETECT_EVERY_N_FRAMES,
                 int(cfg.DEBUG_SHOW_CAMERA),
-                (
-                    "outer_first"
-                    if (
-                        cfg.TARGET_RECT_SIZE_MM is None
-                        or cfg.PREFER_OUTER_FIRST_PLANNER
-                    )
-                    else "fixed_rectangle"
-                ),
+                _planner_selection()[0],
                 cfg.PLACING_VERIFICATION_INTERVAL_MS,
                 cfg.A4_HOLD_MISSED_FRAMES,
                 cfg.PIECE_SEGMENTATION_MODE,
@@ -12065,6 +12468,15 @@ def main():
                 int(
                     cfg.ENABLE_DYNAMIC_DIVIDER
                     and auto_calibrate_a4
+                ),
+                (
+                    "live_grayscale"
+                    if getattr(
+                        cfg,
+                        "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                        False,
+                    )
+                    else "schematic"
                 ),
                 (
                     "automatic_initial_lock_frozen"
@@ -12836,14 +13248,11 @@ def main():
                         )
                     elif not last_stable or active_plan is None:
                         plan_start_ms = _ms_now()
-                        configured_planner = (
-                            "outer_first"
-                            if (
-                                cfg.TARGET_RECT_SIZE_MM is None
-                                or cfg.PREFER_OUTER_FIRST_PLANNER
-                            )
-                            else "fixed_rectangle"
-                        )
+                        (
+                            configured_planner,
+                            unknown_planner,
+                            prefer_unknown_planner,
+                        ) = _planner_selection()
                         print(
                             "PLANNING_START,frame={},planner="
                             "{},count={}".format(
@@ -12859,6 +13268,26 @@ def main():
                         _render_planning_status(
                             planning_canvas, pieces, frame_index
                         )
+                        if getattr(
+                            cfg,
+                            "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                            False,
+                        ):
+                            last_operator_view_error = (
+                                _render_live_operator_view(
+                                    planning_canvas,
+                                    frame,
+                                    pieces,
+                                    a4_state,
+                                    None,
+                                    None,
+                                    "PLANNING",
+                                    True,
+                                    False,
+                                    error,
+                                    candidate,
+                                )
+                            )
                         thumbnail_error = (
                             _draw_gray_work_thumbnail(
                                 planning_canvas,
@@ -12908,12 +13337,15 @@ def main():
                                 pieces,
                                 cfg.TARGET_RECT_SIZE_MM,
                                 plan_rectangle_assembly,
-                                plan_outer_first_rectangle,
+                                unknown_planner,
                                 allow_unknown_fallback=(
                                     cfg.ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE
                                 ),
                                 prefer_outer_first=(
-                                    cfg.PREFER_OUTER_FIRST_PLANNER
+                                    prefer_unknown_planner
+                                ),
+                                preferred_planner_name=(
+                                    configured_planner
                                 ),
                             )
                         finally:
@@ -12922,8 +13354,9 @@ def main():
                         if routing["fallback_used"]:
                             print(
                                 "PLANNER_FALLBACK,frame={},from=fixed_rectangle,"
-                                "to=outer_first,reason={}".format(
+                                "to={},reason={}".format(
                                     frame_index,
+                                    configured_planner,
                                     routing.get(
                                         "fixed_failure_reason",
                                         "unknown",
@@ -13171,14 +13604,83 @@ def main():
                 last_rendered_state, current_render_state
             )
             render_due = (
-                frame_index % cfg.DISPLAY_EVERY_N_FRAMES == 0
-                if show_camera
-                else ui_dirty
+                (
+                    ui_dirty
+                    or frame_index
+                    % cfg.DISPLAY_EVERY_N_FRAMES
+                    == 0
+                )
+                if getattr(
+                    cfg,
+                    "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                    False,
+                )
+                else (
+                    frame_index
+                    % cfg.DISPLAY_EVERY_N_FRAMES
+                    == 0
+                    if show_camera
+                    else ui_dirty
+                )
             )
 
             if render_due:
                 render_started = PERF_STATS.mark()
-                if show_camera:
+                if getattr(
+                    cfg,
+                    "LIVE_GRAYSCALE_OPERATOR_VIEW",
+                    False,
+                ):
+                    canvas = canvases[canvas_index]
+                    canvas_index = 1 - canvas_index
+                    operator_error = _render_live_operator_view(
+                        canvas,
+                        frame,
+                        pieces,
+                        a4_state,
+                        active_plan,
+                        placement_state,
+                        phase,
+                        stable,
+                        bool(motion_metrics.get("motion")),
+                        error,
+                        candidate,
+                    )
+                    if (
+                        operator_error
+                        and operator_error
+                        != last_operator_view_error
+                    ):
+                        print(
+                            "OPERATOR_VIEW_ERROR,frame={},"
+                            "reason={}".format(
+                                frame_index,
+                                operator_error.replace(",", ";"),
+                            )
+                        )
+                    last_operator_view_error = operator_error
+                    PERF_STATS.add_stage(
+                        "render_ms", render_started
+                    )
+                    PERF_STATS.increment("render_count")
+                    (
+                        ide_output_index,
+                        last_ide_stream_error,
+                    ) = _show_output_with_ide(
+                        canvas,
+                        frame_index,
+                        ide_output_index,
+                        last_ide_stream_error,
+                        force_ide=(
+                            phase == "COMPLETE"
+                            or (
+                                ui_dirty
+                                and active_plan is not None
+                                and bool(active_plan.operations)
+                            )
+                        ),
+                    )
+                elif show_camera:
                     if candidate is not None:
                         _draw_quad(
                             frame,
@@ -13199,10 +13701,6 @@ def main():
                         frame,
                         pieces,
                         a4_state["corners_px"],
-                        a4_state.get(
-                            "divider_y_mm",
-                            cfg.DIVIDER_Y_MM,
-                        ),
                     )
                     label = (
                         "A4 LOCK"
