@@ -609,7 +609,7 @@ cfg.OFFLINE_OUTPUT_IMAGE = OFFLINE_OUTPUT_IMAGE
 # physical labels appear as image BL, image TL, image TR, image BR.  This set
 # was copied from the previously stable A4_LOCK log.  The realtime loop never
 # searches for, smooths, or updates these points.
-AUTO_CALIBRATE_A4 = False
+AUTO_CALIBRATE_A4 = True
 A4_CORNERS_PX = [
     (133.0, 441.0),
     (140.0, 78.0),
