@@ -12,6 +12,8 @@ from puzzle_geometry import (
 )
 from puzzle_vision import (
     _finalize_fitted_polygon,
+    _ordered_contour_polygon,
+    _ordered_contour_polygon_once,
     background_difference_threshold,
     detect_pieces_from_canmv_image,
     detect_pieces_from_gray,
@@ -39,6 +41,23 @@ class _FakeBlob:
         return self._center[1]
 
 
+class _FakeStatistics:
+    def __init__(self, array):
+        self.array = array
+
+    def min(self):
+        return int(self.array.min())
+
+    def max(self):
+        return int(self.array.max())
+
+    def mean(self):
+        return float(self.array.mean())
+
+    def median(self):
+        return float(np.median(self.array))
+
+
 class _FakeCanMVGrayImage:
     """Minimal native-image facade for the no-cv2 board path."""
 
@@ -62,6 +81,15 @@ class _FakeCanMVGrayImage:
         if list(corners) != expected:
             raise AssertionError((corners, expected))
         return self
+
+    def format(self):
+        return "GRAYSCALE"
+
+    def get_statistics(self):
+        return _FakeStatistics(self.array)
+
+    def get_pixel(self, x, y):
+        return int(self.array[y, x])
 
     def find_blobs(
         self,
@@ -270,6 +298,76 @@ class VisionRegressionTests(unittest.TestCase):
             45,
         )
 
+    def test_background_delta_traces_white_edge_not_gray_shadow(self):
+        width = cfg.CANMV_WORK_WIDTH
+        height = cfg.CANMV_WORK_HEIGHT
+        scale_x = float(width - 1) / cfg.A4_WIDTH_MM
+        scale_y = float(height - 1) / cfg.A4_HEIGHT_MM
+
+        def px(points_mm):
+            return np.array(
+                [
+                    (
+                        int(round(x * scale_x)),
+                        int(round(y * scale_y)),
+                    )
+                    for x, y in points_mm
+                ],
+                dtype=np.int32,
+            )
+
+        gray = np.full((height, width), 20, dtype=np.uint8)
+        true_polygon = [
+            (40, 25),
+            (90, 25),
+            (90, 65),
+            (40, 65),
+        ]
+        shadow_polygon = [
+            (x + 7, y + 6) for x, y in true_polygon
+        ]
+        cv2.fillPoly(gray, [px(shadow_polygon)], 70)
+        cv2.fillPoly(gray, [px(true_polygon)], 205)
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+        old_mode = cfg.PIECE_SEGMENTATION_MODE
+        old_contour_floor = getattr(
+            cfg, "PIECE_CONTOUR_MIN_GRAY_THRESHOLD", 0
+        )
+        cfg.PIECE_SEGMENTATION_MODE = "background_delta"
+        cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 100
+        try:
+            pieces, diagnostics = (
+                detect_pieces_from_canmv_image(
+                    _FakeCanMVGrayImage(gray),
+                    corners,
+                    (width, height),
+                )
+            )
+        finally:
+            cfg.PIECE_SEGMENTATION_MODE = old_mode
+            cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD = (
+                old_contour_floor
+            )
+        self.assertEqual(len(pieces), 1)
+        self.assertLess(diagnostics["threshold"], 70)
+        self.assertEqual(
+            diagnostics["contour_threshold"], 100
+        )
+        self.assertAlmostEqual(
+            pieces[0].centroid_mm[0], 65.0, delta=1.5
+        )
+        self.assertAlmostEqual(
+            pieces[0].centroid_mm[1], 45.0, delta=1.5
+        )
+        self.assertAlmostEqual(
+            pieces[0].area_mm2, 2000.0, delta=160.0
+        )
+
     def test_canmv_threshold_override_recovers_dim_piece(self):
         width = cfg.CANMV_WORK_WIDTH
         height = cfg.CANMV_WORK_HEIGHT
@@ -369,6 +467,127 @@ class VisionRegressionTests(unittest.TestCase):
         )
         self.assertGreater(diagnostics["boundary_steps"], 0)
         self.assertGreater(diagnostics["pixel_reads"], 0)
+
+    def test_canmv_gray_sanity_compares_native_and_shared_array(self):
+        width = cfg.CANMV_WORK_WIDTH
+        height = cfg.CANMV_WORK_HEIGHT
+        gray = np.zeros((height, width), dtype=np.uint8)
+        gray[24:64, 30:90] = 230
+        image = _FakeCanMVGrayImage(gray)
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+        _, diagnostics = detect_pieces_from_canmv_image(
+            image,
+            corners,
+            (width, height),
+            collect_sanity=True,
+        )
+        sanity = diagnostics["gray_sanity"]
+        self.assertEqual(sanity["rotation_return"], "self")
+        self.assertEqual(sanity["native"]["format"], "GRAYSCALE")
+        self.assertEqual(sanity["native"]["max"], "230")
+        self.assertEqual(sanity["upper"]["max"], 230)
+        self.assertEqual(sanity["upper"]["bright"], 2400)
+        self.assertEqual(
+            sanity["upper"]["bright_bbox"],
+            (30, 24, 60, 40),
+        )
+        self.assertEqual(sanity["lower"]["bright"], 0)
+
+    def test_closed_contour_fit_retries_reverse_direction(self):
+        mask = np.zeros((150, 150), dtype=np.uint8)
+        cv2.fillPoly(
+            mask,
+            [
+                np.array(
+                    [(101, 78), (83, 87), (45, 23), (62, 53)],
+                    dtype=np.int32,
+                )
+            ],
+            255,
+        )
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        contour = max(contours, key=cv2.contourArea)
+        points = [
+            (
+                float(item[0][0]) * 0.88,
+                float(item[0][1]) * 0.88,
+            )
+            for item in contour
+        ]
+        tolerance = max(0.05, cfg.CONTOUR_DP_TOLERANCE_MM)
+        self.assertIsNone(
+            _ordered_contour_polygon_once(points, tolerance)
+        )
+        diagnostics = {}
+        recovered = _ordered_contour_polygon(
+            points, diagnostics
+        )
+        self.assertIsNotNone(recovered)
+        self.assertEqual(
+            diagnostics["polygon_fit_method"], "reverse"
+        )
+        self.assertTrue(
+            diagnostics["polygon_fit_reverse_used"]
+        )
+
+    def test_closed_contour_fit_keeps_valid_unrefined_polygon(self):
+        mask = np.zeros((160, 160), dtype=np.uint8)
+        cv2.fillPoly(
+            mask,
+            [
+                np.array(
+                    [(89, 82), (93, 114), (65, 120), (118, 66)],
+                    dtype=np.int32,
+                )
+            ],
+            255,
+        )
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        contour = max(contours, key=cv2.contourArea)
+        points = [
+            (
+                float(item[0][0]) * 0.88,
+                float(item[0][1]) * 0.88,
+            )
+            for item in contour
+        ]
+        tolerance = max(0.05, cfg.CONTOUR_DP_TOLERANCE_MM)
+        self.assertIsNone(
+            _ordered_contour_polygon_once(points, tolerance)
+        )
+        self.assertIsNone(
+            _ordered_contour_polygon_once(
+                list(reversed(points)), tolerance
+            )
+        )
+        diagnostics = {}
+        recovered = _ordered_contour_polygon(
+            points, diagnostics
+        )
+        self.assertIsNotNone(recovered)
+        self.assertEqual(
+            diagnostics["polygon_fit_method"],
+            "forward_unrefined",
+        )
+        self.assertFalse(
+            diagnostics["polygon_fit_reverse_used"]
+        )
+        self.assertTrue(
+            diagnostics["polygon_fit_unrefined_used"]
+        )
 
     def test_canmv_full_a4_mode_detects_upper_and_lower_pieces(self):
         width = cfg.CANMV_WORK_WIDTH

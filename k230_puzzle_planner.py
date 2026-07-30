@@ -461,7 +461,8 @@ def _print_plan(plan, pieces, frame_index):
                 "validation={},candidates={},full={},partial={},"
                 "sets={},selected={},selected_partial={},"
                 "limit_hit={},timed_out={},actual_size={}x{},"
-                "dimension_error_mm={},local_gate_failures={}".format(
+                "dimension_error_mm={},local_gate_failures={},"
+                "safety_gate_failures={}".format(
                     frame_index,
                     stats.get("cut_mode", "auto"),
                     stats.get("validation", "local"),
@@ -489,6 +490,8 @@ def _print_plan(plan, pieces, frame_index):
                         else "na"
                     ),
                     "|".join(stats.get("local_gate_failures", ()))
+                    or "none",
+                    "|".join(stats.get("safety_gate_failures", ()))
                     or "none",
                 )
             )

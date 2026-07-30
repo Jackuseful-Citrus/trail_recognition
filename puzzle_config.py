@@ -99,6 +99,11 @@ PIECE_BACKGROUND_RELAXED_DELTA_GRAY = 20
 PIECE_BACKGROUND_NOISE_MARGIN_GRAY = 12
 PIECE_BACKGROUND_MAX_DELTA_GRAY = 55
 PIECE_BACKGROUND_MIN_SAMPLES = 96
+# A low background-relative threshold is useful for finding every component,
+# but its grey halo/shadow is not a physical puzzle edge. A value <= 0 keeps
+# the discovery threshold for contour tracing; the realtime black-surface
+# profile raises this floor independently.
+PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 0
 MORPH_KERNEL_PX = 3
 MORPH_OPEN_ITERATIONS = 1
 MORPH_CLOSE_ITERATIONS = 2
@@ -192,6 +197,14 @@ OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE = 32
 PLANNER_BACKEND = "outer_first"
 SIMULATOR_PLANNER_CUT_MODE = "auto"
 SIMULATOR_PLANNER_VALIDATION = "local"
+# Even simulator-compatible "upstream" proposals must not command an
+# obviously broken physical placement. Upstream mode may exceed local gates
+# only up to this multiplier; larger errors are rejected fail-closed.
+SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER = 2.0
+# T-junctions fitted from raster contours can report a small overlap at their
+# shared endpoint even when the visible topology is correct. Keep the hard
+# overlap safety limit looser than the outside/gap limits.
+SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER = 5.0
 SIMULATOR_MATCH_REL_TOLERANCE = 0.12
 SIMULATOR_PARTIAL_MIN_RATIO = 0.22
 SIMULATOR_PARTIAL_MAX_RATIO = 0.88
@@ -305,6 +318,7 @@ MOTION_START_CONFIRM_FRAMES = 2
 MOTION_END_CONFIRM_FRAMES = 4
 POST_MOTION_STABLE_FRAMES = 4
 POST_MOTION_VERIFY_SAMPLES = 3
+MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 
 # Final whole-rectangle validation. Linear values are millimetres.
 FINAL_RECT_FILL_MIN = 0.75

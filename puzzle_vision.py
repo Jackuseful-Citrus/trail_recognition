@@ -350,9 +350,14 @@ def _refine_vertices_with_lines(contour, polygon):
     return result
 
 
-def _finalize_fitted_polygon(contour_mm, polygon):
-    """Refine and validate an already simplified ordered polygon."""
-    polygon = _refine_vertices_with_lines(contour_mm, polygon)
+def _finalize_fitted_polygon(
+    contour_mm, polygon, refine_lines=True
+):
+    """Optionally refine, then validate an ordered simplified polygon."""
+    if refine_lines:
+        polygon = _refine_vertices_with_lines(
+            contour_mm, polygon
+        )
     polygon = remove_near_collinear_vertices(
         polygon,
         tolerance_deg=cfg.VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG,
@@ -387,9 +392,10 @@ def _finalize_fitted_polygon(contour_mm, polygon):
     return ensure_clockwise(polygon)
 
 
-def _ordered_contour_polygon(points_mm):
-    """Fit a validated 3..5 vertex polygon from an ordered outer contour."""
-    tolerance = max(0.05, cfg.CONTOUR_DP_TOLERANCE_MM)
+def _ordered_contour_polygon_once(
+    points_mm, tolerance, refine_lines=True
+):
+    """Run one direction-sensitive closed-contour polygon fit."""
     cleanup_limit = (
         cfg.MAX_POLYGON_VERTICES
         + cfg.VERTEX_CLEANUP_EXTRA_VERTICES
@@ -406,7 +412,68 @@ def _ordered_contour_polygon(points_mm):
         polygon = _reduce_polygon_to_limit(
             polygon, cleanup_limit
         )
-    return _finalize_fitted_polygon(points_mm, polygon)
+    return _finalize_fitted_polygon(
+        points_mm,
+        polygon,
+        refine_lines=refine_lines,
+    )
+
+
+def _ordered_contour_polygon(points_mm, fit_diagnostics=None):
+    """Fit a validated 3..5 vertex polygon from an ordered outer contour."""
+    tolerance = max(0.05, cfg.CONTOUR_DP_TOLERANCE_MM)
+    polygon = _ordered_contour_polygon_once(
+        points_mm, tolerance
+    )
+    if polygon is not None:
+        if fit_diagnostics is not None:
+            fit_diagnostics["polygon_fit_method"] = "forward"
+            fit_diagnostics["polygon_fit_reverse_used"] = False
+            fit_diagnostics["polygon_fit_unrefined_used"] = False
+        return polygon
+
+    # Closed Douglas-Peucker fitting can be direction-sensitive at the chosen
+    # ring seam. Retrying the identical measured contour in reverse order
+    # changes neither its pixels nor its convexity and is safer than forcing a
+    # convex hull or changing the threshold.
+    reversed_points = list(reversed(points_mm))
+    polygon = _ordered_contour_polygon_once(
+        reversed_points, tolerance
+    )
+    if polygon is not None:
+        if fit_diagnostics is not None:
+            fit_diagnostics["polygon_fit_method"] = "reverse"
+            fit_diagnostics["polygon_fit_reverse_used"] = True
+            fit_diagnostics["polygon_fit_unrefined_used"] = False
+        return polygon
+
+    # A valid Douglas-Peucker polygon can occasionally be made invalid when
+    # neighbouring least-squares lines intersect on the wrong side of a short
+    # or acute edge. In that case retain the measured simplified vertices.
+    # This does not invent a convex hull, relax geometry validation, or change
+    # segmentation; the same simple-polygon and area checks still apply.
+    polygon = _ordered_contour_polygon_once(
+        points_mm, tolerance, refine_lines=False
+    )
+    reverse_used = False
+    if polygon is None:
+        polygon = _ordered_contour_polygon_once(
+            reversed_points, tolerance, refine_lines=False
+        )
+        reverse_used = polygon is not None
+    if fit_diagnostics is not None:
+        if polygon is None:
+            method = "invalid"
+        elif reverse_used:
+            method = "reverse_unrefined"
+        else:
+            method = "forward_unrefined"
+        fit_diagnostics["polygon_fit_method"] = method
+        fit_diagnostics["polygon_fit_reverse_used"] = reverse_used
+        fit_diagnostics["polygon_fit_unrefined_used"] = (
+            polygon is not None
+        )
+    return polygon
 
 
 def _extract_polygon(contour, cv2_module, np_module):
@@ -614,6 +681,122 @@ def _blob_value(blob, method_name, tuple_index=None):
     if tuple_index is None:
         raise AttributeError("blob has no {}".format(method_name))
     return blob[tuple_index]
+
+
+def _diagnostic_scalar(value):
+    if isinstance(value, (tuple, list)):
+        return "|".join(str(item) for item in value)
+    return str(value).replace(",", ";")
+
+
+def _native_gray_sanity(gray_image):
+    """Read native image health after find_blobs without changing its input."""
+    result = {
+        "format": "na",
+        "width": int(gray_image.width()),
+        "height": int(gray_image.height()),
+        "min": "na",
+        "max": "na",
+        "mean": "na",
+        "median": "na",
+        "p00": "na",
+        "pc": "na",
+        "pt": "na",
+        "pb": "na",
+        "error": "",
+    }
+    errors = []
+    try:
+        format_method = getattr(gray_image, "format", None)
+        if format_method is not None:
+            value = (
+                format_method()
+                if callable(format_method)
+                else format_method
+            )
+            result["format"] = _diagnostic_scalar(value)
+    except Exception as exc:
+        errors.append("format:{}".format(str(exc)))
+    try:
+        stats = gray_image.get_statistics()
+        for name in ("min", "max", "mean", "median"):
+            method = getattr(stats, name, None)
+            if method is not None:
+                value = method() if callable(method) else method
+                result[name] = _diagnostic_scalar(value)
+    except Exception as exc:
+        errors.append("statistics:{}".format(str(exc)))
+    width = result["width"]
+    height = result["height"]
+    samples = {
+        "p00": (min(2, width - 1), min(2, height - 1)),
+        "pc": (width // 2, height // 2),
+        "pt": (width // 2, height // 4),
+        "pb": (width // 2, 3 * height // 4),
+    }
+    for name, point in samples.items():
+        try:
+            result[name] = _diagnostic_scalar(
+                gray_image.get_pixel(point[0], point[1])
+            )
+        except Exception as exc:
+            errors.append("{}:{}".format(name, str(exc)))
+    result["error"] = "|".join(errors).replace(",", ";")
+    return result
+
+
+def _array_gray_region_sanity(gray_array, roi, threshold):
+    """Measure the shared array in one ROI after native blob extraction."""
+    array_height = int(gray_array.shape[0])
+    array_width = int(gray_array.shape[1])
+    x0 = max(0, int(roi[0]))
+    y0 = max(0, int(roi[1]))
+    x1 = min(array_width, x0 + max(0, int(roi[2])))
+    y1 = min(array_height, y0 + max(0, int(roi[3])))
+    minimum = 255
+    maximum = 0
+    total = 0
+    count = 0
+    bright = 0
+    bright_x0 = x1
+    bright_y0 = y1
+    bright_x1 = -1
+    bright_y1 = -1
+    for y in range(y0, y1):
+        _vision_exitpoint(y - y0, interval=16)
+        row = gray_array[y]
+        for x in range(x0, x1):
+            value = max(0, min(255, int(row[x])))
+            minimum = min(minimum, value)
+            maximum = max(maximum, value)
+            total += value
+            count += 1
+            if value >= threshold:
+                bright += 1
+                bright_x0 = min(bright_x0, x)
+                bright_y0 = min(bright_y0, y)
+                bright_x1 = max(bright_x1, x)
+                bright_y1 = max(bright_y1, y)
+    if count <= 0:
+        minimum = 0
+    bbox = (
+        (
+            bright_x0,
+            bright_y0,
+            bright_x1 - bright_x0 + 1,
+            bright_y1 - bright_y0 + 1,
+        )
+        if bright > 0
+        else None
+    )
+    return {
+        "min": minimum,
+        "max": maximum,
+        "mean": float(total) / count if count else 0.0,
+        "pixels": count,
+        "bright": bright,
+        "bright_bbox": bbox,
+    }
 
 
 def _pixel_is_white(gray_array, x, y, threshold):
@@ -1184,7 +1367,9 @@ def _extract_canmv_polygon(
         )
         for point in boundary_px
     ]
-    polygon_mm = _ordered_contour_polygon(boundary_mm)
+    polygon_mm = _ordered_contour_polygon(
+        boundary_mm, trace_diagnostics
+    )
     if (
         cfg.FORCE_CONVEX_CONTOURS
         or (
@@ -1210,6 +1395,7 @@ def detect_pieces_from_canmv_image(
     region="upper",
     threshold=None,
     divider_y_mm=None,
+    collect_sanity=False,
 ):
     """Detect pieces with CanMV v1.6 native image APIs, without ``cv2``.
 
@@ -1235,7 +1421,23 @@ def detect_pieces_from_canmv_image(
         for point in corners_px
     ]
     rectify_started = PERF_STATS.mark()
-    gray_image.rotation_corr(corners=work_corners)
+    original_gray_image = gray_image
+    corrected = gray_image.rotation_corr(corners=work_corners)
+    if corrected is None:
+        rotation_return = "none"
+    elif corrected is original_gray_image:
+        rotation_return = "self"
+    elif (
+        hasattr(corrected, "width")
+        and hasattr(corrected, "height")
+        and hasattr(corrected, "find_blobs")
+    ):
+        gray_image = corrected
+        rotation_return = "new"
+    else:
+        rotation_return = "invalid:{}".format(
+            type(corrected).__name__
+        )
     PERF_STATS.add_stage("rectify_ms", rectify_started)
 
     pixels_per_mm_x = float(work_width - 1) / cfg.A4_WIDTH_MM
@@ -1331,6 +1533,24 @@ def detect_pieces_from_canmv_image(
             if segmentation_mode == "background_delta"
             else "fixed_native"
         )
+    contour_threshold = piece_threshold
+    if segmentation_mode == "background_delta":
+        contour_threshold = max(
+            contour_threshold,
+            max(
+                0,
+                min(
+                    255,
+                    int(
+                        getattr(
+                            cfg,
+                            "PIECE_CONTOUR_MIN_GRAY_THRESHOLD",
+                            0,
+                        )
+                    ),
+                ),
+            ),
+        )
     if region == "upper":
         detection_regions = [(margin_y, upper_end)]
     elif region == "lower":
@@ -1380,6 +1600,35 @@ def detect_pieces_from_canmv_image(
                 (blob, region_start, region_end)
             )
     PERF_STATS.add_stage("blob_ms", blob_started)
+    gray_sanity = None
+    if collect_sanity:
+        upper_roi = (
+            margin_x,
+            margin_y,
+            max(1, work_width - 2 * margin_x),
+            max(1, upper_end - margin_y),
+        )
+        lower_roi = (
+            margin_x,
+            lower_start,
+            max(1, work_width - 2 * margin_x),
+            max(1, work_height - margin_y - lower_start),
+        )
+        gray_sanity = {
+            "native": _native_gray_sanity(gray_image),
+            "upper": _array_gray_region_sanity(
+                gray_array, upper_roi, piece_threshold
+            ),
+            "lower": _array_gray_region_sanity(
+                gray_array, lower_roi, piece_threshold
+            ),
+            "rotation_return": rotation_return,
+            "find_min_pixels": min_pixels,
+            "blob_rects": [
+                tuple(_blob_value(blob, "rect", None))
+                for blob, _region_start, _region_end in blob_regions
+            ],
+        }
     observations = []
     rejected = {
         "area": 0,
@@ -1391,6 +1640,9 @@ def detect_pieces_from_canmv_image(
     fallback_count = 0
     primary_boundary_ok_count = 0
     ordered_fallback_ok_count = 0
+    polygon_reverse_retry_count = 0
+    polygon_unrefined_retry_count = 0
+    polygon_failure_rects = []
     boundary_failure_reasons = {}
     trace_failures = {}
     for blob, region_start, region_end in blob_regions:
@@ -1417,7 +1669,7 @@ def detect_pieces_from_canmv_image(
             _extract_canmv_polygon(
                 gray_array,
                 blob,
-                piece_threshold,
+                contour_threshold,
                 pixels_per_mm_x,
                 pixels_per_mm_y,
             )
@@ -1434,6 +1686,14 @@ def detect_pieces_from_canmv_image(
             "boundary_fallback_ordered_ok", False
         ):
             ordered_fallback_ok_count += 1
+        if trace_diagnostics.get(
+            "polygon_fit_reverse_used", False
+        ):
+            polygon_reverse_retry_count += 1
+        if trace_diagnostics.get(
+            "polygon_fit_unrefined_used", False
+        ):
+            polygon_unrefined_retry_count += 1
         failure_reason = trace_diagnostics.get(
             "boundary_failure_reason", ""
         )
@@ -1448,6 +1708,7 @@ def detect_pieces_from_canmv_image(
             )
         if polygon_mm is None:
             rejected["polygon"] += 1
+            polygon_failure_rects.append(rect)
             if trace_diagnostics.get("ok", False):
                 trace_failures["fit_invalid"] = (
                     trace_failures.get("fit_invalid", 0) + 1
@@ -1496,6 +1757,7 @@ def detect_pieces_from_canmv_image(
         "divider_y_mm": active_divider_y_mm,
         "divider_detected": divider_y_mm is not None,
         "threshold": float(piece_threshold),
+        "contour_threshold": float(contour_threshold),
         "threshold_mode": threshold_mode,
         "segmentation_mode": segmentation_mode,
         "background_gray": background_stats[
@@ -1531,9 +1793,17 @@ def detect_pieces_from_canmv_image(
         "boundary_fallback_ordered_ok": (
             ordered_fallback_ok_count
         ),
+        "polygon_reverse_retry_count": (
+            polygon_reverse_retry_count
+        ),
+        "polygon_unrefined_retry_count": (
+            polygon_unrefined_retry_count
+        ),
+        "polygon_failure_rects": polygon_failure_rects,
         "boundary_failure_reason": boundary_failure_reasons,
         "trace_failures": trace_failures,
         "detected_vertex_counts": detected_vertex_counts,
+        "gray_sanity": gray_sanity,
     }
     return observations, diagnostics
 

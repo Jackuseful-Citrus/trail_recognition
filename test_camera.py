@@ -52,7 +52,7 @@ def _load_a4_corners():
         cfg_dir = base_dir + "/k230_realtime_a4"
         if cfg_dir not in sys.path:
             sys.path.insert(0, cfg_dir)
-        from realtime_a4_config import A4_CORNERS_PX
+        from k230_realtime_a4.realtime_a4_config import A4_CORNERS_PX
         config_points = A4_CORNERS_PX
     except Exception:
         config_points = _A4_CORNERS_FALLBACK_PX

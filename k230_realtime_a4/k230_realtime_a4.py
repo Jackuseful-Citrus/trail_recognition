@@ -51,7 +51,6 @@ from puzzle_realtime_state import (
     PieceCountConsensus,
     PlacementMotionState,
     a4_detection_interval,
-    bottom_right_thumbnail_rect,
     phase_allows_vision,
     operator_overlay_visibility,
     operator_status_line,
@@ -60,6 +59,7 @@ from puzzle_realtime_state import (
     periodic_output_due,
     should_render_ui,
     status_ui_key,
+    top_right_thumbnail_rect,
 )
 from puzzle_vision import (
     background_difference_threshold,
@@ -70,6 +70,7 @@ from puzzle_vision import (
 from puzzle_a4_boundary import (
     A4BoundaryTracker,
     detect_a4_boundary,
+    project_a4_mm_to_frame,
 )
 
 
@@ -112,19 +113,14 @@ def _draw_quad(frame, corners, color, thickness=3):
 
 
 def _a4_mm_to_frame(point_mm, corners):
-    u = float(point_mm[0]) / cfg.A4_WIDTH_MM
-    v = float(point_mm[1]) / cfg.A4_HEIGHT_MM
-    tl, tr, br, bl = corners
-    return (
-        (1.0 - u) * (1.0 - v) * tl[0]
-        + u * (1.0 - v) * tr[0]
-        + u * v * br[0]
-        + (1.0 - u) * v * bl[0],
-        (1.0 - u) * (1.0 - v) * tl[1]
-        + u * (1.0 - v) * tr[1]
-        + u * v * br[1]
-        + (1.0 - u) * v * bl[1],
+    projected = project_a4_mm_to_frame(
+        point_mm, corners
     )
+    if projected is None:
+        # A4 locking already rejects a degenerate quadrilateral. Retain a
+        # harmless fallback for manual emergency configurations.
+        return float(corners[0][0]), float(corners[0][1])
+    return projected
 
 
 def _draw_piece_overlay(frame, pieces, corners):
@@ -408,8 +404,9 @@ def _draw_gray_work_thumbnail(
     gray_image,
     source_frame_index,
     threshold,
+    contour_threshold,
 ):
-    """Draw the exact rectified piece-recognition image at bottom-right."""
+    """Draw a rectified A4-only grayscale image at the top-right."""
     if (
         not cfg.SHOW_GRAY_WORK_THUMBNAIL
         or gray_image is None
@@ -417,7 +414,7 @@ def _draw_gray_work_thumbnail(
         return None
     try:
         x, y, width, height, scale = (
-            bottom_right_thumbnail_rect(
+            top_right_thumbnail_rect(
                 canvas.width(),
                 canvas.height(),
                 gray_image.width(),
@@ -443,18 +440,27 @@ def _draw_gray_work_thumbnail(
             height + 2,
             WHITE,
         )
+        label = "A4 B:{} C:{} F:{}".format(
+            threshold if threshold is not None else "-",
+            (
+                contour_threshold
+                if contour_threshold is not None
+                else "-"
+            ),
+            source_frame_index,
+        )
+        label_y = min(
+            canvas.height() - 16,
+            y + height + 3,
+        )
         _draw_text(
             canvas,
-            x,
-            max(0, y - 17),
-            "GRAY {}x{} T:{} F:{}".format(
-                gray_image.width(),
-                gray_image.height(),
-                threshold if threshold is not None else "-",
-                source_frame_index,
-            ),
-            GRAY,
+            x + 1,
+            label_y + 1,
+            label,
+            (0, 0, 0),
         )
+        _draw_text(canvas, x, label_y, label, WHITE)
         return None
     except Exception as exc:
         if "IDE interrupt" in str(exc):
@@ -975,6 +981,7 @@ def _detect_frame_pieces(
     region,
     threshold,
     divider_y_mm=None,
+    collect_sanity=False,
 ):
     piece_gray = frame.to_grayscale(
         x_size=cfg.REALTIME_PIECE_WORK_WIDTH,
@@ -987,6 +994,7 @@ def _detect_frame_pieces(
         region=region,
         threshold=threshold,
         divider_y_mm=divider_y_mm,
+        collect_sanity=collect_sanity,
     )
 
 
@@ -1061,6 +1069,27 @@ def _count_map_text(values):
     )
 
 
+def _print_frozen_piece_geometry(frame_index, pieces):
+    """Emit replayable millimetre polygons once per planning attempt."""
+    for index, piece in enumerate(pieces):
+        piece_id = piece.piece_id or "P{}".format(index + 1)
+        vertices = "|".join(
+            "{:.2f}:{:.2f}".format(point[0], point[1])
+            for point in piece.polygon_mm
+        )
+        print(
+            "PIECE_GEOMETRY,frame={},id={},area_mm2={:.1f},"
+            "center_mm={:.2f}:{:.2f},vertices_mm={}".format(
+                frame_index,
+                piece_id,
+                piece.area_mm2,
+                piece.centroid_mm[0],
+                piece.centroid_mm[1],
+                vertices,
+            )
+        )
+
+
 def _relaxed_piece_threshold(diagnostics):
     """Choose the low-contrast retry threshold in the same gray reference."""
     if (
@@ -1093,6 +1122,64 @@ def _print_piece_diagnostics(
     retry_used,
     consensus_state=None,
 ):
+    sanity = diagnostics.get("gray_sanity")
+    if sanity is not None:
+        native = sanity["native"]
+        upper = sanity["upper"]
+        lower = sanity["lower"]
+        upper_bbox = upper.get("bright_bbox")
+        lower_bbox = lower.get("bright_bbox")
+        print(
+            "GRAY_SANITY,frame={},format={},size={}x{},"
+            "rotation_return={},min={},max={},mean={},median={},"
+            "p00={},pc={},pt={},pb={},"
+            "upper_min={},upper_max={},upper_mean={:.1f},"
+            "upper_bright={},upper_bbox={},"
+            "lower_min={},lower_max={},lower_mean={:.1f},"
+            "lower_bright={},lower_bbox={},"
+            "find_min_pixels={},blob_rects={},error={}".format(
+                frame_index,
+                native.get("format", "na"),
+                native.get("width", 0),
+                native.get("height", 0),
+                sanity.get("rotation_return", "na"),
+                native.get("min", "na"),
+                native.get("max", "na"),
+                native.get("mean", "na"),
+                native.get("median", "na"),
+                native.get("p00", "na"),
+                native.get("pc", "na"),
+                native.get("pt", "na"),
+                native.get("pb", "na"),
+                upper.get("min", 0),
+                upper.get("max", 0),
+                upper.get("mean", 0.0),
+                upper.get("bright", 0),
+                (
+                    ":".join(str(value) for value in upper_bbox)
+                    if upper_bbox is not None
+                    else "none"
+                ),
+                lower.get("min", 0),
+                lower.get("max", 0),
+                lower.get("mean", 0.0),
+                lower.get("bright", 0),
+                (
+                    ":".join(str(value) for value in lower_bbox)
+                    if lower_bbox is not None
+                    else "none"
+                ),
+                sanity.get("find_min_pixels", 0),
+                (
+                    "|".join(
+                        ":".join(str(value) for value in rect)
+                        for rect in sanity.get("blob_rects", ())
+                    )
+                    or "none"
+                ),
+                native.get("error", "") or "none",
+            )
+        )
     rejected = diagnostics.get("rejected", {})
     trace_failures = diagnostics.get("trace_failures", {})
     expected = "na"
@@ -1106,11 +1193,14 @@ def _print_piece_diagnostics(
         )
     print(
         "PIECE_DETECT,frame={},region={},segmentation={},"
-        "threshold={},bg={:.1f},bg_high={:.1f},"
+        "threshold={},contour_threshold={},"
+        "bg={:.1f},bg_high={:.1f},"
         "bg_spread={:.1f},delta={:.1f},bg_samples={},retry={},"
         "raw_blobs={},accepted={},rejected={},trace_failures={},"
         "boundary_primary_ok={},boundary_fallback_used={},"
         "boundary_fallback_ordered_ok={},boundary_failure_reason={},"
+        "polygon_reverse_retry={},polygon_unrefined_retry={},"
+        "polygon_failure_rects={},"
         "boundary_steps={},pixel_reads={},"
         "raw_vertices={},vertices={},areas_mm2={},"
         "divider_y_mm={:.1f},divider_detected={},"
@@ -1119,6 +1209,12 @@ def _print_piece_diagnostics(
             region,
             diagnostics.get("threshold_mode", "unknown"),
             int(diagnostics.get("threshold", 0)),
+            int(
+                diagnostics.get(
+                    "contour_threshold",
+                    diagnostics.get("threshold", 0),
+                )
+            ),
             diagnostics.get("background_gray", 0.0),
             diagnostics.get("background_high_gray", 0.0),
             diagnostics.get("background_spread_gray", 0.0),
@@ -1136,6 +1232,17 @@ def _print_piece_diagnostics(
             ),
             _count_map_text(
                 diagnostics.get("boundary_failure_reason", {})
+            ),
+            diagnostics.get("polygon_reverse_retry_count", 0),
+            diagnostics.get("polygon_unrefined_retry_count", 0),
+            (
+                "|".join(
+                    ":".join(str(value) for value in rect)
+                    for rect in diagnostics.get(
+                        "polygon_failure_rects", ()
+                    )
+                )
+                or "none"
             ),
             diagnostics.get("boundary_steps", 0),
             diagnostics.get("pixel_reads", 0),
@@ -1228,6 +1335,9 @@ def main():
         "mean_abs_diff": 0.0,
         "changed_ratio": 0.0,
         "motion": False,
+        "scene_mean_abs_diff": 0.0,
+        "scene_changed_ratio": 0.0,
+        "scene_change": False,
     }
     before_foreground_mask = None
     verify_samples = []
@@ -1251,6 +1361,7 @@ def main():
     last_piece_gray = None
     last_piece_gray_frame = -1
     last_piece_gray_threshold = None
+    last_piece_contour_threshold = None
     last_thumbnail_error = None
     last_operator_view_error = None
     ide_output_index = 0
@@ -1282,7 +1393,7 @@ def main():
             "placement_check_ms={},a4_hold_misses={},"
             "piece_segment={},piece_deltas={}|{},"
             "fixed_fallbacks={}|{},count_window={},"
-            "count_settle={},gray_thumbnail={},"
+            "count_settle={},gray_thumbnail={},gray_sanity={},"
             "ide_stream=explicit,ide_quality={},"
             "ide_every={},plan_debug={},"
             "plan_debug_ms={},dynamic_divider={},"
@@ -1307,6 +1418,13 @@ def main():
                 cfg.PIECE_COUNT_WINDOW_DETECTIONS,
                 cfg.PIECE_COUNT_SETTLE_DETECTIONS,
                 int(cfg.SHOW_GRAY_WORK_THUMBNAIL),
+                int(
+                    getattr(
+                        cfg,
+                        "ENABLE_GRAY_SANITY_DIAGNOSTICS",
+                        False,
+                    )
+                ),
                 cfg.IDE_STREAM_QUALITY,
                 cfg.IDE_STREAM_EVERY_N_OUTPUTS,
                 int(cfg.ENABLE_PLAN_DEBUG),
@@ -1434,6 +1552,26 @@ def main():
                     )
                     if piece_due:
                         piece_detection_count += 1
+                        collect_gray_sanity = bool(
+                            getattr(
+                                cfg,
+                                "ENABLE_GRAY_SANITY_DIAGNOSTICS",
+                                False,
+                            )
+                            and (
+                                piece_detection_count == 1
+                                or piece_detection_count
+                                % max(
+                                    1,
+                                    getattr(
+                                        cfg,
+                                        "GRAY_SANITY_EVERY_N_DETECTIONS",
+                                        5,
+                                    ),
+                                )
+                                == 0
+                            )
+                        )
                         pieces, piece_diagnostics = (
                             _detect_frame_pieces(
                                 frame,
@@ -1448,6 +1586,7 @@ def main():
                                     )
                                     else None
                                 ),
+                                collect_sanity=collect_gray_sanity,
                             )
                         )
                         retry_used = False
@@ -1506,6 +1645,7 @@ def main():
                                     )
                                     else None
                                 ),
+                                collect_sanity=collect_gray_sanity,
                             )
                             if len(retry_pieces) > len(pieces):
                                 pieces = retry_pieces
@@ -1523,9 +1663,24 @@ def main():
                                 cfg.WHITE_GRAY_THRESHOLD,
                             )
                         )
+                        last_piece_contour_threshold = int(
+                            piece_diagnostics.get(
+                                "contour_threshold",
+                                last_piece_gray_threshold,
+                            )
+                        )
                         raw_pieces = pieces
                         raw_piece_count = len(raw_pieces)
-                        if tracker_expected_count is None:
+                        polygon_fit_incomplete = (
+                            piece_diagnostics.get(
+                                "rejected", {}
+                            ).get("polygon", 0)
+                            > 0
+                        )
+                        if (
+                            tracker_expected_count is None
+                            and not polygon_fit_incomplete
+                        ):
                             consensus_state = (
                                 piece_count_consensus.update(
                                     raw_piece_count
@@ -1540,7 +1695,17 @@ def main():
                                 piece_tracker.reset(
                                     tracker_expected_count
                                 )
-                        if (
+                        if polygon_fit_incomplete:
+                            tracker_stable = False
+                            stable = False
+                            # Show the current frame's accepted contours so a
+                            # fit failure cannot leave stale, misleading
+                            # overlays on screen. Planning remains fail-closed.
+                            pieces = raw_pieces
+                            pending_reason = (
+                                "polygon_fit_incomplete"
+                            )
+                        elif (
                             tracker_expected_count is None
                             or raw_piece_count
                             != tracker_expected_count
@@ -1694,8 +1859,19 @@ def main():
                                     )
                                 )
                         else:
+                            motion_signal = motion_metrics["motion"]
+                            motion_source = "adjacent"
+                            if (
+                                phase == "WAIT_FOR_MOTION"
+                                and motion_metrics.get(
+                                    "scene_change", False
+                                )
+                            ):
+                                motion_signal = True
+                                if not motion_metrics["motion"]:
+                                    motion_source = "scene"
                             motion_state = placement_flow.update(
-                                motion_metrics["motion"],
+                                motion_signal,
                                 frame_index,
                             )
                             phase = motion_state["phase"]
@@ -1704,7 +1880,10 @@ def main():
                                 print(
                                     "MOTION_START,frame={},"
                                     "mean_diff={:.2f},"
-                                    "changed_ratio={:.3f}".format(
+                                    "changed_ratio={:.3f},"
+                                    "scene_mean_diff={:.2f},"
+                                    "scene_changed_ratio={:.3f},"
+                                    "source={}".format(
                                         motion_state[
                                             "motion_start_frame"
                                         ],
@@ -1714,6 +1893,15 @@ def main():
                                         motion_metrics[
                                             "changed_ratio"
                                         ],
+                                        motion_metrics.get(
+                                            "scene_mean_abs_diff",
+                                            0.0,
+                                        ),
+                                        motion_metrics.get(
+                                            "scene_changed_ratio",
+                                            0.0,
+                                        ),
+                                        motion_source,
                                     )
                                 )
                             if motion_state["motion_ended"]:
@@ -1753,6 +1941,40 @@ def main():
                                         motion_metrics[
                                             "changed_ratio"
                                         ],
+                                    )
+                                )
+                                last_motion_diagnostic_frame = frame_index
+                            if (
+                                phase == "WAIT_FOR_MOTION"
+                                and frame_index
+                                - last_motion_diagnostic_frame
+                                >= getattr(
+                                    cfg,
+                                    "MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES",
+                                    60,
+                                )
+                            ):
+                                print(
+                                    "MOTION_WAIT,frame={},"
+                                    "mean_diff={:.2f},"
+                                    "changed_ratio={:.3f},"
+                                    "scene_mean_diff={:.2f},"
+                                    "scene_changed_ratio={:.3f}".format(
+                                        frame_index,
+                                        motion_metrics[
+                                            "mean_abs_diff"
+                                        ],
+                                        motion_metrics[
+                                            "changed_ratio"
+                                        ],
+                                        motion_metrics.get(
+                                            "scene_mean_abs_diff",
+                                            0.0,
+                                        ),
+                                        motion_metrics.get(
+                                            "scene_changed_ratio",
+                                            0.0,
+                                        ),
                                     )
                                 )
                                 last_motion_diagnostic_frame = frame_index
@@ -1812,6 +2034,12 @@ def main():
                             placement_diagnostics.get(
                                 "threshold",
                                 cfg.WHITE_GRAY_THRESHOLD,
+                            )
+                        )
+                        last_piece_contour_threshold = int(
+                            placement_diagnostics.get(
+                                "contour_threshold",
+                                last_piece_gray_threshold,
                             )
                         )
                         gray_array = placement_diagnostics[
@@ -2013,6 +2241,8 @@ def main():
                                 phase = (
                                     placement_flow.verification_finished()
                                 )
+                            if phase == "WAIT_FOR_MOTION":
+                                motion_detector.accept_current_as_reference()
                             verify_samples = []
                             verify_started_frame = None
                         if phase == "COMPLETE":
@@ -2039,6 +2269,7 @@ def main():
                     last_piece_gray = None
                     last_piece_gray_frame = -1
                     last_piece_gray_threshold = None
+                    last_piece_contour_threshold = None
                 elif placement_monitor is not None:
                     # Keep the frozen plan and most recent contour-only state
                     # while A4 tracking is temporarily lost.
@@ -2107,6 +2338,9 @@ def main():
                                 len(pieces),
                             )
                         )
+                        _print_frozen_piece_geometry(
+                            frame_index, pieces
+                        )
                         phase = "PLANNING"
                         planning_canvas = canvases[canvas_index]
                         canvas_index = 1 - canvas_index
@@ -2140,6 +2374,7 @@ def main():
                                 last_piece_gray,
                                 last_piece_gray_frame,
                                 last_piece_gray_threshold,
+                                last_piece_contour_threshold,
                             )
                         )
                         if (
@@ -2505,6 +2740,49 @@ def main():
                             )
                         )
                     last_operator_view_error = operator_error
+                    live_a4_gray = last_piece_gray
+                    live_a4_gray_frame = last_piece_gray_frame
+                    live_a4_error = None
+                    if (
+                        cfg.SHOW_GRAY_WORK_THUMBNAIL
+                        and a4_state["locked"]
+                        and a4_state["corners_px"] is not None
+                    ):
+                        try:
+                            live_a4_gray = _rectified_gray(
+                                frame,
+                                a4_state["corners_px"],
+                                cfg.GRAY_THUMBNAIL_MAX_WIDTH,
+                                cfg.GRAY_THUMBNAIL_MAX_HEIGHT,
+                            )
+                            live_a4_gray_frame = frame_index
+                        except Exception as exc:
+                            if "IDE interrupt" in str(exc):
+                                raise
+                            live_a4_error = str(exc)
+                    thumbnail_error = (
+                        live_a4_error
+                        or _draw_gray_work_thumbnail(
+                            canvas,
+                            live_a4_gray,
+                            live_a4_gray_frame,
+                            last_piece_gray_threshold,
+                            last_piece_contour_threshold,
+                        )
+                    )
+                    if (
+                        thumbnail_error
+                        and thumbnail_error
+                        != last_thumbnail_error
+                    ):
+                        print(
+                            "GRAY_THUMBNAIL_ERROR,frame={},"
+                            "reason={}".format(
+                                frame_index,
+                                thumbnail_error.replace(",", ";"),
+                            )
+                        )
+                    last_thumbnail_error = thumbnail_error
                     PERF_STATS.add_stage(
                         "render_ms", render_started
                     )
@@ -2654,6 +2932,7 @@ def main():
                             last_piece_gray,
                             last_piece_gray_frame,
                             last_piece_gray_threshold,
+                            last_piece_contour_threshold,
                         )
                     )
                     if (

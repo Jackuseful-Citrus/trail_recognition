@@ -741,28 +741,39 @@ def _sim_target_geometry(target_size):
     )
 
 
-def _sim_local_gate_failures(metrics, dimension_error):
+def _sim_gate_failures(
+    metrics,
+    dimension_error,
+    limit_multiplier=1.0,
+    overlap_multiplier=None,
+):
+    if overlap_multiplier is None:
+        overlap_multiplier = limit_multiplier
     failures = []
     gates = (
         (
             "outside_mm2",
             metrics["outside_mm2"],
-            float(cfg.FIXED_RECT_MAX_OUTSIDE_MM2),
+            float(cfg.FIXED_RECT_MAX_OUTSIDE_MM2)
+            * limit_multiplier,
         ),
         (
             "overlap_mm2",
             metrics["overlap_mm2"],
-            float(cfg.FIXED_RECT_MAX_OVERLAP_MM2),
+            float(cfg.FIXED_RECT_MAX_OVERLAP_MM2)
+            * overlap_multiplier,
         ),
         (
             "fill_gap_mm2",
             metrics["fill_gap_mm2"],
-            float(cfg.FIXED_RECT_MAX_GAP_MM2),
+            float(cfg.FIXED_RECT_MAX_GAP_MM2)
+            * limit_multiplier,
         ),
         (
             "dimension_error_mm",
             dimension_error,
-            float(cfg.FINAL_RECT_DIM_TOLERANCE_MM),
+            float(cfg.FINAL_RECT_DIM_TOLERANCE_MM)
+            * limit_multiplier,
         ),
     )
     for name, value, limit in gates:
@@ -771,6 +782,12 @@ def _sim_local_gate_failures(metrics, dimension_error):
                 "{}={:.1f}>{:.1f}".format(name, value, limit)
             )
     return failures
+
+
+def _sim_local_gate_failures(metrics, dimension_error):
+    return _sim_gate_failures(
+        metrics, dimension_error, limit_multiplier=1.0
+    )
 
 
 def _sim_seam_records(polygons, matches):
@@ -960,9 +977,43 @@ def plan_simulator_rectangle(
     gate_failures = _sim_local_gate_failures(
         metrics, dimension_error
     )
-    valid = validation == "upstream" or not gate_failures
+    safety_multiplier = max(
+        1.0,
+        float(
+            getattr(
+                cfg,
+                "SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER",
+                2.0,
+            )
+        ),
+    )
+    overlap_safety_multiplier = max(
+        safety_multiplier,
+        float(
+            getattr(
+                cfg,
+                "SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER",
+                safety_multiplier,
+            )
+        ),
+    )
+    safety_gate_failures = _sim_gate_failures(
+        metrics,
+        dimension_error,
+        limit_multiplier=safety_multiplier,
+        overlap_multiplier=overlap_safety_multiplier,
+    )
+    valid = (
+        not safety_gate_failures
+        if validation == "upstream"
+        else not gate_failures
+    )
     reason = "ok"
-    if validation == "upstream" and gate_failures:
+    if validation == "upstream" and safety_gate_failures:
+        reason = (
+            "upstream proposal rejected by physical safety gates: {}"
+        ).format("; ".join(safety_gate_failures))
+    elif validation == "upstream" and gate_failures:
         reason = "upstream proposal; local warnings: {}".format(
             "; ".join(gate_failures)
         )
@@ -1014,6 +1065,11 @@ def plan_simulator_rectangle(
         "actual_width_mm": actual_width,
         "actual_height_mm": actual_height,
         "local_gate_failures": gate_failures,
+        "safety_gate_failures": safety_gate_failures,
+        "safety_gate_multiplier": safety_multiplier,
+        "overlap_safety_gate_multiplier": (
+            overlap_safety_multiplier
+        ),
         "input_piece_area_mm2": sum(
             piece.area_mm2 for piece in pieces
         ),

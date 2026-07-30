@@ -129,6 +129,34 @@ def bottom_right_thumbnail_rect(
     return (x, y, width, height, scale)
 
 
+def top_right_thumbnail_rect(
+    canvas_width,
+    canvas_height,
+    source_width,
+    source_height,
+    max_width,
+    max_height,
+    margin,
+):
+    """Fit an aspect-preserving thumbnail against the top-right corner."""
+    x, _y, width, height, scale = bottom_right_thumbnail_rect(
+        canvas_width,
+        canvas_height,
+        source_width,
+        source_height,
+        max_width,
+        max_height,
+        margin,
+    )
+    return (
+        x,
+        max(0, min(int(margin), int(canvas_height) - height)),
+        width,
+        height,
+        scale,
+    )
+
+
 def periodic_output_due(output_index, every_n_outputs):
     """Return whether a throttled side-channel should publish this output."""
     interval = max(1, int(every_n_outputs))
@@ -263,6 +291,7 @@ class MotionDetector:
         "divider_start",
         "divider_end",
         "previous",
+        "reference",
         "last_metrics",
     )
 
@@ -285,21 +314,37 @@ class MotionDetector:
             self.divider_start = int(divider_rows[0])
             self.divider_end = int(divider_rows[1])
         self.previous = None
+        self.reference = None
         self.last_metrics = {
             "mean_abs_diff": 0.0,
             "changed_ratio": 0.0,
             "motion": False,
+            "scene_mean_abs_diff": 0.0,
+            "scene_changed_ratio": 0.0,
+            "scene_change": False,
             "sample_count": 0,
         }
 
     def reset(self):
         self.previous = None
+        self.reference = None
         self.last_metrics = {
             "mean_abs_diff": 0.0,
             "changed_ratio": 0.0,
             "motion": False,
+            "scene_mean_abs_diff": 0.0,
+            "scene_changed_ratio": 0.0,
+            "scene_change": False,
             "sample_count": 0,
         }
+
+    def accept_current_as_reference(self):
+        """Make the latest stable sample the next placement baseline."""
+        self.reference = (
+            bytearray(self.previous)
+            if self.previous is not None
+            else None
+        )
 
     def update(self, gray_array):
         height = int(gray_array.shape[0])
@@ -311,34 +356,62 @@ class MotionDetector:
             row = gray_array[y]
             for x in range(0, width, self.sample_stride):
                 current.append(int(row[x]))
-        if self.previous is None or len(self.previous) != len(current):
+        if (
+            self.previous is None
+            or self.reference is None
+            or len(self.previous) != len(current)
+            or len(self.reference) != len(current)
+        ):
             self.previous = current
+            self.reference = bytearray(current)
             self.last_metrics = {
                 "mean_abs_diff": 0.0,
                 "changed_ratio": 0.0,
                 "motion": False,
+                "scene_mean_abs_diff": 0.0,
+                "scene_changed_ratio": 0.0,
+                "scene_change": False,
                 "sample_count": len(current),
             }
             return dict(self.last_metrics)
         total = 0
         changed = 0
-        for before, after in zip(self.previous, current):
+        scene_total = 0
+        scene_changed = 0
+        for before, reference, after in zip(
+            self.previous, self.reference, current
+        ):
             difference = abs(int(after) - int(before))
             total += difference
             if difference >= self.pixel_threshold:
                 changed += 1
+            scene_difference = abs(
+                int(after) - int(reference)
+            )
+            scene_total += scene_difference
+            if scene_difference >= self.pixel_threshold:
+                scene_changed += 1
         count = max(1, len(current))
         mean_abs_diff = float(total) / count
         changed_ratio = float(changed) / count
+        scene_mean_abs_diff = float(scene_total) / count
+        scene_changed_ratio = float(scene_changed) / count
         motion = (
             mean_abs_diff >= self.mean_threshold
             and changed_ratio >= self.ratio_threshold
+        )
+        scene_change = (
+            scene_mean_abs_diff >= self.mean_threshold
+            and scene_changed_ratio >= self.ratio_threshold
         )
         self.previous = current
         self.last_metrics = {
             "mean_abs_diff": mean_abs_diff,
             "changed_ratio": changed_ratio,
             "motion": motion,
+            "scene_mean_abs_diff": scene_mean_abs_diff,
+            "scene_changed_ratio": scene_changed_ratio,
+            "scene_change": scene_change,
             "sample_count": len(current),
         }
         return dict(self.last_metrics)

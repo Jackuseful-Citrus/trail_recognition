@@ -17,6 +17,7 @@ from puzzle_a4_boundary import (
     _projective_quad_point,
     detect_a4_boundary,
     order_a4_corners,
+    project_a4_mm_to_frame,
 )
 from puzzle_realtime_state import (
     MotionDetector,
@@ -33,6 +34,7 @@ from puzzle_realtime_state import (
     placement_ui_key,
     periodic_output_due,
     should_render_ui,
+    top_right_thumbnail_rect,
 )
 
 
@@ -160,6 +162,35 @@ class AutomaticA4Tests(unittest.TestCase):
             candidate["corners_px"][0][0],
             self.corners[0][0] * 799.0 / 319.0,
             places=4,
+        )
+
+    def test_a4_overlay_uses_projective_not_bilinear_mapping(self):
+        corners = [
+            (110.0, 431.0),
+            (123.0, 73.0),
+            (591.0, 73.0),
+            (594.0, 431.0),
+        ]
+        point_mm = (
+            cfg.A4_WIDTH_MM * 0.5,
+            cfg.A4_HEIGHT_MM * 0.2,
+        )
+        expected = _projective_quad_point(
+            corners, 0.5, 0.2
+        )
+        actual = project_a4_mm_to_frame(
+            point_mm, corners
+        )
+        self.assertAlmostEqual(actual[0], expected[0])
+        self.assertAlmostEqual(actual[1], expected[1])
+        bilinear_y = (
+            0.4 * corners[0][1]
+            + 0.4 * corners[1][1]
+            + 0.1 * corners[2][1]
+            + 0.1 * corners[3][1]
+        )
+        self.assertGreater(
+            abs(actual[1] - bilinear_y), 2.5
         )
 
     def test_projective_divider_validates_without_moving_corners(self):
@@ -675,6 +706,23 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         self.assertAlmostEqual(width / height, 240 / 336, places=2)
         self.assertAlmostEqual(scale, min(128 / 240, 180 / 336))
 
+    def test_gray_thumbnail_fits_top_right_and_keeps_aspect(self):
+        x, y, width, height, scale = top_right_thumbnail_rect(
+            800,
+            480,
+            240,
+            336,
+            128,
+            180,
+            8,
+        )
+        self.assertEqual(x + width, 792)
+        self.assertEqual(y, 8)
+        self.assertLessEqual(width, 128)
+        self.assertLessEqual(height, 180)
+        self.assertAlmostEqual(width / height, 240 / 336, places=2)
+        self.assertAlmostEqual(scale, min(128 / 240, 180 / 336))
+
     def test_explicit_ide_stream_is_rate_limited_but_sends_first(self):
         due = [
             index
@@ -770,6 +818,43 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         broad = np.full((10, 10), 80, dtype=np.uint8)
         metrics = detector.update(broad)
         self.assertTrue(metrics["motion"])
+
+    def test_slow_cumulative_scene_change_triggers_placement(self):
+        detector = MotionDetector(18, 5.0, 0.035)
+        flow = PlacementMotionState(2, 4, 4)
+        base = np.zeros((20, 20), dtype=np.uint8)
+        detector.update(base)
+        phases = []
+        for frame_index, changed_pixels in enumerate(
+            (20, 40, 60), start=1
+        ):
+            frame = base.copy()
+            frame.flat[:changed_pixels] = 80
+            metrics = detector.update(frame)
+            # Each adjacent step changes too little mean intensity to trigger.
+            self.assertFalse(metrics["motion"])
+            signal = (
+                metrics["motion"]
+                or metrics["scene_change"]
+            )
+            phases.append(
+                flow.update(signal, frame_index)["phase"]
+            )
+        self.assertIn("MOVING", phases)
+
+        placed = base.copy()
+        placed.flat[:60] = 80
+        state = None
+        for frame_index in range(4, 8):
+            metrics = detector.update(placed)
+            state = flow.update(
+                metrics["motion"], frame_index
+            )
+        self.assertTrue(state["trigger_verify"])
+        flow.verification_finished()
+        detector.accept_current_as_reference()
+        metrics = detector.update(placed)
+        self.assertFalse(metrics["scene_change"])
 
     def test_moving_phase_pauses_all_expensive_vision(self):
         for phase in (

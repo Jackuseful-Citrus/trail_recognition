@@ -131,6 +131,17 @@ def _projective_quad_point(corners, u, v):
     return _projective_point(transform, u, v)
 
 
+def project_a4_mm_to_frame(point_mm, corners):
+    """Project one physical A4 millimetre point into the camera frame."""
+    if corners is None or len(corners) != 4:
+        return None
+    return _projective_quad_point(
+        corners,
+        float(point_mm[0]) / float(cfg.A4_WIDTH_MM),
+        float(point_mm[1]) / float(cfg.A4_HEIGHT_MM),
+    )
+
+
 def _inside_gray(gray_image, corners):
     values = []
     for v in (0.18, 0.36, 0.64, 0.82):

@@ -1,14 +1,13 @@
-"""Configuration overrides for the fixed, manually calibrated A4 runtime."""
+"""Configuration overrides for the realtime simulator-backed A4 runtime."""
 
 from puzzle_config import *
 
 
-# Fixed manual calibration in physical A4 order: TL, TR, BR, BL.  Because the
-# A4 is landscape in the camera and the fragment half is on image-left, these
-# physical labels appear as image BL, image TL, image TR, image BR.  This set
-# was copied from the previously stable A4_LOCK log.  The realtime loop never
-# searches for, smooths, or updates these points.
-AUTO_CALIBRATE_A4 = False
+# Automatically find and freeze the initial A4 boundary. The manual corners
+# remain available as a fallback by setting this switch to False. They are in
+# physical A4 order: TL, TR, BR, BL; in the current landscape camera view these
+# labels appear as image BL, image TL, image TR, image BR.
+AUTO_CALIBRATE_A4 = True
 A4_CORNERS_PX = [
     (133.0, 441.0),
     (140.0, 78.0),
@@ -38,6 +37,8 @@ OPERATOR_HIDE_OVERLAYS_DURING_MOTION = True
 # diagnostics in the log, but allow that proposal to enter the manual placement
 # state machine. Build with ``--simulator-validation local`` for strict A/B.
 SIMULATOR_PLANNER_VALIDATION = "upstream"
+SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER = 2.0
+SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER = 5.0
 
 # A4 boundary detector uses a small aspect-preserving grayscale frame.
 A4_DETECT_WIDTH = 320
@@ -103,6 +104,11 @@ PIECE_COUNT_MIN_CONFIRMATIONS = 2
 PIECE_LOW_GRAY_THRESHOLD = 165
 PIECE_THRESHOLD_PROBE_EVERY_N_DETECTIONS = 4
 PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS = 5
+# First-stage board diagnosis for the rectified image consumed by find_blobs.
+# It does not change thresholds or the recognition path. The first detection
+# and then every fifth detection report native-image and shared-array health.
+ENABLE_GRAY_SANITY_DIAGNOSTICS = True
+GRAY_SANITY_EVERY_N_DETECTIONS = 5
 # After A4 rectification, calibrate the dominant green/dark paper gray level
 # from the mostly empty lower half. The threshold follows global illumination
 # instead of assuming that every white piece remains above gray 180.
@@ -114,15 +120,26 @@ PIECE_BACKGROUND_RELAXED_DELTA_GRAY = 20
 PIECE_BACKGROUND_NOISE_MARGIN_GRAY = 12
 PIECE_BACKGROUND_MAX_DELTA_GRAY = 55
 PIECE_BACKGROUND_MIN_SAMPLES = 96
+# Discover components at background+30 (about 51 in the current lighting),
+# then trace the white-paper boundary above the grey cast-shadow band.
+PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 100
+
+# A slow hand/gantry move can be invisible to adjacent-frame differencing.
+# Cumulative reference-scene motion handles that path; the watchdog guarantees
+# a placement check even if no transition frame is observed.
+ENABLE_PLACEMENT_WATCHDOG = True
+PLACING_VERIFICATION_INTERVAL_MS = 8000
+MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 
 # Lower-resolution real-time piece image. Roughly 1.14 px/mm is still adequate
 # for the hand-cut 20 mm+ edges and reduces pixel traversal by about 44%.
 REALTIME_PIECE_WORK_WIDTH = 240
 REALTIME_PIECE_WORK_HEIGHT = 336
 
-# Show the perspective-corrected grayscale image actually consumed by piece
-# segmentation. It is fitted into the bottom-right corner of the 800x480
-# contour canvas without allocating a second full-size image.
+# Show a perspective-corrected grayscale view containing only the A4 region.
+# The live operator view refreshes it from the current camera frame and places
+# it at the top-right; blocking planning screens retain the latest image
+# actually consumed by piece segmentation.
 SHOW_GRAY_WORK_THUMBNAIL = True
 GRAY_THUMBNAIL_MAX_WIDTH = 128
 GRAY_THUMBNAIL_MAX_HEIGHT = 180
