@@ -280,6 +280,89 @@ def plan_frozen_pieces(
     }
 
 
+def planning_input_integrity(
+    pieces,
+    target_rect_size_mm,
+    overlap_area,
+    required_piece_count=None,
+    area_ratio_min=0.85,
+    area_ratio_max=1.15,
+    max_pair_overlap_ratio=0.20,
+    rejected_border_blobs=0,
+    max_rejected_border_blobs=0,
+):
+    """Fail closed on incomplete or duplicate frozen planner input."""
+    pieces = list(pieces)
+    total_area = sum(float(piece.area_mm2) for piece in pieces)
+    target_area = None
+    area_ratio = None
+    if target_rect_size_mm is not None:
+        target_area = (
+            float(target_rect_size_mm[0])
+            * float(target_rect_size_mm[1])
+        )
+        if target_area > 0.0:
+            area_ratio = total_area / target_area
+
+    max_overlap_ratio = 0.0
+    max_overlap_pair = None
+    for left in range(len(pieces)):
+        for right in range(left + 1, len(pieces)):
+            overlap = float(
+                overlap_area(
+                    pieces[left].polygon_mm,
+                    pieces[right].polygon_mm,
+                )
+            )
+            smaller = max(
+                1e-9,
+                min(
+                    float(pieces[left].area_mm2),
+                    float(pieces[right].area_mm2),
+                ),
+            )
+            ratio = overlap / smaller
+            if ratio > max_overlap_ratio:
+                max_overlap_ratio = ratio
+                max_overlap_pair = (
+                    pieces[left].piece_id
+                    or "P{}".format(left + 1),
+                    pieces[right].piece_id
+                    or "P{}".format(right + 1),
+                )
+
+    failures = []
+    if (
+        required_piece_count is not None
+        and len(pieces) != int(required_piece_count)
+    ):
+        failures.append("piece_count")
+    if area_ratio is not None and (
+        area_ratio < float(area_ratio_min)
+        or area_ratio > float(area_ratio_max)
+    ):
+        failures.append("total_area")
+    if max_overlap_ratio > float(max_pair_overlap_ratio):
+        failures.append("pair_overlap")
+    if int(rejected_border_blobs) > int(
+        max_rejected_border_blobs
+    ):
+        failures.append("border_blob")
+    return {
+        "valid": not failures,
+        "reason": failures[0] if failures else "ok",
+        "failures": tuple(failures),
+        "piece_count": len(pieces),
+        "required_piece_count": required_piece_count,
+        "total_area_mm2": total_area,
+        "target_area_mm2": target_area,
+        "area_ratio": area_ratio,
+        "max_pair_overlap_ratio": max_overlap_ratio,
+        "max_pair_overlap_pair": max_overlap_pair,
+        "rejected_border_blobs": int(rejected_border_blobs),
+    }
+
+
 class MotionDetector:
     """Low-cost adjacent-frame gray difference on sparse A4 samples."""
 

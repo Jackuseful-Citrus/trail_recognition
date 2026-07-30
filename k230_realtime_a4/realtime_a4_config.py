@@ -123,6 +123,13 @@ PIECE_BACKGROUND_MIN_SAMPLES = 96
 # Discover components at background+30 (about 51 in the current lighting),
 # then trace the white-paper boundary above the grey cast-shadow band.
 PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 100
+# Erase the perspective-interpolation fringe before native Blob discovery.
+# The 5-pixel band is also excluded from background calibration/search ROIs.
+PIECE_RECTIFIED_BORDER_BLACK_PX = 5
+
+# This competition assembly always starts from four physical pieces. Do not
+# let a repeated incomplete three-piece observation become planner input.
+PLANNING_REQUIRED_PIECE_COUNT = 4
 
 # A slow hand/gantry move can be invisible to adjacent-frame differencing.
 # Cumulative reference-scene motion handles that path; the watchdog guarantees
@@ -136,10 +143,9 @@ MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 REALTIME_PIECE_WORK_WIDTH = 240
 REALTIME_PIECE_WORK_HEIGHT = 336
 
-# Show a perspective-corrected grayscale view containing only the A4 region.
-# The live operator view refreshes it from the current camera frame and places
-# it at the top-right; blocking planning screens retain the latest image
-# actually consumed by piece segmentation.
+# Show the exact perspective-corrected grayscale image most recently consumed
+# by piece segmentation. Rendering scales that 240x336 image; it never runs a
+# second thumbnail-only rotation_corr path.
 SHOW_GRAY_WORK_THUMBNAIL = True
 GRAY_THUMBNAIL_MAX_WIDTH = 128
 GRAY_THUMBNAIL_MAX_HEIGHT = 180

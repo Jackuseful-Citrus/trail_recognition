@@ -104,6 +104,10 @@ PIECE_BACKGROUND_MIN_SAMPLES = 96
 # the discovery threshold for contour tracing; the realtime black-surface
 # profile raises this floor independently.
 PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 0
+# Optional in-place black safety band after perspective correction. Realtime
+# profiles can enable it to prevent interpolated exterior paper/table pixels
+# from joining a physical piece to the A4 image boundary.
+PIECE_RECTIFIED_BORDER_BLACK_PX = 0
 MORPH_KERNEL_PX = 3
 MORPH_OPEN_ITERATIONS = 1
 MORPH_CLOSE_ITERATIONS = 2
@@ -237,6 +241,14 @@ TARGET_MARGIN_MM = 10.0
 TARGET_RECT_SIZE_MM = (100.0, 60.0)
 PREFER_OUTER_FIRST_PLANNER = False
 ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE = False
+
+# Frozen-input integrity gate before any planner is called. A deployment may
+# set an exact piece count; the shared desktop profile remains count-agnostic.
+PLANNING_REQUIRED_PIECE_COUNT = None
+PLANNING_INPUT_AREA_RATIO_MIN = 0.85
+PLANNING_INPUT_AREA_RATIO_MAX = 1.15
+PLANNING_INPUT_MAX_PAIR_OVERLAP_RATIO = 0.20
+PLANNING_INPUT_MAX_BORDER_BLOBS = 0
 
 # Fixed-rectangle packing tolerances for hand-cut 100x60 mm prototypes.
 FIXED_RECT_BEAM_WIDTH = 1200

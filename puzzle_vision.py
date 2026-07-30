@@ -899,6 +899,31 @@ def background_difference_threshold(
     return max(0, min(250, threshold))
 
 
+def blacken_rectified_border(gray_array, border_px):
+    """Set an outer rectified-image safety band to black in place."""
+    height = int(gray_array.shape[0])
+    width = int(gray_array.shape[1])
+    border = max(
+        0,
+        min(
+            int(border_px),
+            max(0, (min(width, height) - 1) // 2),
+        ),
+    )
+    if border <= 0:
+        return 0
+    for y in range(height):
+        row = gray_array[y]
+        if y < border or y >= height - border:
+            for x in range(width):
+                row[x] = 0
+        else:
+            for x in range(border):
+                row[x] = 0
+                row[width - 1 - x] = 0
+    return border
+
+
 def trace_ordered_boundary(
     gray_array,
     rect,
@@ -1096,6 +1121,280 @@ class _ComponentMask:
         )
 
 
+_COMPONENT_NEIGHBORS = (
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+)
+
+
+def _flood_component_mask(
+    gray_array,
+    x0,
+    y0,
+    width,
+    height,
+    seed_index,
+    threshold,
+    allowed_mask=None,
+    output_mask=None,
+):
+    """Return the 8-connected component containing one local seed."""
+    component = (
+        output_mask
+        if output_mask is not None
+        else bytearray(width * height)
+    )
+    component[seed_index] = 1
+    stack = [seed_index]
+    count = 0
+    sum_x = 0
+    sum_y = 0
+    processed = 0
+    while stack:
+        processed += 1
+        _vision_exitpoint(processed)
+        local_index = stack.pop()
+        local_y = local_index // width
+        local_x = local_index - local_y * width
+        count += 1
+        sum_x += x0 + local_x
+        sum_y += y0 + local_y
+        for dx, dy in _COMPONENT_NEIGHBORS:
+            nx = local_x + dx
+            ny = local_y + dy
+            if (
+                nx < 0
+                or nx >= width
+                or ny < 0
+                or ny >= height
+            ):
+                continue
+            neighbor_index = ny * width + nx
+            if component[neighbor_index]:
+                continue
+            if (
+                allowed_mask is not None
+                and not allowed_mask[neighbor_index]
+            ):
+                continue
+            if int(gray_array[y0 + ny][x0 + nx]) < threshold:
+                continue
+            component[neighbor_index] = 1
+            stack.append(neighbor_index)
+    return component, count, sum_x, sum_y
+
+
+def _select_component_seed(
+    gray_array,
+    x0,
+    y0,
+    width,
+    height,
+    threshold,
+    center,
+    expected_pixels=None,
+    allowed_mask=None,
+):
+    """Choose the component matching native Blob size/centre evidence."""
+    visited = bytearray(width * height)
+    best_seed = None
+    best_score = None
+    best_count = 0
+    best_center = None
+    candidate_count = 0
+    diagonal2 = max(1.0, float(width * width + height * height))
+    expected = (
+        max(1.0, float(expected_pixels))
+        if expected_pixels is not None
+        else None
+    )
+    for local_index in range(width * height):
+        _vision_exitpoint(local_index)
+        if visited[local_index]:
+            continue
+        local_y = local_index // width
+        local_x = local_index - local_y * width
+        if (
+            allowed_mask is not None
+            and not allowed_mask[local_index]
+        ):
+            visited[local_index] = 1
+            continue
+        if int(gray_array[y0 + local_y][x0 + local_x]) < threshold:
+            visited[local_index] = 1
+            continue
+        _component, count, sum_x, sum_y = _flood_component_mask(
+            gray_array,
+            x0,
+            y0,
+            width,
+            height,
+            local_index,
+            threshold,
+            allowed_mask=allowed_mask,
+            output_mask=visited,
+        )
+        candidate_count += 1
+        component_center = (
+            float(sum_x) / max(1, count),
+            float(sum_y) / max(1, count),
+        )
+        center_distance2 = (
+            (component_center[0] - float(center[0])) ** 2
+            + (component_center[1] - float(center[1])) ** 2
+        )
+        if expected is None:
+            # The high-threshold white core should be the largest component
+            # inside the already selected low-threshold Blob component.
+            score = (
+                -float(count),
+                center_distance2 / diagonal2,
+            )
+        else:
+            score = (
+                abs(float(count) - expected) / expected
+                + 0.5 * center_distance2 / diagonal2,
+                center_distance2 / diagonal2,
+            )
+        if best_score is None or score < best_score:
+            best_score = score
+            best_seed = local_index
+            best_count = count
+            best_center = component_center
+    return {
+        "seed_index": best_seed,
+        "count": best_count,
+        "center": best_center,
+        "candidate_count": candidate_count,
+    }
+
+
+def _blob_component_boundary(
+    gray_array,
+    rect,
+    center,
+    blob_pixels,
+    discovery_threshold,
+    contour_threshold,
+):
+    """Bind a native low-threshold Blob to only its own white core.
+
+    Bounding boxes may overlap even when native Blobs are distinct. Rebuilding
+    the discovery-threshold components and matching their pixel count/centroid
+    prevents two overlapping boxes from tracing the same high-threshold piece.
+    """
+    array_height = int(gray_array.shape[0])
+    array_width = int(gray_array.shape[1])
+    x0 = max(0, int(rect[0]))
+    y0 = max(0, int(rect[1]))
+    x1 = min(array_width, x0 + max(1, int(rect[2])))
+    y1 = min(array_height, y0 + max(1, int(rect[3])))
+    width = x1 - x0
+    height = y1 - y0
+    diagnostics = {
+        "ok": False,
+        "reason": "",
+        "pixel_reads": 0,
+        "boundary_steps": 0,
+        "component_candidates": 0,
+        "blob_component_pixels": 0,
+        "contour_component_candidates": 0,
+        "contour_component_pixels": 0,
+        "blob_pixel_error_ratio": 1.0,
+    }
+    if width <= 0 or height <= 0:
+        diagnostics["reason"] = "identity_empty_bbox"
+        return [], diagnostics
+
+    selected_blob = _select_component_seed(
+        gray_array,
+        x0,
+        y0,
+        width,
+        height,
+        discovery_threshold,
+        center,
+        expected_pixels=blob_pixels,
+    )
+    diagnostics["component_candidates"] = selected_blob[
+        "candidate_count"
+    ]
+    if selected_blob["seed_index"] is None:
+        diagnostics["reason"] = "identity_no_blob_component"
+        return [], diagnostics
+    blob_mask, blob_count, _sum_x, _sum_y = (
+        _flood_component_mask(
+            gray_array,
+            x0,
+            y0,
+            width,
+            height,
+            selected_blob["seed_index"],
+            discovery_threshold,
+        )
+    )
+    diagnostics["blob_component_pixels"] = blob_count
+    diagnostics["blob_pixel_error_ratio"] = abs(
+        float(blob_count) - max(1.0, float(blob_pixels))
+    ) / max(1.0, float(blob_pixels))
+
+    selected_contour = _select_component_seed(
+        gray_array,
+        x0,
+        y0,
+        width,
+        height,
+        contour_threshold,
+        center,
+        allowed_mask=blob_mask,
+    )
+    diagnostics["contour_component_candidates"] = (
+        selected_contour["candidate_count"]
+    )
+    if selected_contour["seed_index"] is None:
+        diagnostics["reason"] = "identity_no_contour_component"
+        return [], diagnostics
+    contour_mask, contour_count, _sum_x, _sum_y = (
+        _flood_component_mask(
+            gray_array,
+            x0,
+            y0,
+            width,
+            height,
+            selected_contour["seed_index"],
+            contour_threshold,
+            allowed_mask=blob_mask,
+        )
+    )
+    diagnostics["contour_component_pixels"] = contour_count
+    local_mask = _ComponentMask(contour_mask, width, height)
+    boundary, trace = trace_ordered_boundary(
+        local_mask,
+        (0, 0, width, height),
+        1,
+    )
+    diagnostics["ok"] = bool(trace["ok"])
+    diagnostics["reason"] = (
+        "identity_ok"
+        if trace["ok"]
+        else "identity_{}".format(trace["reason"])
+    )
+    diagnostics["pixel_reads"] = trace["pixel_reads"]
+    diagnostics["boundary_steps"] = trace["boundary_steps"]
+    if not trace["ok"]:
+        return [], diagnostics
+    return [
+        (point[0] + x0, point[1] + y0)
+        for point in boundary
+    ], diagnostics
+
+
 def _component_boundary(
     gray_array,
     rect,
@@ -1142,17 +1441,6 @@ def _component_boundary(
     seed_index = (seed[1] - y0) * width + (seed[0] - x0)
     visited[seed_index] = 1
     stack = [seed_index]
-    neighbor_offsets = (
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (-1, 0),
-        (1, 0),
-        (-1, 1),
-        (0, 1),
-        (1, 1),
-    )
-
     processed = 0
     while stack:
         processed += 1
@@ -1166,7 +1454,7 @@ def _component_boundary(
             continue
         diagnostics["component_pixels"] += 1
 
-        for dx, dy in neighbor_offsets:
+        for dx, dy in _COMPONENT_NEIGHBORS:
             nx = x + dx
             ny = y + dy
             if (
@@ -1289,19 +1577,26 @@ def _simplify_convex_polygon(points, epsilon):
 def _extract_canmv_polygon(
     gray_array,
     blob,
+    discovery_threshold,
     threshold,
     pixels_per_mm_x,
     pixels_per_mm_y,
 ):
-    """Extract one CanMV connected component as a millimetre polygon."""
+    """Extract one identity-bound CanMV component as a millimetre polygon."""
     rect = tuple(_blob_value(blob, "rect", None))
     center = (
         float(_blob_value(blob, "cx", 5)),
         float(_blob_value(blob, "cy", 6)),
     )
+    blob_pixels = float(_blob_value(blob, "pixels", 4))
     contour_started = PERF_STATS.mark()
-    boundary_px, trace_diagnostics = trace_ordered_boundary(
-        gray_array, rect, threshold
+    boundary_px, trace_diagnostics = _blob_component_boundary(
+        gray_array,
+        rect,
+        center,
+        blob_pixels,
+        discovery_threshold,
+        threshold,
     )
     trace_diagnostics["boundary_primary_ok"] = bool(
         trace_diagnostics["ok"]
@@ -1313,41 +1608,9 @@ def _extract_canmv_polygon(
         if trace_diagnostics["ok"]
         else trace_diagnostics["reason"]
     )
-    if (
-        not trace_diagnostics["ok"]
-        or len(boundary_px) < cfg.BOUNDARY_TRACE_MIN_POINTS
-    ):
-        if not cfg.ENABLE_BOUNDARY_FLOOD_FALLBACK:
-            PERF_STATS.add_stage(
-                "contour_ms", contour_started
-            )
-            return None, boundary_px, trace_diagnostics
-        boundary_px, fallback_diagnostics = _component_boundary(
-            gray_array, rect, center, threshold
-        )
-        trace_diagnostics["fallback"] = True
-        trace_diagnostics["boundary_fallback_used"] = True
-        trace_diagnostics["boundary_fallback_ordered_ok"] = bool(
-            fallback_diagnostics["ok"]
-        )
-        trace_diagnostics["ok"] = bool(
-            fallback_diagnostics["ok"]
-        )
-        trace_diagnostics["reason"] = fallback_diagnostics["reason"]
-        trace_diagnostics["boundary_failure_reason"] = (
-            ""
-            if fallback_diagnostics["ok"]
-            else fallback_diagnostics["reason"]
-        )
-        trace_diagnostics["pixel_reads"] += fallback_diagnostics[
-            "pixel_reads"
-        ]
-        trace_diagnostics["boundary_steps"] += fallback_diagnostics[
-            "boundary_steps"
-        ]
-        PERF_STATS.increment("boundary_fallback_count")
-    else:
-        trace_diagnostics["fallback"] = False
+    # A raw bounding-box fallback would reintroduce the exact ambiguity this
+    # identity binding prevents, so failures remain fail-closed.
+    trace_diagnostics["fallback"] = False
     PERF_STATS.add_stage("contour_ms", contour_started)
     if (
         not trace_diagnostics["ok"]
@@ -1462,15 +1725,30 @@ def detect_pieces_from_canmv_image(
         nominal_divider
         + int(2.0 * pixels_per_mm_y + 0.5),
     )
+    safety_border_px = max(
+        0,
+        int(
+            getattr(
+                cfg,
+                "PIECE_RECTIFIED_BORDER_BLACK_PX",
+                0,
+            )
+        ),
+    )
     margin_x = max(
         1,
+        safety_border_px,
         int(cfg.DETECTION_BORDER_MARGIN_MM * pixels_per_mm_x + 0.5),
     )
     margin_y = max(
         1,
+        safety_border_px,
         int(cfg.DETECTION_BORDER_MARGIN_MM * pixels_per_mm_y + 0.5),
     )
     gray_array = gray_image.to_numpy_ref()
+    safety_border_px = blacken_rectified_border(
+        gray_array, safety_border_px
+    )
     segmentation_mode = getattr(
         cfg, "PIECE_SEGMENTATION_MODE", "fixed"
     )
@@ -1642,6 +1920,9 @@ def detect_pieces_from_canmv_image(
     ordered_fallback_ok_count = 0
     polygon_reverse_retry_count = 0
     polygon_unrefined_retry_count = 0
+    component_bound_count = 0
+    component_candidate_count = 0
+    contour_component_candidate_count = 0
     polygon_failure_rects = []
     boundary_failure_reasons = {}
     trace_failures = {}
@@ -1669,6 +1950,7 @@ def detect_pieces_from_canmv_image(
             _extract_canmv_polygon(
                 gray_array,
                 blob,
+                piece_threshold,
                 contour_threshold,
                 pixels_per_mm_x,
                 pixels_per_mm_y,
@@ -1678,6 +1960,16 @@ def detect_pieces_from_canmv_image(
             "boundary_steps", 0
         )
         pixel_reads += trace_diagnostics.get("pixel_reads", 0)
+        component_candidate_count += trace_diagnostics.get(
+            "component_candidates", 0
+        )
+        contour_component_candidate_count += (
+            trace_diagnostics.get(
+                "contour_component_candidates", 0
+            )
+        )
+        if trace_diagnostics.get("reason") == "identity_ok":
+            component_bound_count += 1
         if trace_diagnostics.get("boundary_primary_ok", False):
             primary_boundary_ok_count += 1
         if trace_diagnostics.get("fallback", False):
@@ -1780,6 +2072,7 @@ def detect_pieces_from_canmv_image(
         ),
         "raw_contours": len(blob_regions),
         "rejected": rejected,
+        "rectified_border_black_px": safety_border_px,
         "detection_end_row": upper_end,
         "detection_regions": detection_regions,
         "region": region,
@@ -1792,6 +2085,11 @@ def detect_pieces_from_canmv_image(
         "boundary_fallback_used": fallback_count,
         "boundary_fallback_ordered_ok": (
             ordered_fallback_ok_count
+        ),
+        "component_bound_count": component_bound_count,
+        "component_candidate_count": component_candidate_count,
+        "contour_component_candidate_count": (
+            contour_component_candidate_count
         ),
         "polygon_reverse_retry_count": (
             polygon_reverse_retry_count

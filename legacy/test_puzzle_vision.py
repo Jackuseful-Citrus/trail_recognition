@@ -143,6 +143,92 @@ class _FakeCanMVGrayImage:
 
 
 class VisionRegressionTests(unittest.TestCase):
+    def test_overlapping_blob_boxes_keep_distinct_component_identity(self):
+        width = cfg.CANMV_WORK_WIDTH
+        height = cfg.CANMV_WORK_HEIGHT
+        gray = np.full((height, width), 20, dtype=np.uint8)
+
+        # Component A has a large hooked low-threshold halo/bounding box.
+        gray[20:55, 20:65] = 60
+        gray[20:25, 20:125] = 60
+        gray[20:110, 120:125] = 60
+        gray[25:52, 25:60] = 205
+
+        # Component B is disconnected but its bounding box contains A's white
+        # core. A bbox-first high-threshold trace therefore duplicates A.
+        gray[65:105, 75:115] = 60
+        gray[100:110, 30:80] = 60
+        gray[40:105, 70:78] = 60
+        gray[70:100, 80:110] = 205
+
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+        old_mode = cfg.PIECE_SEGMENTATION_MODE
+        old_floor = cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD
+        cfg.PIECE_SEGMENTATION_MODE = "background_delta"
+        cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 100
+        try:
+            pieces, diagnostics = (
+                detect_pieces_from_canmv_image(
+                    _FakeCanMVGrayImage(gray),
+                    corners,
+                    (width, height),
+                )
+            )
+        finally:
+            cfg.PIECE_SEGMENTATION_MODE = old_mode
+            cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD = old_floor
+
+        self.assertEqual(diagnostics["raw_contours"], 2)
+        self.assertEqual(len(pieces), 2)
+        self.assertEqual(
+            diagnostics["component_bound_count"], 2
+        )
+        centers_x = sorted(
+            piece.centroid_mm[0] for piece in pieces
+        )
+        self.assertGreater(centers_x[1] - centers_x[0], 30.0)
+
+    def test_rectified_black_border_removes_external_bright_ring(self):
+        width = cfg.CANMV_WORK_WIDTH
+        height = cfg.CANMV_WORK_HEIGHT
+        gray = np.full((height, width), 20, dtype=np.uint8)
+        gray[:5, :] = 240
+        gray[-5:, :] = 240
+        gray[:, :5] = 240
+        gray[:, -5:] = 240
+        gray[35:75, 45:90] = 220
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+        old_border = cfg.PIECE_RECTIFIED_BORDER_BLACK_PX
+        cfg.PIECE_RECTIFIED_BORDER_BLACK_PX = 5
+        try:
+            pieces, diagnostics = (
+                detect_pieces_from_canmv_image(
+                    _FakeCanMVGrayImage(gray),
+                    corners,
+                    (width, height),
+                )
+            )
+        finally:
+            cfg.PIECE_RECTIFIED_BORDER_BLACK_PX = old_border
+
+        self.assertEqual(len(pieces), 1)
+        self.assertEqual(diagnostics["raw_contours"], 1)
+        self.assertEqual(
+            diagnostics["rectified_border_black_px"], 5
+        )
+        self.assertEqual(int(gray[0, 0]), 0)
+        self.assertEqual(int(gray[-1, -1]), 0)
+
     def test_self_intersecting_fit_is_rejected_before_observation(self):
         bow_tie = [
             (0, 0),

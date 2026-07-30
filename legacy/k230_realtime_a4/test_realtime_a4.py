@@ -12,6 +12,10 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import realtime_a4_config as cfg
+from puzzle_geometry import (
+    PieceObservation,
+    polygon_overlap_area,
+)
 from puzzle_a4_boundary import (
     A4BoundaryTracker,
     _projective_quad_point,
@@ -31,6 +35,7 @@ from puzzle_realtime_state import (
     operator_status_line,
     placement_phase_actions,
     plan_frozen_pieces,
+    planning_input_integrity,
     placement_ui_key,
     periodic_output_due,
     should_render_ui,
@@ -872,6 +877,67 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         self.assertTrue(verify["piece_detection"])
         self.assertTrue(verify["placement_check"])
         self.assertFalse(verify["tracker_update"])
+
+    def test_planning_input_gate_rejects_missing_duplicate_and_border(self):
+        polygons = [
+            [(0, 0), (50, 0), (50, 30), (0, 30)],
+            [(55, 0), (105, 0), (105, 30), (55, 30)],
+            [(0, 35), (50, 35), (50, 65), (0, 65)],
+            [(55, 35), (105, 35), (105, 65), (55, 65)],
+        ]
+        pieces = [
+            PieceObservation(
+                "P{}".format(index + 1), [], polygon
+            )
+            for index, polygon in enumerate(polygons)
+        ]
+        common = {
+            "target_rect_size_mm": (100.0, 60.0),
+            "overlap_area": polygon_overlap_area,
+            "required_piece_count": 4,
+            "area_ratio_min": 0.85,
+            "area_ratio_max": 1.15,
+            "max_pair_overlap_ratio": 0.20,
+        }
+        valid = planning_input_integrity(
+            pieces,
+            rejected_border_blobs=0,
+            **common
+        )
+        self.assertTrue(valid["valid"])
+
+        missing = planning_input_integrity(
+            pieces[:3],
+            rejected_border_blobs=0,
+            **common
+        )
+        self.assertFalse(missing["valid"])
+        self.assertIn("piece_count", missing["failures"])
+        self.assertIn("total_area", missing["failures"])
+
+        duplicate_pieces = list(pieces)
+        duplicate_pieces[1] = PieceObservation(
+            "P2", [], polygons[0]
+        )
+        duplicate = planning_input_integrity(
+            duplicate_pieces,
+            rejected_border_blobs=0,
+            **common
+        )
+        self.assertFalse(duplicate["valid"])
+        self.assertIn("pair_overlap", duplicate["failures"])
+        self.assertAlmostEqual(
+            duplicate["max_pair_overlap_ratio"], 1.0
+        )
+
+        border = planning_input_integrity(
+            pieces,
+            rejected_border_blobs=1,
+            max_rejected_border_blobs=0,
+            **common
+        )
+        self.assertFalse(border["valid"])
+        self.assertIn("border_blob", border["failures"])
 
     def test_fixed_target_routes_only_to_fixed_planner(self):
         calls = []

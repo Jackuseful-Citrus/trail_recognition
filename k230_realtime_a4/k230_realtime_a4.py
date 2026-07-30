@@ -36,6 +36,7 @@ from puzzle_geometry import (
     end_plan_debug,
     plan_outer_first_rectangle,
     plan_rectangle_assembly,
+    polygon_overlap_area,
 )
 from puzzle_simulator_planner import plan_simulator_rectangle
 from puzzle_placement import PlacementMonitor
@@ -55,6 +56,7 @@ from puzzle_realtime_state import (
     operator_overlay_visibility,
     operator_status_line,
     plan_frozen_pieces,
+    planning_input_integrity,
     placement_ui_key,
     periodic_output_due,
     should_render_ui,
@@ -186,6 +188,7 @@ def _draw_plan_target_overlay(
     if (
         plan is None
         or corners is None
+        or not plan.valid
         or not plan.target_polygons
     ):
         return
@@ -1015,7 +1018,14 @@ def _rectified_gray(frame, corners_px, width, height):
         )
         for point in corners_px
     ]
-    gray.rotation_corr(corners=work_corners)
+    corrected = gray.rotation_corr(corners=work_corners)
+    if (
+        corrected is not None
+        and hasattr(corrected, "width")
+        and hasattr(corrected, "height")
+        and hasattr(corrected, "to_numpy_ref")
+    ):
+        gray = corrected
     return gray
 
 
@@ -1197,6 +1207,8 @@ def _print_piece_diagnostics(
         "bg={:.1f},bg_high={:.1f},"
         "bg_spread={:.1f},delta={:.1f},bg_samples={},retry={},"
         "raw_blobs={},accepted={},rejected={},trace_failures={},"
+        "border_black_px={},component_bound={},"
+        "component_candidates={}|{},"
         "boundary_primary_ok={},boundary_fallback_used={},"
         "boundary_fallback_ordered_ok={},boundary_failure_reason={},"
         "polygon_reverse_retry={},polygon_unrefined_retry={},"
@@ -1225,6 +1237,12 @@ def _print_piece_diagnostics(
             len(pieces),
             _count_map_text(rejected),
             _count_map_text(trace_failures),
+            diagnostics.get("rectified_border_black_px", 0),
+            diagnostics.get("component_bound_count", 0),
+            diagnostics.get("component_candidate_count", 0),
+            diagnostics.get(
+                "contour_component_candidate_count", 0
+            ),
             diagnostics.get("boundary_primary_ok", 0),
             diagnostics.get("boundary_fallback_used", 0),
             diagnostics.get(
@@ -1346,7 +1364,11 @@ def main():
     last_rendered_state = None
     complete_displayed = False
     piece_count_consensus = PieceCountConsensus(
-        cfg.MIN_PIECE_COUNT,
+        (
+            cfg.PLANNING_REQUIRED_PIECE_COUNT
+            if cfg.PLANNING_REQUIRED_PIECE_COUNT is not None
+            else cfg.MIN_PIECE_COUNT
+        ),
         cfg.MAX_PIECE_COUNT,
         cfg.PIECE_COUNT_WINDOW_DETECTIONS,
         cfg.PIECE_COUNT_SETTLE_DETECTIONS,
@@ -1357,6 +1379,8 @@ def main():
     bad_count_detections = 0
     piece_detection_count = 0
     last_piece_diagnostic_signature = None
+    last_piece_diagnostics = {}
+    last_input_integrity_signature = None
     pending_reason = "a4_unlocked"
     last_piece_gray = None
     last_piece_gray_frame = -1
@@ -1653,6 +1677,7 @@ def main():
                                     retry_diagnostics
                                 )
                                 retry_used = True
+                        last_piece_diagnostics = piece_diagnostics
                         last_piece_gray = piece_diagnostics.get(
                             "rectified"
                         )
@@ -2319,11 +2344,138 @@ def main():
                     active_plan_key = None
                 else:
                     key = _plan_key(pieces)
-                    if key == last_failed_plan_key:
+                    input_integrity = planning_input_integrity(
+                        pieces,
+                        cfg.TARGET_RECT_SIZE_MM,
+                        polygon_overlap_area,
+                        required_piece_count=(
+                            cfg.PLANNING_REQUIRED_PIECE_COUNT
+                        ),
+                        area_ratio_min=(
+                            cfg.PLANNING_INPUT_AREA_RATIO_MIN
+                        ),
+                        area_ratio_max=(
+                            cfg.PLANNING_INPUT_AREA_RATIO_MAX
+                        ),
+                        max_pair_overlap_ratio=(
+                            cfg.PLANNING_INPUT_MAX_PAIR_OVERLAP_RATIO
+                        ),
+                        rejected_border_blobs=(
+                            last_piece_diagnostics.get(
+                                "rejected", {}
+                            ).get("border", 0)
+                        ),
+                        max_rejected_border_blobs=(
+                            cfg.PLANNING_INPUT_MAX_BORDER_BLOBS
+                        ),
+                    )
+                    integrity_signature = (
+                        input_integrity["valid"],
+                        input_integrity["failures"],
+                        input_integrity["piece_count"],
+                        int(
+                            input_integrity["total_area_mm2"]
+                            + 0.5
+                        ),
+                        int(
+                            input_integrity[
+                                "max_pair_overlap_ratio"
+                            ]
+                            * 1000.0
+                            + 0.5
+                        ),
+                        input_integrity[
+                            "rejected_border_blobs"
+                        ],
+                    )
+                    if not input_integrity["valid"]:
+                        active_plan = None
+                        active_plan_key = None
+                        pending_reason = "input_{}".format(
+                            input_integrity["reason"]
+                        )
+                        if (
+                            integrity_signature
+                            != last_input_integrity_signature
+                        ):
+                            pair = input_integrity[
+                                "max_pair_overlap_pair"
+                            ]
+                            print(
+                                "PLANNING_INPUT_INVALID,frame={},"
+                                "failures={},count={}/{},"
+                                "total_area_mm2={:.1f},"
+                                "target_area_mm2={},area_ratio={},"
+                                "max_pair_overlap={:.3f},pair={},"
+                                "border_blobs={}/{}".format(
+                                    frame_index,
+                                    "|".join(
+                                        input_integrity["failures"]
+                                    ),
+                                    input_integrity["piece_count"],
+                                    (
+                                        input_integrity[
+                                            "required_piece_count"
+                                        ]
+                                        if input_integrity[
+                                            "required_piece_count"
+                                        ]
+                                        is not None
+                                        else "any"
+                                    ),
+                                    input_integrity[
+                                        "total_area_mm2"
+                                    ],
+                                    (
+                                        "{:.1f}".format(
+                                            input_integrity[
+                                                "target_area_mm2"
+                                            ]
+                                        )
+                                        if input_integrity[
+                                            "target_area_mm2"
+                                        ]
+                                        is not None
+                                        else "na"
+                                    ),
+                                    (
+                                        "{:.3f}".format(
+                                            input_integrity[
+                                                "area_ratio"
+                                            ]
+                                        )
+                                        if input_integrity[
+                                            "area_ratio"
+                                        ]
+                                        is not None
+                                        else "na"
+                                    ),
+                                    input_integrity[
+                                        "max_pair_overlap_ratio"
+                                    ],
+                                    (
+                                        "{}:{}".format(
+                                            pair[0], pair[1]
+                                        )
+                                        if pair is not None
+                                        else "none"
+                                    ),
+                                    input_integrity[
+                                        "rejected_border_blobs"
+                                    ],
+                                    cfg.PLANNING_INPUT_MAX_BORDER_BLOBS,
+                                )
+                            )
+                        last_input_integrity_signature = (
+                            integrity_signature
+                        )
+                    elif key == last_failed_plan_key:
+                        last_input_integrity_signature = None
                         pending_reason = (
                             "holding_repeated_failed_plan_input"
                         )
                     elif not last_stable or active_plan is None:
+                        last_input_integrity_signature = None
                         plan_start_ms = _ms_now()
                         (
                             configured_planner,
@@ -2740,32 +2892,11 @@ def main():
                             )
                         )
                     last_operator_view_error = operator_error
-                    live_a4_gray = last_piece_gray
-                    live_a4_gray_frame = last_piece_gray_frame
-                    live_a4_error = None
-                    if (
-                        cfg.SHOW_GRAY_WORK_THUMBNAIL
-                        and a4_state["locked"]
-                        and a4_state["corners_px"] is not None
-                    ):
-                        try:
-                            live_a4_gray = _rectified_gray(
-                                frame,
-                                a4_state["corners_px"],
-                                cfg.GRAY_THUMBNAIL_MAX_WIDTH,
-                                cfg.GRAY_THUMBNAIL_MAX_HEIGHT,
-                            )
-                            live_a4_gray_frame = frame_index
-                        except Exception as exc:
-                            if "IDE interrupt" in str(exc):
-                                raise
-                            live_a4_error = str(exc)
                     thumbnail_error = (
-                        live_a4_error
-                        or _draw_gray_work_thumbnail(
+                        _draw_gray_work_thumbnail(
                             canvas,
-                            live_a4_gray,
-                            live_a4_gray_frame,
+                            last_piece_gray,
+                            last_piece_gray_frame,
                             last_piece_gray_threshold,
                             last_piece_contour_threshold,
                         )
