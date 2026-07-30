@@ -1,0 +1,34 @@
+{
+  "description": "Pre-optimization desktop baseline for sample_puzzle.jpg",
+  "source_hashes": {
+    "puzzle_geometry.py": "b7adabef7da4fad58760151100b3b65778247b81b5aee3bb546b12be39b58bae",
+    "puzzle_vision.py": "11c68511478f4092dac4a878dd2698ee07afb6fc2b9cb9eac776b9c910771500",
+    "k230_realtime_a4.py": "bd45e6c415049503713373de960cc87c62287ce40b5649da98904ea4b5891523"
+  },
+  "existing_tests": {
+    "passed": 25,
+    "total": 25,
+    "elapsed_seconds": 3.821
+  },
+  "desktop_sample": {
+    "detected_pieces": 4,
+    "polygon_vertices": [3, 4, 4, 4],
+    "contour_detection_median_ms": 1.632,
+    "outer_first_plan_median_ms": 152.494,
+    "outer_first_dfs_nodes": 2358,
+    "outer_first_polygon_intersections": 14486,
+    "fixed_plan_median_ms": 2200.151,
+    "fixed_plan_dfs_nodes": 5308,
+    "fixed_plan_polygon_intersections": 255762,
+    "raw_cross_piece_edge_pairs": 84,
+    "strict_filtered_edge_pairs": 5,
+    "legacy_tolerant_filtered_edge_pairs": 47,
+    "strict_rectangle_hypotheses": 478,
+    "tolerant_rectangle_hypotheses": 680
+  },
+  "board_measurement": null,
+  "notes": [
+    "Desktop timings are medians from repeated CPython runs.",
+    "No K230 FPS or board timing is claimed in this baseline."
+  ]
+}

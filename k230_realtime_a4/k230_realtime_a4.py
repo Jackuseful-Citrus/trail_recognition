@@ -1,0 +1,1756 @@
+#!/usr/bin/env python3
+"""Shake-tolerant K230 puzzle recognition with automatic A4 tracking."""
+
+import gc
+import os
+import time
+
+import image
+from media.display import Display
+from media.media import MediaManager
+
+import realtime_a4_config as cfg
+from k230_puzzle_planner import (
+    COLORS,
+    GRAY,
+    GREEN,
+    RED,
+    WHITE,
+    YELLOW,
+    _audit_runtime_api,
+    _draw_box,
+    _draw_polyline,
+    _draw_text,
+    _init_hardware,
+    _ms_delta,
+    _ms_now,
+    _plan_key,
+    _print_plan,
+    _render_status,
+    _sleep_ms,
+    _stop_requested,
+)
+from puzzle_geometry import (
+    PieceTracker,
+    plan_outer_first_rectangle,
+)
+from puzzle_placement import PlacementMonitor
+from puzzle_perf import PERF_STATS
+from puzzle_realtime_state import (
+    PieceCountConsensus,
+    a4_detection_interval,
+    bottom_right_thumbnail_rect,
+    phase_allows_vision,
+    placement_ui_key,
+    periodic_output_due,
+    should_render_ui,
+    status_ui_key,
+)
+from puzzle_vision import (
+    background_difference_threshold,
+    build_polygon_scanlines,
+    detect_pieces_from_canmv_image,
+    polygon_white_coverage_scanlines,
+)
+from puzzle_a4_boundary import (
+    A4BoundaryTracker,
+    detect_a4_boundary,
+)
+
+
+def _draw_quad(frame, corners, color, thickness=3):
+    if corners is None:
+        return
+    for index, point in enumerate(corners):
+        other = corners[(index + 1) % len(corners)]
+        frame.draw_line(
+            int(point[0]),
+            int(point[1]),
+            int(other[0]),
+            int(other[1]),
+            color=color,
+            thickness=thickness,
+        )
+
+
+def _a4_mm_to_frame(point_mm, corners):
+    u = float(point_mm[0]) / cfg.A4_WIDTH_MM
+    v = float(point_mm[1]) / cfg.A4_HEIGHT_MM
+    tl, tr, br, bl = corners
+    return (
+        (1.0 - u) * (1.0 - v) * tl[0]
+        + u * (1.0 - v) * tr[0]
+        + u * v * br[0]
+        + (1.0 - u) * v * bl[0],
+        (1.0 - u) * (1.0 - v) * tl[1]
+        + u * (1.0 - v) * tr[1]
+        + u * v * br[1]
+        + (1.0 - u) * v * bl[1],
+    )
+
+
+def _draw_piece_overlay(frame, pieces, corners):
+    if corners is None:
+        return
+    divider_left = _a4_mm_to_frame(
+        (0.0, cfg.DIVIDER_Y_MM), corners
+    )
+    divider_right = _a4_mm_to_frame(
+        (cfg.A4_WIDTH_MM, cfg.DIVIDER_Y_MM), corners
+    )
+    frame.draw_line(
+        int(divider_left[0]),
+        int(divider_left[1]),
+        int(divider_right[0]),
+        int(divider_right[1]),
+        color=GRAY,
+        thickness=2,
+    )
+    for index, piece in enumerate(pieces):
+        color = COLORS[index % len(COLORS)]
+        polygon = [
+            _a4_mm_to_frame(point, corners)
+            for point in piece.polygon_mm
+        ]
+        _draw_quad(frame, polygon, color, thickness=2)
+        center = _a4_mm_to_frame(piece.centroid_mm, corners)
+        frame.draw_cross(
+            int(center[0]),
+            int(center[1]),
+            size=6,
+            thickness=2,
+            color=color,
+        )
+        _draw_text(
+            frame,
+            int(center[0]) + 5,
+            int(center[1]) - 15,
+            piece.piece_id or "P?",
+            color,
+        )
+
+
+def _draw_gray_work_thumbnail(
+    canvas,
+    gray_image,
+    source_frame_index,
+    threshold,
+):
+    """Draw the exact rectified piece-recognition image at bottom-right."""
+    if (
+        not cfg.SHOW_GRAY_WORK_THUMBNAIL
+        or gray_image is None
+    ):
+        return None
+    try:
+        x, y, width, height, scale = (
+            bottom_right_thumbnail_rect(
+                canvas.width(),
+                canvas.height(),
+                gray_image.width(),
+                gray_image.height(),
+                cfg.GRAY_THUMBNAIL_MAX_WIDTH,
+                cfg.GRAY_THUMBNAIL_MAX_HEIGHT,
+                cfg.GRAY_THUMBNAIL_MARGIN_PX,
+            )
+        )
+        canvas.draw_image(
+            gray_image,
+            x,
+            y,
+            x_scale=scale,
+            y_scale=scale,
+            alpha=256,
+        )
+        _draw_box(
+            canvas,
+            x - 1,
+            y - 1,
+            width + 2,
+            height + 2,
+            WHITE,
+        )
+        _draw_text(
+            canvas,
+            x,
+            max(0, y - 17),
+            "GRAY {}x{} T:{} F:{}".format(
+                gray_image.width(),
+                gray_image.height(),
+                threshold if threshold is not None else "-",
+                source_frame_index,
+            ),
+            GRAY,
+        )
+        return None
+    except Exception as exc:
+        if "IDE interrupt" in str(exc):
+            raise
+        return str(exc)
+
+
+def _show_output_with_ide(
+    output_image,
+    frame_index,
+    output_index,
+    previous_ide_error,
+    force_ide=False,
+):
+    """Submit to LCD and explicitly publish selected frames to IDE Preview."""
+    display_started = PERF_STATS.mark()
+    Display.show_image(output_image)
+    PERF_STATS.add_stage("display_ms", display_started)
+    PERF_STATS.increment("display_count")
+
+    should_stream = (
+        cfg.IDE_STREAM_ENABLED
+        and (
+            force_ide
+            or periodic_output_due(
+                output_index,
+                cfg.IDE_STREAM_EVERY_N_OUTPUTS,
+            )
+        )
+    )
+    current_error = previous_ide_error
+    if should_stream:
+        ide_started = PERF_STATS.mark()
+        try:
+            sender = getattr(
+                output_image, "compress_for_ide", None
+            )
+            if sender is None:
+                raise RuntimeError(
+                    "image missing compress_for_ide"
+                )
+            os.exitpoint()
+            sender(quality=cfg.IDE_STREAM_QUALITY)
+            os.exitpoint()
+            PERF_STATS.increment("ide_stream_count")
+            current_error = None
+        except Exception as exc:
+            if "IDE interrupt" in str(exc):
+                raise
+            current_error = str(exc)
+        PERF_STATS.add_stage("ide_stream_ms", ide_started)
+
+        if current_error and current_error != previous_ide_error:
+            print(
+                "IDE_STREAM_ERROR,frame={},reason={}".format(
+                    frame_index,
+                    current_error.replace(",", ";"),
+                )
+            )
+        elif (
+            current_error is None
+            and previous_ide_error is not None
+        ):
+            print(
+                "IDE_STREAM_RECOVERED,frame={}".format(
+                    frame_index
+                )
+            )
+    return output_index + 1, current_error
+
+
+def _print_a4_lock(frame_index, state):
+    corners_text = "|".join(
+        "{:.0f}:{:.0f}".format(point[0], point[1])
+        for point in state["corners_px"]
+    )
+    print(
+        "A4_LOCK,frame={},source={},confidence={:.2f},"
+        "motion_px={:.1f},orientation={},corners={}".format(
+            frame_index,
+            state["source"],
+            state["confidence"],
+            state["motion_px"],
+            state.get("orientation", ""),
+            corners_text,
+        )
+    )
+
+
+def _preserve_corner_labels(candidate, previous_corners):
+    """Prevent A4 physical orientation flipping after pieces move downward."""
+    if candidate is None or previous_corners is None:
+        return candidate
+    corners = list(candidate["corners_px"])
+    variants = []
+    for base in (corners, list(reversed(corners))):
+        for shift in range(4):
+            variants.append(base[shift:] + base[:shift])
+    best = min(
+        variants,
+        key=lambda variant: sum(
+            (
+                variant[index][0]
+                - previous_corners[index][0]
+            )
+            ** 2
+            + (
+                variant[index][1]
+                - previous_corners[index][1]
+            )
+            ** 2
+            for index in range(4)
+        ),
+    )
+    candidate["corners_px"] = best
+    return candidate
+
+
+def _placement_screen_point(point_mm):
+    scale = 1.28
+    return (
+        int(18 + point_mm[0] * scale),
+        int(48 + point_mm[1] * scale),
+    )
+
+
+def _piece_color(piece_id, reference_pieces):
+    for index, piece in enumerate(reference_pieces):
+        if piece.piece_id == piece_id:
+            return COLORS[index % len(COLORS)]
+    return WHITE
+
+
+def _operation_for_piece(plan, piece_id):
+    for operation in plan.operations:
+        if operation["piece_id"] == piece_id:
+            return operation
+    return None
+
+
+def _render_placement_status(
+    canvas,
+    reference_pieces,
+    plan,
+    placement_state,
+    phase,
+    frame_index,
+    fps,
+    next_check_ms,
+    error,
+):
+    """Render current and target contours on one full-A4 schematic."""
+    canvas.clear()
+    _draw_text(
+        canvas, 12, 8, "K230 PUZZLE PLACEMENT", WHITE, 2
+    )
+    _draw_text(
+        canvas,
+        580,
+        12,
+        "F:{} FPS:{:.1f}".format(frame_index, fps),
+        GRAY,
+    )
+
+    a4_top_left = _placement_screen_point((0.0, 0.0))
+    a4_bottom_right = _placement_screen_point(
+        (cfg.A4_WIDTH_MM, cfg.A4_HEIGHT_MM)
+    )
+    _draw_box(
+        canvas,
+        a4_top_left[0],
+        a4_top_left[1],
+        a4_bottom_right[0] - a4_top_left[0],
+        a4_bottom_right[1] - a4_top_left[1],
+        GRAY,
+        thickness=2,
+    )
+    divider_a = _placement_screen_point(
+        (0.0, cfg.DIVIDER_Y_MM)
+    )
+    divider_b = _placement_screen_point(
+        (cfg.A4_WIDTH_MM, cfg.DIVIDER_Y_MM)
+    )
+    canvas.draw_line(
+        divider_a[0],
+        divider_a[1],
+        divider_b[0],
+        divider_b[1],
+        color=GRAY,
+        thickness=2,
+    )
+    _draw_text(canvas, 20, 431, "A4 / mm", GRAY)
+
+    completed = placement_state["completed"]
+    next_piece_id = placement_state["next_piece_id"]
+
+    # Draw desired lower-half poses first. Actual observations are drawn on
+    # top, so displacement remains visible until the next 5-second check.
+    for piece in reference_pieces:
+        piece_id = piece.piece_id
+        target = plan.target_polygons.get(piece_id)
+        if not target:
+            continue
+        if piece_id in completed:
+            color = GREEN
+            thickness = 3
+        elif piece_id == next_piece_id:
+            color = YELLOW
+            thickness = 3
+        else:
+            color = GRAY
+            thickness = 2
+        points = [
+            _placement_screen_point(point) for point in target
+        ]
+        _draw_polyline(
+            canvas, points, color, thickness=thickness
+        )
+        operation = _operation_for_piece(plan, piece_id)
+        if operation is not None:
+            center = _placement_screen_point(
+                operation["target_center_mm"]
+            )
+            _draw_text(
+                canvas,
+                center[0] + 3,
+                center[1] - 12,
+                "{}{}".format(
+                    piece_id,
+                    " OK" if piece_id in completed else "",
+                ),
+                color,
+            )
+
+    for piece in placement_state["visible_pieces"]:
+        color = _piece_color(piece.piece_id, reference_pieces)
+        points = [
+            _placement_screen_point(point)
+            for point in piece.polygon_mm
+        ]
+        _draw_polyline(canvas, points, color, thickness=2)
+        center = _placement_screen_point(piece.centroid_mm)
+        canvas.draw_cross(
+            center[0],
+            center[1],
+            size=5,
+            thickness=2,
+            color=color,
+        )
+        _draw_text(
+            canvas,
+            center[0] + 4,
+            center[1] - 12,
+            piece.piece_id,
+            color,
+        )
+
+    panel_x = 320
+    status_color = GREEN if phase == "COMPLETE" else YELLOW
+    _draw_text(
+        canvas,
+        panel_x,
+        55,
+        phase,
+        status_color,
+        2,
+    )
+    _draw_text(
+        canvas,
+        panel_x,
+        83,
+        "DONE:{}/{}".format(
+            placement_state["completed_count"],
+            placement_state["total_count"],
+        ),
+        WHITE,
+        2,
+    )
+    if phase == "COMPLETE":
+        _draw_text(
+            canvas, panel_x, 115, "PUZZLE COMPLETE", GREEN, 2
+        )
+    else:
+        _draw_text(
+            canvas,
+            panel_x,
+            115,
+            "NEXT:{}".format(next_piece_id or "-"),
+            YELLOW,
+            2,
+        )
+        _draw_text(
+            canvas,
+            panel_x,
+            145,
+            "CHECK IN:{:.1f}s".format(
+                max(0, next_check_ms) / 1000.0
+            ),
+            GRAY,
+        )
+    _draw_text(
+        canvas,
+        panel_x,
+        171,
+        "OBS:{} MATCH:{}".format(
+            placement_state["observed_count"],
+            placement_state["matched_count"],
+        ),
+        GRAY,
+    )
+    if error:
+        _draw_text(
+            canvas, panel_x, 198, str(error)[:48], RED
+        )
+
+    row_y = 225
+    for piece in reference_pieces:
+        piece_id = piece.piece_id
+        operation = _operation_for_piece(plan, piece_id)
+        if operation is None:
+            continue
+        if piece_id in completed:
+            state_text = "DONE"
+            color = GREEN
+        elif piece_id == next_piece_id:
+            state_text = "MOVE"
+            color = YELLOW
+        else:
+            state_text = "WAIT"
+            color = GRAY
+        _draw_text(
+            canvas,
+            panel_x,
+            row_y,
+            "{} {}".format(piece_id, state_text),
+            color,
+            2,
+        )
+        _draw_text(
+            canvas,
+            panel_x + 110,
+            row_y + 3,
+            "T:{:.1f},{:.1f} R:{:+.1f}".format(
+                operation["target_center_mm"][0],
+                operation["target_center_mm"][1],
+                operation["rotation_deg"],
+            ),
+            WHITE,
+        )
+        row_y += 48
+
+
+def _render_planning_status(canvas, pieces, frame_index):
+    canvas.clear()
+    _draw_text(
+        canvas, 160, 160, "PLANNING...", YELLOW, 3
+    )
+    _draw_text(
+        canvas,
+        185,
+        215,
+        "FROZEN PIECES:{}".format(len(pieces)),
+        WHITE,
+        2,
+    )
+    _draw_text(
+        canvas,
+        190,
+        250,
+        "FRAME:{}".format(frame_index),
+        GRAY,
+    )
+
+
+def _print_placement_check(frame_index, result):
+    for piece_id in result["newly_completed"]:
+        metrics = result["metrics"].get(piece_id, {})
+        print(
+            "PIECE_PLACED,frame={},id={},method={},"
+            "center_error_mm={},max_vertex_error_mm={},"
+            "coverage={:.2f}".format(
+                frame_index,
+                piece_id,
+                metrics.get("method", "unknown"),
+                "{:.1f}".format(
+                    metrics["center_error_mm"]
+                )
+                if metrics.get("center_error_mm") is not None
+                else "na",
+                "{:.1f}".format(
+                    metrics["max_vertex_error_mm"]
+                )
+                if metrics.get("max_vertex_error_mm")
+                is not None
+                else "na",
+                metrics.get("coverage", 0.0),
+            )
+        )
+    print(
+        "PLACEMENT_CHECK,frame={},check={},observed={},matched={},"
+        "completed={}/{},next={}".format(
+            frame_index,
+            result["check_index"],
+            result["observed_count"],
+            result["matched_count"],
+            result["completed_count"],
+            result["total_count"],
+            result["next_piece_id"] or "none",
+        )
+    )
+
+
+def _detect_frame_pieces(
+    frame,
+    corners_px,
+    region,
+    threshold,
+):
+    piece_gray = frame.to_grayscale(
+        x_size=cfg.REALTIME_PIECE_WORK_WIDTH,
+        y_size=cfg.REALTIME_PIECE_WORK_HEIGHT,
+    )
+    return detect_pieces_from_canmv_image(
+        piece_gray,
+        corners_px,
+        (cfg.FRAME_WIDTH, cfg.FRAME_HEIGHT),
+        region=region,
+        threshold=threshold,
+    )
+
+
+def _count_map_text(values):
+    if not values:
+        return "none"
+    return "|".join(
+        "{}:{}".format(name, values[name])
+        for name in sorted(values)
+    )
+
+
+def _relaxed_piece_threshold(diagnostics):
+    """Choose the low-contrast retry threshold in the same gray reference."""
+    if (
+        diagnostics.get("segmentation_mode")
+        == "background_delta"
+        and diagnostics.get("background_sample_count", 0)
+        >= cfg.PIECE_BACKGROUND_MIN_SAMPLES
+    ):
+        return background_difference_threshold(
+            {
+                "background_gray": diagnostics.get(
+                    "background_gray", 0.0
+                ),
+                "background_spread_gray": diagnostics.get(
+                    "background_spread_gray", 0.0
+                ),
+            },
+            cfg.PIECE_BACKGROUND_RELAXED_DELTA_GRAY,
+            cfg.PIECE_BACKGROUND_NOISE_MARGIN_GRAY,
+            cfg.PIECE_BACKGROUND_MAX_DELTA_GRAY,
+        )
+    return int(cfg.PIECE_LOW_GRAY_THRESHOLD)
+
+
+def _print_piece_diagnostics(
+    frame_index,
+    region,
+    pieces,
+    diagnostics,
+    retry_used,
+    consensus_state=None,
+):
+    rejected = diagnostics.get("rejected", {})
+    trace_failures = diagnostics.get("trace_failures", {})
+    expected = "na"
+    samples = "na"
+    if consensus_state is not None:
+        if consensus_state["expected_count"] is not None:
+            expected = consensus_state["expected_count"]
+        samples = "{}/{}".format(
+            consensus_state["valid_samples"],
+            consensus_state["settle_detections"],
+        )
+    print(
+        "PIECE_DETECT,frame={},region={},segmentation={},"
+        "threshold={},bg={:.1f},bg_high={:.1f},"
+        "bg_spread={:.1f},delta={:.1f},bg_samples={},retry={},"
+        "raw_blobs={},accepted={},rejected={},trace_failures={},"
+        "fallbacks={},boundary_steps={},pixel_reads={},"
+        "raw_vertices={},vertices={},areas_mm2={},"
+        "expected={},samples={}".format(
+            frame_index,
+            region,
+            diagnostics.get("threshold_mode", "unknown"),
+            int(diagnostics.get("threshold", 0)),
+            diagnostics.get("background_gray", 0.0),
+            diagnostics.get("background_high_gray", 0.0),
+            diagnostics.get("background_spread_gray", 0.0),
+            diagnostics.get("threshold_delta_gray", 0.0),
+            diagnostics.get("background_sample_count", 0),
+            int(bool(retry_used)),
+            diagnostics.get("raw_contours", 0),
+            len(pieces),
+            _count_map_text(rejected),
+            _count_map_text(trace_failures),
+            diagnostics.get("boundary_fallback_count", 0),
+            diagnostics.get("boundary_steps", 0),
+            diagnostics.get("pixel_reads", 0),
+            "|".join(
+                str(value)
+                for value in diagnostics.get(
+                    "detected_vertex_counts", []
+                )
+            )
+            or "none",
+            "|".join(
+                str(len(piece.polygon_mm)) for piece in pieces
+            )
+            or "none",
+            "|".join(
+                "{:.0f}".format(piece.area_mm2)
+                for piece in pieces
+            )
+            or "none",
+            expected,
+            samples,
+        )
+    )
+
+
+def _report_performance(frame_index):
+    if not PERF_STATS.report_due(frame_index):
+        return
+    snapshot = PERF_STATS.window_snapshot(reset=False)
+    print(PERF_STATS.format_report(frame_index))
+    counters = snapshot["counters"]
+    if counters:
+        print(
+            "[PERF_COUNT] frame={} {}".format(
+                frame_index,
+                " ".join(
+                    "{}={}".format(name, counters[name])
+                    for name in sorted(counters)
+                ),
+            )
+        )
+    PERF_STATS.window_snapshot(reset=True)
+
+
+def main():
+    sensor = None
+    canvases = []
+    _audit_runtime_api()
+    boundary_tracker = A4BoundaryTracker()
+    piece_tracker = PieceTracker()
+    frame_index = 0
+    fps = 0.0
+    start_ms = _ms_now()
+    active_plan = None
+    active_plan_key = None
+    last_stable = False
+    last_piece_stable = False
+    last_a4_locked = False
+    last_pieces = []
+    last_piece_detection_frame = -1000000
+    last_boundary_diagnostics = {}
+    canvas_index = 0
+    a4_lock_frame = None
+    phase = "ACQUIRE"
+    placement_monitor = None
+    reference_pieces = []
+    placement_started_ms = 0
+    last_placement_check_ms = 0
+    placement_complete_logged = False
+    target_scanlines = {}
+    last_rendered_state = None
+    complete_displayed = False
+    piece_count_consensus = PieceCountConsensus(
+        cfg.MIN_PIECE_COUNT,
+        cfg.MAX_PIECE_COUNT,
+        cfg.PIECE_COUNT_WINDOW_DETECTIONS,
+        cfg.PIECE_COUNT_SETTLE_DETECTIONS,
+        cfg.PIECE_COUNT_MIN_CONFIRMATIONS,
+    )
+    consensus_state = piece_count_consensus.state()
+    piece_detection_count = 0
+    last_piece_diagnostic_signature = None
+    pending_reason = "a4_unlocked"
+    last_piece_gray = None
+    last_piece_gray_frame = -1
+    last_piece_gray_threshold = None
+    last_thumbnail_error = None
+    ide_output_index = 0
+    last_ide_stream_error = None
+    PERF_STATS.enabled = bool(cfg.ENABLE_STAGE_TIMING)
+    PERF_STATS.reset()
+
+    try:
+        sensor = _init_hardware()
+        # The automatic acquisition preview transitions to this status canvas
+        # after lock, so both canvases are prepared even when camera preview is
+        # initially visible.
+        canvases = [
+            image.Image(
+                cfg.FRAME_WIDTH,
+                cfg.FRAME_HEIGHT,
+                image.RGB565,
+            ),
+            image.Image(
+                cfg.FRAME_WIDTH,
+                cfg.FRAME_HEIGHT,
+                image.RGB565,
+            ),
+        ]
+        print(
+            "START_REALTIME_A4,frame={}x{},boundary={}x{},"
+            "piece_work={}x{},a4_every={},piece_every={},"
+            "debug_camera={},planner=outer_first,"
+            "placement_check_ms={},a4_hold_misses={},"
+            "piece_segment={},piece_deltas={}|{},"
+            "fixed_fallbacks={}|{},count_window={},"
+            "count_settle={},gray_thumbnail={},"
+            "ide_stream=explicit,ide_quality={},"
+            "ide_every={}".format(
+                cfg.FRAME_WIDTH,
+                cfg.FRAME_HEIGHT,
+                cfg.A4_DETECT_WIDTH,
+                cfg.A4_DETECT_HEIGHT,
+                cfg.REALTIME_PIECE_WORK_WIDTH,
+                cfg.REALTIME_PIECE_WORK_HEIGHT,
+                cfg.A4_DETECT_INTERVAL_ACQUIRE,
+                cfg.PIECE_DETECT_EVERY_N_FRAMES,
+                int(cfg.DEBUG_SHOW_CAMERA),
+                cfg.PLACING_VERIFICATION_INTERVAL_MS,
+                cfg.A4_HOLD_MISSED_FRAMES,
+                cfg.PIECE_SEGMENTATION_MODE,
+                cfg.PIECE_BACKGROUND_DELTA_GRAY,
+                cfg.PIECE_BACKGROUND_RELAXED_DELTA_GRAY,
+                cfg.WHITE_GRAY_THRESHOLD,
+                cfg.PIECE_LOW_GRAY_THRESHOLD,
+                cfg.PIECE_COUNT_WINDOW_DETECTIONS,
+                cfg.PIECE_COUNT_SETTLE_DETECTIONS,
+                int(cfg.SHOW_GRAY_WORK_THUMBNAIL),
+                cfg.IDE_STREAM_QUALITY,
+                cfg.IDE_STREAM_EVERY_N_OUTPUTS,
+            )
+        )
+
+        while True:
+            os.exitpoint()
+            if _stop_requested(start_ms, frame_index):
+                print(
+                    "STOP,reason=configured_limit,frame={}".format(
+                        frame_index
+                    )
+                )
+                break
+            if (
+                phase == "COMPLETE"
+                and complete_displayed
+                and not phase_allows_vision(phase)
+            ):
+                # Preserve the final canvas without snapshot, A4 tracking,
+                # segmentation, coverage scans, or display writes.
+                _sleep_ms(50)
+                continue
+            PERF_STATS.begin_frame(frame_index)
+            frame_start = _ms_now()
+            capture_started = PERF_STATS.mark()
+            frame = sensor.snapshot()
+            PERF_STATS.add_stage("capture_ms", capture_started)
+            if frame is None:
+                if (
+                    frame_index
+                    % cfg.A4_STATUS_PRINT_EVERY_N_FRAMES
+                    == 0
+                ):
+                    print(
+                        "DETECTION_ERROR,frame={},"
+                        "reason=snapshot_none".format(frame_index)
+                    )
+                frame_index += 1
+                PERF_STATS.end_frame()
+                _report_performance(frame_index)
+                continue
+
+            error = None
+            pieces = []
+            stable = False
+            candidate = None
+            boundary_diagnostics = {}
+            try:
+                a4_state = boundary_tracker.state()
+                boundary_interval = a4_detection_interval(
+                    phase,
+                    cfg.A4_DETECT_INTERVAL_ACQUIRE,
+                    cfg.A4_DETECT_INTERVAL_PLACING,
+                )
+                boundary_due = (
+                    boundary_interval is not None
+                    and (
+                        not a4_state["locked"]
+                        or frame_index % boundary_interval == 0
+                    )
+                )
+                if boundary_due:
+                    a4_started = PERF_STATS.mark()
+                    boundary_gray = frame.to_grayscale(
+                        x_size=cfg.A4_DETECT_WIDTH,
+                        y_size=cfg.A4_DETECT_HEIGHT,
+                    )
+                    candidate, boundary_diagnostics = (
+                        detect_a4_boundary(
+                            boundary_gray,
+                            (cfg.FRAME_WIDTH, cfg.FRAME_HEIGHT),
+                        )
+                    )
+                    last_boundary_diagnostics = (
+                        boundary_diagnostics
+                    )
+                    if phase in ("PLACING", "COMPLETE"):
+                        candidate = _preserve_corner_labels(
+                            candidate,
+                            a4_state["corners_px"],
+                        )
+                    a4_state = boundary_tracker.update(candidate)
+                    PERF_STATS.add_stage(
+                        "a4_detect_ms", a4_started
+                    )
+                else:
+                    boundary_diagnostics = (
+                        last_boundary_diagnostics
+                    )
+
+                if a4_state["locked"] and phase == "ACQUIRE":
+                    piece_due = (
+                        frame_index - last_piece_detection_frame
+                        >= cfg.PIECE_DETECT_EVERY_N_FRAMES
+                    )
+                    if piece_due:
+                        piece_detection_count += 1
+                        pieces, piece_diagnostics = (
+                            _detect_frame_pieces(
+                                frame,
+                                a4_state["corners_px"],
+                                "upper",
+                                None,
+                            )
+                        )
+                        retry_used = False
+                        primary_threshold = int(
+                            piece_diagnostics.get(
+                                "threshold",
+                                cfg.WHITE_GRAY_THRESHOLD,
+                            )
+                        )
+                        relaxed_threshold = (
+                            _relaxed_piece_threshold(
+                                piece_diagnostics
+                            )
+                        )
+                        previous_consensus = (
+                            piece_count_consensus.state()
+                        )
+                        expected_count = previous_consensus[
+                            "expected_count"
+                        ]
+                        probe_due = (
+                            not previous_consensus["ready"]
+                            and piece_detection_count
+                            % max(
+                                1,
+                                cfg.PIECE_THRESHOLD_PROBE_EVERY_N_DETECTIONS,
+                            )
+                            == 0
+                        )
+                        retry_due = (
+                            len(pieces) < cfg.MIN_PIECE_COUNT
+                            or (
+                                expected_count is not None
+                                and len(pieces) < expected_count
+                            )
+                            or probe_due
+                        )
+                        if (
+                            retry_due
+                            and relaxed_threshold
+                            < primary_threshold
+                        ):
+                            (
+                                retry_pieces,
+                                retry_diagnostics,
+                            ) = _detect_frame_pieces(
+                                frame,
+                                a4_state["corners_px"],
+                                "upper",
+                                relaxed_threshold,
+                            )
+                            if len(retry_pieces) > len(pieces):
+                                pieces = retry_pieces
+                                piece_diagnostics = (
+                                    retry_diagnostics
+                                )
+                                retry_used = True
+                        last_piece_gray = piece_diagnostics.get(
+                            "rectified"
+                        )
+                        last_piece_gray_frame = frame_index
+                        last_piece_gray_threshold = int(
+                            piece_diagnostics.get(
+                                "threshold",
+                                cfg.WHITE_GRAY_THRESHOLD,
+                            )
+                        )
+                        pieces, tracker_stable = piece_tracker.update(
+                            pieces
+                        )
+                        consensus_state = (
+                            piece_count_consensus.update(
+                                len(pieces)
+                            )
+                        )
+                        stable = (
+                            tracker_stable
+                            and consensus_state["ready"]
+                        )
+                        if not consensus_state["ready"]:
+                            pending_reason = consensus_state[
+                                "reason"
+                            ]
+                        elif not tracker_stable:
+                            pending_reason = "tracker_stabilizing"
+                        else:
+                            pending_reason = "ready"
+                        diagnostic_signature = (
+                            len(pieces),
+                            int(
+                                piece_diagnostics.get(
+                                    "threshold", 0
+                                )
+                            ),
+                            tuple(
+                                sorted(
+                                    piece_diagnostics.get(
+                                        "rejected", {}
+                                    ).items()
+                                )
+                            ),
+                            tuple(
+                                sorted(
+                                    piece_diagnostics.get(
+                                        "trace_failures", {}
+                                    ).items()
+                                )
+                            ),
+                            tuple(
+                                piece_diagnostics.get(
+                                    "detected_vertex_counts", []
+                                )
+                            ),
+                            consensus_state["reason"],
+                        )
+                        diagnostic_due = (
+                            retry_used
+                            or diagnostic_signature
+                            != last_piece_diagnostic_signature
+                            or piece_detection_count
+                            % max(
+                                1,
+                                cfg.PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS,
+                            )
+                            == 0
+                        )
+                        if diagnostic_due:
+                            _print_piece_diagnostics(
+                                frame_index,
+                                "upper",
+                                pieces,
+                                piece_diagnostics,
+                                retry_used,
+                                consensus_state,
+                            )
+                            last_piece_diagnostic_signature = (
+                                diagnostic_signature
+                            )
+                        last_piece_detection_frame = frame_index
+                        last_pieces = pieces
+                        last_piece_stable = stable
+                    else:
+                        pieces = last_pieces
+                        stable = last_piece_stable
+                elif (
+                    a4_state["locked"]
+                    and phase in ("PLACING", "COMPLETE")
+                    and placement_monitor is not None
+                ):
+                    pieces = placement_monitor.visible_pieces()
+                    stable = True
+                    check_due = (
+                        phase == "PLACING"
+                        and _ms_delta(
+                            _ms_now(),
+                            last_placement_check_ms,
+                        )
+                        >= cfg.PLACING_VERIFICATION_INTERVAL_MS
+                    )
+                    if check_due:
+                        observations, placement_diagnostics = (
+                            _detect_frame_pieces(
+                                frame,
+                                a4_state["corners_px"],
+                                "full",
+                                None,
+                            )
+                        )
+                        placement_retry_used = False
+                        primary_threshold = int(
+                            placement_diagnostics.get(
+                                "threshold",
+                                cfg.WHITE_GRAY_THRESHOLD,
+                            )
+                        )
+                        relaxed_threshold = (
+                            _relaxed_piece_threshold(
+                                placement_diagnostics
+                            )
+                        )
+                        minimum_visible = len(
+                            placement_monitor.visible_pieces()
+                        )
+                        if (
+                            len(observations) < minimum_visible
+                            and relaxed_threshold
+                            < primary_threshold
+                        ):
+                            (
+                                retry_observations,
+                                retry_diagnostics,
+                            ) = _detect_frame_pieces(
+                                frame,
+                                a4_state["corners_px"],
+                                "full",
+                                relaxed_threshold,
+                            )
+                            if len(retry_observations) > len(
+                                observations
+                            ):
+                                observations = retry_observations
+                                placement_diagnostics = (
+                                    retry_diagnostics
+                                )
+                                placement_retry_used = True
+                        last_piece_gray = (
+                            placement_diagnostics.get("rectified")
+                        )
+                        last_piece_gray_frame = frame_index
+                        last_piece_gray_threshold = int(
+                            placement_diagnostics.get(
+                                "threshold",
+                                cfg.WHITE_GRAY_THRESHOLD,
+                            )
+                        )
+                        _print_piece_diagnostics(
+                            frame_index,
+                            "full",
+                            observations,
+                            placement_diagnostics,
+                            placement_retry_used,
+                        )
+                        coverages = {}
+                        coverage_samples = 0
+                        coverage_foreground = 0
+                        if placement_monitor.completed:
+                            gray_array = placement_diagnostics[
+                                "rectified"
+                            ].to_numpy_ref()
+                            coverage_started_ms = _ms_now()
+                            coverage_perf_started = PERF_STATS.mark()
+                            for piece_id in placement_monitor.order:
+                                if (
+                                    piece_id
+                                    in placement_monitor.completed
+                                ):
+                                    continue
+                                coverage_result = (
+                                    polygon_white_coverage_scanlines(
+                                        gray_array,
+                                        target_scanlines[piece_id],
+                                    )
+                                )
+                                coverages[piece_id] = (
+                                    coverage_result[
+                                        "coverage_ratio"
+                                    ]
+                                )
+                                coverage_samples += (
+                                    coverage_result["sample_count"]
+                                )
+                                coverage_foreground += (
+                                    coverage_result[
+                                        "foreground_count"
+                                    ]
+                                )
+                            PERF_STATS.add_stage(
+                                "coverage_scan_ms",
+                                coverage_perf_started,
+                            )
+                            print(
+                                "COVERAGE_SCAN,frame={},elapsed_ms={},"
+                                "sample_count={},foreground_count={},"
+                                "targets={}".format(
+                                    frame_index,
+                                    _ms_delta(
+                                        _ms_now(),
+                                        coverage_started_ms,
+                                    ),
+                                    coverage_samples,
+                                    coverage_foreground,
+                                    len(coverages),
+                                )
+                            )
+                        placement_result = (
+                            placement_monitor.check(
+                                observations,
+                                coverages=coverages,
+                            )
+                        )
+                        last_placement_check_ms = _ms_now()
+                        pieces = (
+                            placement_monitor.visible_pieces()
+                        )
+                        _print_placement_check(
+                            frame_index, placement_result
+                        )
+                        if placement_result["done"]:
+                            phase = "COMPLETE"
+                            if not placement_complete_logged:
+                                placement_complete_logged = True
+                                print(
+                                    "PLACEMENT_COMPLETE,frame={},"
+                                    "elapsed_ms={},count={}".format(
+                                        frame_index,
+                                        _ms_delta(
+                                            _ms_now(),
+                                            placement_started_ms,
+                                        ),
+                                        placement_result[
+                                            "total_count"
+                                        ],
+                                    )
+                                )
+                elif phase == "ACQUIRE":
+                    piece_tracker.update([])
+                    pieces = []
+                    last_pieces = []
+                    last_piece_stable = False
+                    last_piece_detection_frame = -1000000
+                    pending_reason = "a4_unlocked"
+                    last_piece_gray = None
+                    last_piece_gray_frame = -1
+                    last_piece_gray_threshold = None
+                elif placement_monitor is not None:
+                    # Keep the frozen plan and most recent contour-only state
+                    # while A4 tracking is temporarily lost.
+                    pieces = placement_monitor.visible_pieces()
+                    stable = True
+            except Exception as exc:
+                if "IDE interrupt" in str(exc):
+                    raise
+                error = str(exc)
+                a4_state = boundary_tracker.state()
+                if (
+                    phase in ("PLACING", "COMPLETE")
+                    and placement_monitor is not None
+                ):
+                    pieces = placement_monitor.visible_pieces()
+                    stable = True
+                else:
+                    piece_tracker.update([])
+                    pieces = []
+                    stable = False
+                    last_pieces = []
+                    last_piece_stable = False
+                    pending_reason = "detection_error"
+
+            if a4_state["locked"] and not last_a4_locked:
+                a4_lock_frame = frame_index
+                _print_a4_lock(frame_index, a4_state)
+            elif not a4_state["locked"]:
+                a4_lock_frame = None
+                if last_a4_locked and phase == "ACQUIRE":
+                    piece_count_consensus.reset()
+                    consensus_state = (
+                        piece_count_consensus.state()
+                    )
+                    piece_detection_count = 0
+                    last_piece_diagnostic_signature = None
+
+            if phase == "ACQUIRE":
+                if (
+                    not stable
+                    or error
+                    or not a4_state["locked"]
+                ):
+                    active_plan = None
+                    active_plan_key = None
+                else:
+                    key = _plan_key(pieces)
+                    if not last_stable or active_plan is None:
+                        plan_start_ms = _ms_now()
+                        print(
+                            "PLANNING_START,frame={},planner="
+                            "outer_first,count={}".format(
+                                frame_index, len(pieces)
+                            )
+                        )
+                        phase = "PLANNING"
+                        planning_canvas = canvases[canvas_index]
+                        canvas_index = 1 - canvas_index
+                        render_started = PERF_STATS.mark()
+                        _render_planning_status(
+                            planning_canvas, pieces, frame_index
+                        )
+                        thumbnail_error = (
+                            _draw_gray_work_thumbnail(
+                                planning_canvas,
+                                last_piece_gray,
+                                last_piece_gray_frame,
+                                last_piece_gray_threshold,
+                            )
+                        )
+                        if (
+                            thumbnail_error
+                            and thumbnail_error
+                            != last_thumbnail_error
+                        ):
+                            print(
+                                "GRAY_THUMBNAIL_ERROR,frame={},"
+                                "reason={}".format(
+                                    frame_index,
+                                    thumbnail_error.replace(
+                                        ",", ";"
+                                    ),
+                                )
+                            )
+                        last_thumbnail_error = thumbnail_error
+                        PERF_STATS.add_stage(
+                            "render_ms", render_started
+                        )
+                        PERF_STATS.increment("render_count")
+                        (
+                            ide_output_index,
+                            last_ide_stream_error,
+                        ) = _show_output_with_ide(
+                            planning_canvas,
+                            frame_index,
+                            ide_output_index,
+                            last_ide_stream_error,
+                            force_ide=True,
+                        )
+                        last_rendered_state = (
+                            "PLANNING",
+                            len(pieces),
+                        )
+                        active_plan = (
+                            plan_outer_first_rectangle(pieces)
+                        )
+                        active_plan_key = key
+                        print(
+                            "PLANNING_DONE,frame={},elapsed_ms={},"
+                            "valid={},mode={},nodes={}".format(
+                                frame_index,
+                                _ms_delta(
+                                    _ms_now(), plan_start_ms
+                                ),
+                                int(active_plan.valid),
+                                active_plan.mode,
+                                active_plan.search_nodes,
+                            )
+                        )
+                        _print_plan(
+                            active_plan, pieces, frame_index
+                        )
+                        if active_plan.valid:
+                            placement_monitor = PlacementMonitor(
+                                pieces, active_plan
+                            )
+                            reference_pieces = (
+                                placement_monitor.references
+                            )
+                            phase = "PLACING"
+                            placement_started_ms = _ms_now()
+                            last_placement_check_ms = (
+                                placement_started_ms
+                            )
+                            target_scanlines = {}
+                            for (
+                                piece_id,
+                                target_polygon,
+                            ) in active_plan.target_polygons.items():
+                                target_scanlines[piece_id] = (
+                                    build_polygon_scanlines(
+                                        target_polygon,
+                                        cfg.REALTIME_PIECE_WORK_WIDTH,
+                                        cfg.REALTIME_PIECE_WORK_HEIGHT,
+                                        sample_stride=(
+                                            cfg.PLACEMENT_COVERAGE_SAMPLE_STRIDE
+                                        ),
+                                    )
+                                )
+                            pieces = (
+                                placement_monitor.visible_pieces()
+                            )
+                            stable = True
+                            print(
+                                "PLACEMENT_START,frame={},count={},"
+                                "check_interval_ms={},next={}".format(
+                                    frame_index,
+                                    len(reference_pieces),
+                                    cfg.PLACING_VERIFICATION_INTERVAL_MS,
+                                    placement_monitor.next_piece_id(),
+                                )
+                            )
+                        else:
+                            phase = "ACQUIRE"
+
+            elapsed = max(1, _ms_delta(_ms_now(), frame_start))
+            instant_fps = 1000.0 / elapsed
+            fps = (
+                instant_fps
+                if fps <= 0.0
+                else 0.85 * fps + 0.15 * instant_fps
+            )
+
+            if (
+                frame_index % cfg.A4_STATUS_PRINT_EVERY_N_FRAMES
+                == 0
+            ):
+                if error:
+                    print(
+                        "DETECTION_ERROR,frame={},reason={},"
+                        "pending_reason={}".format(
+                            frame_index,
+                            error.replace(",", ";"),
+                            pending_reason,
+                        )
+                    )
+                elif not a4_state["locked"]:
+                    print(
+                        "A4_SEARCH,frame={},rects={},dark_blobs={},"
+                        "candidates={},valid_frames={},missed={},"
+                        "rejected={}".format(
+                            frame_index,
+                            boundary_diagnostics.get("raw_rects", 0),
+                            boundary_diagnostics.get(
+                                "raw_dark_blobs", 0
+                            ),
+                            boundary_diagnostics.get(
+                                "valid_candidates", 0
+                            ),
+                            a4_state["valid_frames"],
+                            a4_state["missed_frames"],
+                            "|".join(
+                                "{}:{}".format(name, count)
+                                for name, count in sorted(
+                                    boundary_diagnostics.get(
+                                        "rejected", {}
+                                    ).items()
+                                )
+                            )
+                            or "none",
+                        )
+                    )
+                elif not stable:
+                    print(
+                        "PLAN_PENDING,frame={},count={},stable=0,"
+                        "stable_pieces={},reason={},expected={},"
+                        "count_samples={}/{},a4=1,"
+                        "a4_motion_px={:.1f},fps={:.1f}".format(
+                            frame_index,
+                            len(pieces),
+                            sum(
+                                1
+                                for piece in pieces
+                                if piece.stable
+                            ),
+                            pending_reason,
+                            (
+                                consensus_state["expected_count"]
+                                if consensus_state[
+                                    "expected_count"
+                                ]
+                                is not None
+                                else "none"
+                            ),
+                            consensus_state["valid_samples"],
+                            consensus_state[
+                                "settle_detections"
+                            ],
+                            a4_state["motion_px"],
+                            fps,
+                        )
+                    )
+
+            lock_preview_active = (
+                a4_lock_frame is not None
+                and frame_index - a4_lock_frame
+                < cfg.A4_LOCK_PREVIEW_HOLD_FRAMES
+            )
+            show_camera = (
+                phase == "ACQUIRE"
+                and (
+                    cfg.DEBUG_SHOW_CAMERA
+                    or (
+                        cfg.A4_AUTO_SEARCH_PREVIEW
+                        and (
+                            not a4_state["locked"]
+                            or lock_preview_active
+                        )
+                    )
+                )
+            )
+            next_check_ms = 0
+            placement_state = None
+            if (
+                phase in ("PLACING", "COMPLETE")
+                and placement_monitor is not None
+            ):
+                next_check_ms = (
+                    0
+                    if phase == "COMPLETE"
+                    else cfg.PLACING_VERIFICATION_INTERVAL_MS
+                    - _ms_delta(
+                        _ms_now(),
+                        last_placement_check_ms,
+                    )
+                )
+                placement_state = placement_monitor.state()
+                current_render_state = (
+                    "placement",
+                ) + placement_ui_key(
+                    phase,
+                    placement_state,
+                    next_check_ms,
+                    cfg.UI_COUNTDOWN_REFRESH_INTERVAL_MS,
+                    error,
+                ) + (last_piece_gray_frame,)
+            else:
+                current_render_state = (
+                    "camera",
+                    frame_index,
+                ) if show_camera else (
+                    "status",
+                ) + status_ui_key(
+                    phase,
+                    a4_state["locked"],
+                    stable,
+                    len(pieces),
+                    active_plan is not None
+                    and active_plan.valid,
+                    error,
+                ) + (last_piece_gray_frame,)
+            ui_dirty = should_render_ui(
+                last_rendered_state, current_render_state
+            )
+            render_due = (
+                frame_index % cfg.DISPLAY_EVERY_N_FRAMES == 0
+                if show_camera
+                else ui_dirty
+            )
+
+            if render_due:
+                render_started = PERF_STATS.mark()
+                if show_camera:
+                    if candidate is not None:
+                        _draw_quad(
+                            frame,
+                            candidate["corners_px"],
+                            YELLOW,
+                            thickness=2,
+                        )
+                    if a4_state["corners_px"] is not None:
+                        _draw_quad(
+                            frame,
+                            a4_state["corners_px"],
+                            GREEN
+                            if a4_state["locked"]
+                            else YELLOW,
+                            thickness=3,
+                        )
+                    _draw_piece_overlay(
+                        frame, pieces, a4_state["corners_px"]
+                    )
+                    label = (
+                        "A4 LOCK"
+                        if a4_state["locked"]
+                        else "A4 SEARCH"
+                    )
+                    _draw_text(
+                        frame,
+                        10,
+                        8,
+                        "{} C:{:.2f} M:{:.1f}px P:{} "
+                        "FPS:{:.1f}".format(
+                            label,
+                            a4_state["confidence"],
+                            a4_state["motion_px"],
+                            len(pieces),
+                            fps,
+                        ),
+                        GREEN if a4_state["locked"] else YELLOW,
+                        2,
+                    )
+                    if error:
+                        _draw_text(
+                            frame,
+                            10,
+                            38,
+                            str(error)[:76],
+                            RED,
+                        )
+                    PERF_STATS.add_stage(
+                        "render_ms", render_started
+                    )
+                    PERF_STATS.increment("render_count")
+                    (
+                        ide_output_index,
+                        last_ide_stream_error,
+                    ) = _show_output_with_ide(
+                        frame,
+                        frame_index,
+                        ide_output_index,
+                        last_ide_stream_error,
+                    )
+                else:
+                    canvas = canvases[canvas_index]
+                    canvas_index = 1 - canvas_index
+                    if (
+                        phase in ("PLACING", "COMPLETE")
+                        and placement_monitor is not None
+                    ):
+                        _render_placement_status(
+                            canvas,
+                            reference_pieces,
+                            active_plan,
+                            placement_state,
+                            phase,
+                            frame_index,
+                            fps,
+                            next_check_ms,
+                            error,
+                        )
+                    else:
+                        _render_status(
+                            canvas,
+                            pieces,
+                            stable,
+                            active_plan,
+                            frame_index,
+                            fps,
+                            error,
+                        )
+                        _draw_text(
+                            canvas,
+                            520,
+                            38,
+                            "A4:{} C:{:.2f} M:{:.1f}px".format(
+                                "LOCK"
+                                if a4_state["locked"]
+                                else "SEARCH",
+                                a4_state["confidence"],
+                                a4_state["motion_px"],
+                            ),
+                            GREEN
+                            if a4_state["locked"]
+                            else YELLOW,
+                        )
+                    thumbnail_error = (
+                        _draw_gray_work_thumbnail(
+                            canvas,
+                            last_piece_gray,
+                            last_piece_gray_frame,
+                            last_piece_gray_threshold,
+                        )
+                    )
+                    if (
+                        thumbnail_error
+                        and thumbnail_error
+                        != last_thumbnail_error
+                    ):
+                        print(
+                            "GRAY_THUMBNAIL_ERROR,frame={},"
+                            "reason={}".format(
+                                frame_index,
+                                thumbnail_error.replace(",", ";"),
+                            )
+                        )
+                    last_thumbnail_error = thumbnail_error
+                    PERF_STATS.add_stage(
+                        "render_ms", render_started
+                    )
+                    PERF_STATS.increment("render_count")
+                    (
+                        ide_output_index,
+                        last_ide_stream_error,
+                    ) = _show_output_with_ide(
+                        canvas,
+                        frame_index,
+                        ide_output_index,
+                        last_ide_stream_error,
+                        force_ide=(phase == "COMPLETE"),
+                    )
+                last_rendered_state = current_render_state
+                if phase == "COMPLETE":
+                    complete_displayed = True
+            else:
+                PERF_STATS.increment("skipped_render_count")
+
+            last_stable = stable
+            last_a4_locked = a4_state["locked"]
+            frame_index += 1
+            PERF_STATS.end_frame()
+            _report_performance(frame_index)
+            if frame_index % 30 == 0:
+                gc.collect()
+            if cfg.LOOP_IDLE_MS > 0:
+                _sleep_ms(cfg.LOOP_IDLE_MS)
+
+    except KeyboardInterrupt:
+        print("STOP,reason=user,frame={}".format(frame_index))
+    except BaseException as exc:
+        reason = str(exc)
+        if "IDE interrupt" in reason:
+            print(
+                "STOP,reason=ide_interrupt,frame={}".format(
+                    frame_index
+                )
+            )
+        else:
+            print(
+                "FATAL,frame={},reason={}".format(
+                    frame_index, reason.replace(",", ";")
+                )
+            )
+            return 1
+    finally:
+        if sensor is not None:
+            try:
+                sensor.stop()
+            except Exception as exc:
+                print("CLEANUP_WARNING,sensor={}".format(exc))
+        try:
+            Display.deinit()
+        except Exception as exc:
+            print("CLEANUP_WARNING,display={}".format(exc))
+        try:
+            os.exitpoint(os.EXITPOINT_ENABLE_SLEEP)
+            _sleep_ms(100)
+        except Exception:
+            pass
+        try:
+            MediaManager.deinit()
+        except Exception as exc:
+            print("CLEANUP_WARNING,media={}".format(exc))
+        canvases = []
+        gc.collect()
+    return 0
+
+
+if __name__ == "__main__":
+    os.exitpoint(os.EXITPOINT_ENABLE)
+    main()

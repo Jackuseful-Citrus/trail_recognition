@@ -1,0 +1,57 @@
+{
+  "description": "Post-optimization desktop measurements for sample_puzzle.jpg",
+  "measurement_date": "2026-07-29",
+  "desktop_sample": {
+    "detected_pieces": 4,
+    "polygon_vertices": [3, 4, 4, 4],
+    "full_detection_median_ms": 3.316,
+    "outer_first_plan_median_ms": 44.543,
+    "outer_first_dfs_nodes": 1120,
+    "outer_first_polygon_intersections": 2610,
+    "outer_first_aabb_rejects": 636,
+    "fixed_plan_median_ms": 2096.640,
+    "fixed_plan_dfs_nodes": 2730,
+    "fixed_plan_polygon_intersections": 140566,
+    "fixed_plan_aabb_rejects": 29588,
+    "raw_cross_piece_edge_pairs": 84,
+    "strict_filtered_edge_pairs": 4,
+    "tolerant_filtered_edge_pairs": 8,
+    "raw_rectangle_hypotheses": 480,
+    "expanded_rectangle_hypotheses": 12,
+    "offline_cli_wall_seconds": 2.24
+  },
+  "boundary_trace_mock": {
+    "legacy_flood_ms": 35.883,
+    "ordered_trace_ms": 2.109,
+    "legacy_boundary_points": 1313,
+    "ordered_boundary_points": 936,
+    "ordered_pixel_reads": 1741,
+    "ordered_boundary_steps": 936
+  },
+  "coverage_scanline_desktop": {
+    "legacy_point_in_polygon_median_ms": 1.725,
+    "cached_scanline_median_ms": 0.121,
+    "sample_count": 776,
+    "coverage_ratio": 1.0
+  },
+  "placing_ui_simulation": {
+    "frames": 301,
+    "frame_period_ms": 16,
+    "old_render_count_every_second_frame": 151,
+    "optimized_render_count": 5,
+    "optimized_skipped_render_count": 296
+  },
+  "tests": {
+    "original_passed": 25,
+    "new_passed": 40,
+    "total_passed": 65,
+    "failed": 0
+  },
+  "board_measurement": null,
+  "notes": [
+    "Timings are CPython desktop medians and are not K230 measurements.",
+    "Boundary trace timing uses the same synthetic CanMV-like component for legacy flood and ordered perimeter tracing.",
+    "UI counts are a deterministic PLACING-state simulation, not display-driver measurements.",
+    "The optimized fixed-plan solution is globally rotated 180 degrees relative to the saved baseline; per-piece target centers and rotations are geometrically equivalent after that global rectangle symmetry."
+  ]
+}
