@@ -33,6 +33,15 @@ SOURCE_PROJECTIVE_GENERATION_GUARD = True
 # Optional production guard. ``None`` keeps recognition diagnostics able to
 # observe either physical half; planner profiles may require a normalized side.
 SOURCE_PROJECTIVE_REQUIRED_SOURCE_HALF = None
+# Static-scene optimizations are opt-in so recognition diagnostics retain the
+# continuously measured reference implementation.
+SOURCE_PROJECTIVE_FREEZE_A4_AFTER_LOCK = False
+SOURCE_PROJECTIVE_FREEZE_DIVIDER = False
+SOURCE_PROJECTIVE_DIVIDER_CONFIRM_DETECTIONS = 2
+SOURCE_PROJECTIVE_FREEZE_SOURCE_HALF = False
+SOURCE_PROJECTIVE_CACHE_BACKGROUND = False
+SOURCE_PROJECTIVE_MASK_MODE = "blacken"
+SOURCE_PROJECTIVE_MIN_BOUNDARY_INSIDE_RATIO = 0.95
 
 # Manual camera calibration, ordered TL, TR, BR, BL in the corrected 800x480
 # camera image. Replace these four points after running the calibration overlay.

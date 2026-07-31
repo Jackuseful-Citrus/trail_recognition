@@ -120,6 +120,55 @@ def _touches_source_boundary(rect, rows, margin=1):
     return False
 
 
+def _source_polygon_bbox(points, width, height):
+    x0 = max(0, int(math.floor(min(point[0] for point in points))))
+    y0 = max(0, int(math.floor(min(point[1] for point in points))))
+    x1 = min(
+        width - 1,
+        int(math.ceil(max(point[0] for point in points))),
+    )
+    y1 = min(
+        height - 1,
+        int(math.ceil(max(point[1] for point in points))),
+    )
+    return x0, y0, max(1, x1 - x0 + 1), max(1, y1 - y0 + 1)
+
+
+def _touches_roi_boundary(rect, roi, margin=1):
+    x0, y0, width, height = [int(value) for value in rect]
+    roi_x, roi_y, roi_width, roi_height = [int(value) for value in roi]
+    x1 = x0 + width - 1
+    y1 = y0 + height - 1
+    roi_x1 = roi_x + roi_width - 1
+    roi_y1 = roi_y + roi_height - 1
+    return (
+        x0 <= roi_x + margin
+        or y0 <= roi_y + margin
+        or x1 >= roi_x1 - margin
+        or y1 >= roi_y1 - margin
+    )
+
+
+def _point_inside_rows(point, rows, margin=0):
+    x = int(round(float(point[0])))
+    y = int(round(float(point[1])))
+    if y < 0 or y >= len(rows):
+        return False
+    span = rows[y]
+    return bool(
+        span is not None
+        and x >= span[0] + margin
+        and x <= span[1] - margin
+    )
+
+
+def _boundary_inside_ratio(points, rows):
+    if not points:
+        return 0.0
+    inside = sum(1 for point in points if _point_inside_rows(point, rows))
+    return float(inside) / len(points)
+
+
 def _empty_diagnostics(gray_image, mapper, divider, generation, reason):
     diagnostics = {
         "rectified": gray_image,
@@ -208,6 +257,9 @@ def detect_pieces_from_source_projective_image(
     source_side=None,
     scanline_mask=None,
     generation=0,
+    background_stats=None,
+    prepared_threshold=None,
+    mask_mode=None,
 ):
     """Detect source-image components, then project every boundary point.
 
@@ -235,18 +287,37 @@ def detect_pieces_from_source_projective_image(
     gray_array = gray_image.to_numpy_ref()
     if scanline_mask is None:
         scanline_mask = SourceScanlineMask(mapper, divider, source_side)
-    background_stats = _background_stats_from_a4(gray_array, scanline_mask)
-    piece_threshold, threshold_mode = _source_threshold(
-        background_stats, threshold
-    )
+    if background_stats is None:
+        background_stats = _background_stats_from_a4(
+            gray_array, scanline_mask
+        )
+    if prepared_threshold is None:
+        piece_threshold, threshold_mode = _source_threshold(
+            background_stats, threshold
+        )
+    else:
+        piece_threshold = int(prepared_threshold[0])
+        threshold_mode = str(prepared_threshold[1])
     contour_threshold = max(
         piece_threshold,
         int(getattr(cfg, "PIECE_CONTOUR_MIN_GRAY_THRESHOLD", 0)),
     )
-    mask_started = PERF_STATS.mark()
-    masked_pixels = scanline_mask.blacken_outside_source(gray_array)
-    PERF_STATS.add_stage("source_mask_ms", mask_started)
-    bbox = mapper.a4_bbox_source_px
+    mask_mode = str(
+        mask_mode
+        if mask_mode is not None
+        else getattr(cfg, "SOURCE_PROJECTIVE_MASK_MODE", "blacken")
+    )
+    if mask_mode == "bbox_filter":
+        masked_pixels = 0
+        bbox = _source_polygon_bbox(
+            scanline_mask.source_polygon_px, width, height
+        )
+    else:
+        mask_mode = "blacken"
+        mask_started = PERF_STATS.mark()
+        masked_pixels = scanline_mask.blacken_outside_source(gray_array)
+        PERF_STATS.add_stage("source_mask_ms", mask_started)
+        bbox = mapper.a4_bbox_source_px
     pixel_area_per_mm2 = _polygon_area_px(
         mapper.a4_polygon_source_px
     ) / (mapper.a4_width_mm * mapper.a4_height_mm)
@@ -267,7 +338,13 @@ def detect_pieces_from_source_projective_image(
     PERF_STATS.add_stage("source_blob_ms", blob_started)
     observations = []
     details = []
-    rejected = {"area": 0, "border": 0, "polygon": 0, "mapping": 0}
+    rejected = {
+        "area": 0,
+        "border": 0,
+        "outside_source": 0,
+        "polygon": 0,
+        "mapping": 0,
+    }
     trace_failures = {}
     boundary_steps = 0
     pixel_reads = 0
@@ -280,6 +357,11 @@ def detect_pieces_from_source_projective_image(
     for blob in blobs:
         rect = tuple(_blob_value(blob, "rect", None))
         raw_rects.append(rect)
+        if mask_mode == "bbox_filter" and _touches_roi_boundary(
+            rect, bbox
+        ):
+            rejected["border"] += 1
+            continue
         if _touches_source_boundary(rect, scanline_mask.source_rows):
             rejected["border"] += 1
             continue
@@ -287,6 +369,11 @@ def detect_pieces_from_source_projective_image(
             float(_blob_value(blob, "cx", 5)),
             float(_blob_value(blob, "cy", 6)),
         )
+        if not _point_inside_rows(
+            center, scanline_mask.source_rows, margin=1
+        ):
+            rejected["outside_source"] += 1
+            continue
         blob_pixels = float(_blob_value(blob, "pixels", 4))
         adaptive_background = (
             background_stats["background_gray"]
@@ -331,6 +418,17 @@ def detect_pieces_from_source_projective_image(
             )
             rejected["polygon"] += 1
             polygon_failure_rects.append(rect)
+            continue
+        if mask_mode == "bbox_filter" and _boundary_inside_ratio(
+            boundary_px, scanline_mask.source_rows
+        ) < float(
+            getattr(
+                cfg,
+                "SOURCE_PROJECTIVE_MIN_BOUNDARY_INSIDE_RATIO",
+                0.95,
+            )
+        ):
+            rejected["outside_source"] += 1
             continue
         project_started = PERF_STATS.mark()
         boundary_mm = []
@@ -449,6 +547,8 @@ def detect_pieces_from_source_projective_image(
             "trace_failures": trace_failures,
             "rectified_border_black_px": 0,
             "source_masked_pixels": masked_pixels,
+            "source_mask_mode": mask_mode,
+            "source_blob_roi": bbox,
             "component_bound_count": component_bound_count,
             "component_candidate_count": component_candidate_count,
             "contour_component_candidate_count": (
@@ -524,6 +624,17 @@ class SourceProjectiveRecognition:
         "source_half_state",
         "scanline_mask",
         "_corner_key",
+        "divider_confirmations",
+        "divider_frozen",
+        "_last_divider_sample_id",
+        "source_half_frozen",
+        "background_stats",
+        "piece_threshold",
+        "piece_threshold_mode",
+        "divider_detection_count",
+        "source_half_estimation_count",
+        "background_estimation_count",
+        "scanline_mask_build_count",
     )
 
     def __init__(self):
@@ -535,6 +646,17 @@ class SourceProjectiveRecognition:
         self.source_half_state = None
         self.scanline_mask = None
         self._corner_key = None
+        self.divider_confirmations = 0
+        self.divider_frozen = False
+        self._last_divider_sample_id = None
+        self.source_half_frozen = False
+        self.background_stats = None
+        self.piece_threshold = None
+        self.piece_threshold_mode = None
+        self.divider_detection_count = 0
+        self.source_half_estimation_count = 0
+        self.background_estimation_count = 0
+        self.scanline_mask_build_count = 0
 
     def reset(self, generation=None):
         self.mapper = None
@@ -545,6 +667,71 @@ class SourceProjectiveRecognition:
         self.source_half_state = None
         self.scanline_mask = None
         self._corner_key = None
+        self.divider_confirmations = 0
+        self.divider_frozen = False
+        self._last_divider_sample_id = None
+        self.source_half_frozen = False
+        self.background_stats = None
+        self.piece_threshold = None
+        self.piece_threshold_mode = None
+        self.divider_detection_count = 0
+        self.source_half_estimation_count = 0
+        self.background_estimation_count = 0
+        self.scanline_mask_build_count = 0
+
+    def _invalidate_geometry_dependents(self, generation):
+        self.divider_tracker.reset(generation)
+        self.divider = None
+        self.source_side = None
+        self.source_half_state = None
+        self.scanline_mask = None
+        self.divider_confirmations = 0
+        self.divider_frozen = False
+        self._last_divider_sample_id = None
+        self.source_half_frozen = False
+        self.background_stats = None
+        self.piece_threshold = None
+        self.piece_threshold_mode = None
+
+    def _build_scanline_mask(self, source_side):
+        mask_started = PERF_STATS.mark()
+        self.scanline_mask = SourceScanlineMask(
+            self.mapper, self.divider, source_side
+        )
+        PERF_STATS.add_stage("source_mask_build_ms", mask_started)
+        self.scanline_mask_build_count += 1
+        return self.scanline_mask
+
+    def _add_state_diagnostics(
+        self,
+        diagnostics,
+        divider_required,
+        background_reused=False,
+        threshold_reused=False,
+        scanline_mask_reused=False,
+    ):
+        diagnostics.update(
+            {
+                "divider_confirmations": self.divider_confirmations,
+                "divider_required_confirmations": divider_required,
+                "divider_frozen": self.divider_frozen,
+                "source_half_frozen": self.source_half_frozen,
+                "background_cached": bool(background_reused),
+                "threshold_cached": bool(threshold_reused),
+                "scanline_mask_reused": bool(scanline_mask_reused),
+                "divider_detection_count": self.divider_detection_count,
+                "source_half_estimation_count": (
+                    self.source_half_estimation_count
+                ),
+                "background_estimation_count": (
+                    self.background_estimation_count
+                ),
+                "scanline_mask_build_count": (
+                    self.scanline_mask_build_count
+                ),
+            }
+        )
+        return diagnostics
 
     def _update_mapper(self, corners_source_px, width, height, generation):
         corner_key = tuple(
@@ -556,6 +743,7 @@ class SourceProjectiveRecognition:
             self.reset(generation)
         if self.mapper is not None and corner_key == self._corner_key:
             return False
+        replacing_mapper = self.mapper is not None
         build_started = PERF_STATS.mark()
         self.mapper = A4ProjectiveMapper(
             corners_source_px,
@@ -566,7 +754,10 @@ class SourceProjectiveRecognition:
         )
         PERF_STATS.add_stage("a4_map_build_ms", build_started)
         self._corner_key = corner_key
-        self.scanline_mask = None
+        if replacing_mapper:
+            self._invalidate_geometry_dependents(generation)
+        else:
+            self.scanline_mask = None
         return True
 
     def detect(
@@ -576,6 +767,7 @@ class SourceProjectiveRecognition:
         generation,
         threshold=None,
         collect_sanity=False,
+        sample_id=None,
     ):
         width = int(gray_image.width())
         height = int(gray_image.height())
@@ -583,45 +775,174 @@ class SourceProjectiveRecognition:
             corners_source_px, width, height, generation
         )
         if self.mapper is None or not self.mapper.valid:
-            return [], _empty_diagnostics(
+            diagnostics = _empty_diagnostics(
                 gray_image,
                 self.mapper,
                 None,
                 generation,
                 "invalid_mapper",
             )
-        divider_started = PERF_STATS.mark()
-        detected_divider = detect_source_divider(gray_image, self.mapper)
-        self.divider = self.divider_tracker.update(
-            detected_divider, generation
+            return [], self._add_state_diagnostics(
+                diagnostics,
+                max(
+                    1,
+                    int(
+                        getattr(
+                            cfg,
+                            "SOURCE_PROJECTIVE_DIVIDER_CONFIRM_DETECTIONS",
+                            2,
+                        )
+                    ),
+                ),
+            )
+        freeze_divider = bool(
+            getattr(cfg, "SOURCE_PROJECTIVE_FREEZE_DIVIDER", False)
         )
-        PERF_STATS.add_stage("divider_detect_ms", divider_started)
-        if not self.divider.get("detected", False):
-            return [], _empty_diagnostics(
+        divider_required = max(
+            1,
+            int(
+                getattr(
+                    cfg,
+                    "SOURCE_PROJECTIVE_DIVIDER_CONFIRM_DETECTIONS",
+                    2,
+                )
+            ),
+        )
+        same_sample = bool(
+            freeze_divider
+            and sample_id is not None
+            and sample_id == self._last_divider_sample_id
+        )
+        if not self.divider_frozen and not same_sample:
+            divider_started = PERF_STATS.mark()
+            detected_divider = detect_source_divider(
+                gray_image, self.mapper
+            )
+            self.divider_detection_count += 1
+            self.divider = self.divider_tracker.update(
+                detected_divider, generation
+            )
+            PERF_STATS.add_stage("divider_detect_ms", divider_started)
+            self.scanline_mask = None
+            self.background_stats = None
+            self.piece_threshold = None
+            self.piece_threshold_mode = None
+            self.source_half_frozen = False
+            if freeze_divider:
+                self._last_divider_sample_id = sample_id
+                if detected_divider.get("detected", False):
+                    self.divider_confirmations += 1
+                else:
+                    self.divider_confirmations = 0
+                if (
+                    self.divider_confirmations >= divider_required
+                    and self.divider is not None
+                    and self.divider.get("detected", False)
+                ):
+                    self.divider_frozen = True
+                    self.divider["frozen"] = True
+            else:
+                self.divider_confirmations = int(
+                    bool(
+                        self.divider
+                        and self.divider.get("detected", False)
+                    )
+                )
+        if not self.divider or not self.divider.get("detected", False):
+            diagnostics = _empty_diagnostics(
                 gray_image,
                 self.mapper,
                 self.divider,
                 generation,
                 "divider_required",
             )
-        neutral_mask = SourceScanlineMask(
-            self.mapper, self.divider, "top"
+            return [], self._add_state_diagnostics(
+                diagnostics, divider_required
+            )
+        if freeze_divider and not self.divider_frozen:
+            diagnostics = _empty_diagnostics(
+                gray_image,
+                self.mapper,
+                self.divider,
+                generation,
+                "divider_confirming",
+            )
+            return [], self._add_state_diagnostics(
+                diagnostics, divider_required
+            )
+
+        mask_was_reusable = bool(
+            self.scanline_mask is not None
+            and self.scanline_mask.source_side
+            == (self.source_side or "top")
         )
-        background_stats = _background_stats_from_a4(
-            gray_image.to_numpy_ref(), neutral_mask
+        neutral_mask = self.scanline_mask
+        if neutral_mask is None:
+            neutral_mask = self._build_scanline_mask(
+                self.source_side or "top"
+            )
+        cache_background = bool(
+            getattr(cfg, "SOURCE_PROJECTIVE_CACHE_BACKGROUND", False)
         )
-        provisional_threshold, _mode = _source_threshold(
-            background_stats, threshold
+        background_reused = bool(
+            cache_background and self.background_stats is not None
         )
-        half_state = estimate_source_half(
-            gray_image,
-            self.mapper,
-            self.divider,
-            provisional_threshold,
+        if background_reused:
+            background_stats = self.background_stats
+        else:
+            background_started = PERF_STATS.mark()
+            background_stats = _background_stats_from_a4(
+                gray_image.to_numpy_ref(), neutral_mask
+            )
+            PERF_STATS.add_stage(
+                "source_background_ms", background_started
+            )
+            self.background_estimation_count += 1
+            if cache_background:
+                self.background_stats = background_stats
+
+        threshold_reused = bool(
+            cache_background
+            and threshold is None
+            and self.piece_threshold is not None
         )
-        self.source_half_state = half_state
-        if self.source_side is None and half_state["valid"]:
-            self.source_side = half_state["side"]
+        if threshold_reused:
+            provisional_threshold = self.piece_threshold
+            threshold_mode = self.piece_threshold_mode
+        else:
+            provisional_threshold, threshold_mode = _source_threshold(
+                background_stats, threshold
+            )
+            if cache_background and threshold is None:
+                self.piece_threshold = provisional_threshold
+                self.piece_threshold_mode = threshold_mode
+
+        freeze_source_half = bool(
+            getattr(cfg, "SOURCE_PROJECTIVE_FREEZE_SOURCE_HALF", False)
+        )
+        if (
+            freeze_source_half
+            and self.source_half_frozen
+            and self.source_half_state is not None
+        ):
+            half_state = self.source_half_state
+        else:
+            half_started = PERF_STATS.mark()
+            half_state = estimate_source_half(
+                gray_image,
+                self.mapper,
+                self.divider,
+                provisional_threshold,
+                scanline_mask=neutral_mask,
+            )
+            PERF_STATS.add_stage("source_half_ms", half_started)
+            self.source_half_estimation_count += 1
+            self.source_half_state = half_state
+            if half_state["valid"]:
+                if self.source_side is None:
+                    self.source_side = half_state["side"]
+                if self.source_side == half_state["side"]:
+                    self.source_half_frozen = freeze_source_half
         if self.source_side is None:
             diagnostics = _empty_diagnostics(
                 gray_image,
@@ -631,12 +952,16 @@ class SourceProjectiveRecognition:
                 half_state["reason"],
             )
             diagnostics["source_half"] = half_state
-            return [], diagnostics
-        # Rebuild after every accepted mapper/divider update; ordinary pixel
-        # loops then use only row spans, never point-in-polygon tests.
-        self.scanline_mask = SourceScanlineMask(
-            self.mapper, self.divider, self.source_side
-        )
+            return [], self._add_state_diagnostics(
+                diagnostics,
+                divider_required,
+                background_reused=background_reused,
+                threshold_reused=threshold_reused,
+                scanline_mask_reused=mask_was_reusable,
+            )
+        if self.scanline_mask.source_side != self.source_side:
+            self._build_scanline_mask(self.source_side)
+            mask_was_reusable = False
         observations, diagnostics = (
             detect_pieces_from_source_projective_image(
                 gray_image,
@@ -648,8 +973,21 @@ class SourceProjectiveRecognition:
                 source_side=self.source_side,
                 scanline_mask=self.scanline_mask,
                 generation=generation,
+                background_stats=background_stats,
+                prepared_threshold=(
+                    provisional_threshold, threshold_mode
+                ),
+                mask_mode=getattr(
+                    cfg, "SOURCE_PROJECTIVE_MASK_MODE", "blacken"
+                ),
             )
         )
         diagnostics["source_half"] = half_state
         diagnostics["source_half_selected"] = self.source_side
-        return observations, diagnostics
+        return observations, self._add_state_diagnostics(
+            diagnostics,
+            divider_required,
+            background_reused=background_reused,
+            threshold_reused=threshold_reused,
+            scanline_mask_reused=mask_was_reusable,
+        )

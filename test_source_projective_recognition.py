@@ -301,6 +301,10 @@ class DividerAndPieceTests(unittest.TestCase):
             "PIECE_SEGMENTATION_MODE": cfg.PIECE_SEGMENTATION_MODE,
             "PIECE_CONTOUR_MIN_GRAY_THRESHOLD": cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD,
             "FORCE_CONVEX_CONTOURS": cfg.FORCE_CONVEX_CONTOURS,
+            "SOURCE_PROJECTIVE_FREEZE_DIVIDER": cfg.SOURCE_PROJECTIVE_FREEZE_DIVIDER,
+            "SOURCE_PROJECTIVE_FREEZE_SOURCE_HALF": cfg.SOURCE_PROJECTIVE_FREEZE_SOURCE_HALF,
+            "SOURCE_PROJECTIVE_CACHE_BACKGROUND": cfg.SOURCE_PROJECTIVE_CACHE_BACKGROUND,
+            "SOURCE_PROJECTIVE_MASK_MODE": cfg.SOURCE_PROJECTIVE_MASK_MODE,
         }
         cfg.PIECE_SEGMENTATION_MODE = "background_delta"
         cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 100
@@ -445,8 +449,140 @@ class DividerAndPieceTests(unittest.TestCase):
                 [piece.contour_px for piece in baseline],
             )
 
+    def test_bbox_filter_matches_blacken_without_mutating_image(self):
+        array, mapper, _pieces = _scene()
+        divider = detect_source_divider(_SourceGrayImage(array), mapper)
+        mask = SourceScanlineMask(mapper, divider, "top")
+        blackened_array = array.copy()
+        baseline, baseline_diagnostics = (
+            detect_pieces_from_source_projective_image(
+                _SourceGrayImage(blackened_array),
+                mapper,
+                divider,
+                source_side="top",
+                scanline_mask=mask,
+                generation=1,
+                mask_mode="blacken",
+            )
+        )
+        bbox_array = array.copy()
+        optimized, optimized_diagnostics = (
+            detect_pieces_from_source_projective_image(
+                _SourceGrayImage(bbox_array),
+                mapper,
+                divider,
+                source_side="top",
+                scanline_mask=mask,
+                generation=1,
+                mask_mode="bbox_filter",
+            )
+        )
+        self.assertEqual(
+            [piece.contour_px for piece in optimized],
+            [piece.contour_px for piece in baseline],
+        )
+        self.assertFalse(np.array_equal(blackened_array, array))
+        self.assertTrue(np.array_equal(bbox_array, array))
+        self.assertGreater(
+            baseline_diagnostics["source_masked_pixels"], 0
+        )
+        self.assertEqual(
+            optimized_diagnostics["source_masked_pixels"], 0
+        )
+        self.assertEqual(
+            optimized_diagnostics["source_mask_mode"], "bbox_filter"
+        )
+
+    def test_static_scene_freezes_and_reuses_calibration_work(self):
+        cfg.SOURCE_PROJECTIVE_FREEZE_DIVIDER = True
+        cfg.SOURCE_PROJECTIVE_FREEZE_SOURCE_HALF = True
+        cfg.SOURCE_PROJECTIVE_CACHE_BACKGROUND = True
+        cfg.SOURCE_PROJECTIVE_MASK_MODE = "bbox_filter"
+        array, mapper, _pieces = _scene()
+        recognizer = SourceProjectiveRecognition()
+
+        first, first_diagnostics = recognizer.detect(
+            _SourceGrayImage(array.copy()),
+            mapper.a4_polygon_source_px,
+            generation=4,
+            sample_id=1,
+        )
+        same_frame, retry_diagnostics = recognizer.detect(
+            _SourceGrayImage(array.copy()),
+            mapper.a4_polygon_source_px,
+            generation=4,
+            sample_id=1,
+        )
+        second, second_diagnostics = recognizer.detect(
+            _SourceGrayImage(array.copy()),
+            mapper.a4_polygon_source_px,
+            generation=4,
+            sample_id=2,
+        )
+        third, third_diagnostics = recognizer.detect(
+            _SourceGrayImage(array.copy()),
+            mapper.a4_polygon_source_px,
+            generation=4,
+            sample_id=3,
+        )
+
+        self.assertEqual(first, [])
+        self.assertEqual(same_frame, [])
+        self.assertEqual(first_diagnostics["reason"], "divider_confirming")
+        self.assertEqual(retry_diagnostics["divider_confirmations"], 1)
+        self.assertEqual(retry_diagnostics["divider_detection_count"], 1)
+        self.assertEqual(len(second), 3, second_diagnostics)
+        self.assertEqual(len(third), 3, third_diagnostics)
+        self.assertTrue(second_diagnostics["divider_frozen"])
+        self.assertTrue(second_diagnostics["source_half_frozen"])
+        self.assertEqual(third_diagnostics["divider_detection_count"], 2)
+        self.assertEqual(third_diagnostics["source_half_estimation_count"], 1)
+        self.assertEqual(third_diagnostics["background_estimation_count"], 1)
+        self.assertEqual(third_diagnostics["scanline_mask_build_count"], 1)
+        self.assertTrue(third_diagnostics["scanline_mask_reused"])
+        self.assertTrue(third_diagnostics["background_cached"])
+        self.assertTrue(third_diagnostics["threshold_cached"])
+
 
 class RelockTests(unittest.TestCase):
+    def test_continuous_tracker_can_freeze_after_initial_lock(self):
+        tracker = A4BoundaryTracker(continuous=True)
+        base_corners = [(10, 10), (210, 10), (210, 310), (10, 310)]
+        old_required = cfg.A4_LOCK_REQUIRED_FRAMES
+        old_spread = cfg.A4_LOCK_MAX_SPREAD_PX
+        cfg.A4_LOCK_REQUIRED_FRAMES = 2
+        cfg.A4_LOCK_MAX_SPREAD_PX = 2.0
+        try:
+            for offset in (0.5, -0.5):
+                state = tracker.update(
+                    {
+                        "corners_px": [
+                            (point[0] + offset, point[1])
+                            for point in base_corners
+                        ],
+                        "confidence": 0.9,
+                        "source": "test",
+                    }
+                )
+            self.assertTrue(state["locked"])
+            frozen = tracker.freeze()
+            frozen_corners = list(frozen["corners_px"])
+            moved = tracker.update(
+                {
+                    "corners_px": [
+                        (point[0] + 30.0, point[1])
+                        for point in base_corners
+                    ],
+                    "confidence": 0.9,
+                    "source": "test",
+                }
+            )
+        finally:
+            cfg.A4_LOCK_REQUIRED_FRAMES = old_required
+            cfg.A4_LOCK_MAX_SPREAD_PX = old_spread
+        self.assertTrue(moved["frozen"])
+        self.assertEqual(moved["corners_px"], frozen_corners)
+
     def test_continuous_tracker_invalidates_then_increments_generation(self):
         tracker = A4BoundaryTracker(continuous=True)
         base_corners = [(10, 10), (210, 10), (210, 310), (10, 310)]

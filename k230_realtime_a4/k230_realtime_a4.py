@@ -1160,6 +1160,7 @@ def _detect_frame_pieces(
     work_height=None,
     source_recognizer=None,
     calibration_generation=0,
+    recognition_sample_id=None,
 ):
     if _source_projective_mode():
         work_width = int(cfg.SOURCE_PROJECTIVE_WORK_WIDTH)
@@ -1187,6 +1188,7 @@ def _detect_frame_pieces(
             calibration_generation,
             threshold=threshold,
             collect_sanity=collect_sanity,
+            sample_id=recognition_sample_id,
         )
         diagnostics["projection_closure"] = {
             "max_px": 0.0,
@@ -1671,7 +1673,9 @@ def _print_piece_diagnostics(
         print(
             "SOURCE_PIECE_DETECT,frame={},generation={},work={}x{},"
             "threshold={},raw_blobs={},accepted={},vertices={},"
-            "areas_mm2={},rotation_corr_calls={}".format(
+            "areas_mm2={},rotation_corr_calls={},mask_mode={},"
+            "masked_px={},mask_reused={},background_cached={},"
+            "threshold_cached={}".format(
                 frame_index,
                 diagnostics.get("generation", 0),
                 diagnostics.get("recognition_width", 0),
@@ -1687,6 +1691,11 @@ def _print_piece_diagnostics(
                     for piece in pieces
                 ) or "none",
                 diagnostics.get("rotation_corr_calls", 0),
+                diagnostics.get("source_mask_mode", "pending"),
+                diagnostics.get("source_masked_pixels", 0),
+                int(diagnostics.get("scanline_mask_reused", False)),
+                int(diagnostics.get("background_cached", False)),
+                int(diagnostics.get("threshold_cached", False)),
             )
         )
         print(
@@ -1851,6 +1860,12 @@ def main():
     _audit_runtime_api()
     auto_calibrate_a4 = bool(cfg.AUTO_CALIBRATE_A4)
     source_projective = _source_projective_mode()
+    freeze_source_a4 = bool(
+        source_projective
+        and getattr(
+            cfg, "SOURCE_PROJECTIVE_FREEZE_A4_AFTER_LOCK", False
+        )
+    )
     boundary_tracker = (
         A4BoundaryTracker(continuous=source_projective)
         if auto_calibrate_a4
@@ -1950,7 +1965,7 @@ def main():
             "START_REALTIME_A4,frame={}x{},camera={},boundary={}x{},"
             "a4_refine={}x{}|{},"
             "piece_work={}x{},piece_final={}x{},"
-            "a4_every={},piece_every={},"
+            "a4_acquire_every={},a4_locked_every={},piece_every={},"
             "debug_camera={},planner={},"
             "source_clear={:.2f}|{},a4_hold_misses={},"
             "piece_segment={},piece_deltas={}|{},"
@@ -1997,6 +2012,13 @@ def main():
                     else cfg.REALTIME_PIECE_FINAL_HEIGHT
                 ),
                 cfg.A4_DETECT_INTERVAL_ACQUIRE,
+                (
+                    "off"
+                    if freeze_source_a4
+                    else cfg.A4_TRACK_EVERY_N_FRAMES
+                    if source_projective
+                    else "off"
+                ),
                 cfg.PIECE_DETECT_EVERY_N_FRAMES,
                 int(cfg.DEBUG_SHOW_CAMERA),
                 ACTIVE_PLANNER,
@@ -2067,7 +2089,9 @@ def main():
                 ),
                 (
                     (
-                        "automatic_continuous_relock"
+                        "automatic_initial_lock_frozen"
+                        if freeze_source_a4
+                        else "automatic_continuous_relock"
                         if source_projective
                         else "automatic_initial_lock_frozen"
                     )
@@ -2159,6 +2183,7 @@ def main():
                         (
                             cfg.A4_TRACK_EVERY_N_FRAMES
                             if source_projective
+                            and not freeze_source_a4
                             else None
                         ),
                     )
@@ -2255,7 +2280,9 @@ def main():
                         a4_state = boundary_tracker.update(
                             candidate
                         )
-                        if a4_state["locked"] and not source_projective:
+                        if a4_state["locked"] and (
+                            not source_projective or freeze_source_a4
+                        ):
                             a4_state = boundary_tracker.freeze()
                         PERF_STATS.add_stage(
                             "a4_detect_ms", a4_started
@@ -2312,6 +2339,9 @@ def main():
                                 source_recognizer=source_recognizer,
                                 calibration_generation=a4_state.get(
                                     "calibration_generation", 0
+                                ),
+                                recognition_sample_id=(
+                                    piece_detection_count
                                 ),
                             )
                         )
@@ -2375,6 +2405,9 @@ def main():
                                 source_recognizer=source_recognizer,
                                 calibration_generation=a4_state.get(
                                     "calibration_generation", 0
+                                ),
+                                recognition_sample_id=(
+                                    piece_detection_count
                                 ),
                             )
                             if len(retry_pieces) > len(pieces):
@@ -2452,7 +2485,8 @@ def main():
                                 "SOURCE_DIVIDER,frame={},generation={},"
                                 "detected={},coverage={:.2f},contrast={:.1f},"
                                 "residual_px={:.2f},mean_y_mm={:.2f},"
-                                "slope_mm={:.2f},confidence={:.2f},held={}".format(
+                                "slope_mm={:.2f},confidence={:.2f},held={},"
+                                "confirmations={}/{},frozen={},detect_calls={}".format(
                                     frame_index,
                                     a4_state.get(
                                         "calibration_generation", 0
@@ -2489,11 +2523,27 @@ def main():
                                             )
                                         )
                                     ),
+                                    piece_diagnostics.get(
+                                        "divider_confirmations", 0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_required_confirmations", 1
+                                    ),
+                                    int(
+                                        piece_diagnostics.get(
+                                            "divider_frozen", False
+                                        )
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_detection_count", 0
+                                    ),
                                 )
                             )
                             print(
                                 "SOURCE_HALF,side={},bright_a={},bright_b={},"
-                                "confidence={:.2f},reason={}".format(
+                                "confidence={:.2f},reason={},frozen={},"
+                                "estimate_calls={},background_calls={},"
+                                "mask_builds={}".format(
                                     piece_diagnostics.get(
                                         "source_half_selected",
                                         half_state.get("side", "none"),
@@ -2507,6 +2557,20 @@ def main():
                                         piece_diagnostics.get(
                                             "reason", "unknown"
                                         ),
+                                    ),
+                                    int(
+                                        piece_diagnostics.get(
+                                            "source_half_frozen", False
+                                        )
+                                    ),
+                                    piece_diagnostics.get(
+                                        "source_half_estimation_count", 0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "background_estimation_count", 0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "scanline_mask_build_count", 0
                                     ),
                                 )
                             )
@@ -2860,6 +2924,9 @@ def main():
                                 source_recognizer=source_recognizer,
                                 calibration_generation=a4_state.get(
                                     "calibration_generation", 0
+                                ),
+                                recognition_sample_id=(
+                                    piece_detection_count
                                 ),
                             )
                         )

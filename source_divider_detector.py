@@ -447,9 +447,19 @@ def _sample_half(gray_array, rows, stride, threshold):
     return bright, samples
 
 
-def estimate_source_half(gray_image, mapper, divider, threshold):
+def estimate_source_half(
+    gray_image,
+    mapper,
+    divider,
+    threshold,
+    scanline_mask=None,
+):
     """Choose the half with clearly greater bright-fragment area."""
-    neutral_mask = SourceScanlineMask(mapper, divider, "top")
+    neutral_mask = (
+        scanline_mask
+        if scanline_mask is not None
+        else SourceScanlineMask(mapper, divider, "top")
+    )
     gray_array = gray_image.to_numpy_ref()
     stride = max(
         1, int(getattr(cfg, "SOURCE_HALF_SAMPLE_STRIDE", 3))

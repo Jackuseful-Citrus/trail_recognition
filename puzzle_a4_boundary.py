@@ -1087,10 +1087,10 @@ class A4BoundaryTracker:
         return self.state()
 
     def update(self, candidate):
-        if self.continuous:
-            return self._continuous_update(candidate)
         if self.frozen:
             return self.state()
+        if self.continuous:
+            return self._continuous_update(candidate)
         if candidate is None:
             self.missed_frames += 1
             # Lock acquisition requires truly consecutive valid frames.
@@ -1215,8 +1215,6 @@ class A4BoundaryTracker:
 
     def freeze(self):
         """Make the first locked calibration immutable until process restart."""
-        if self.continuous:
-            return self.state()
         if self.locked and self.corners_px is not None:
             self.frozen = True
             self.motion_px = 0.0
