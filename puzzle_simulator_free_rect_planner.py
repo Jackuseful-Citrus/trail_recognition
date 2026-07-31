@@ -220,8 +220,53 @@ def _free_figure2_fit(observed, template, scale):
                     ),
                     "direction": direction,
                     "offset": offset,
+                    "observed_center": observed_center,
+                    "template_center": template_center,
                 }
     return best
+
+
+def _free_figure2_short_edge_variant(template):
+    """Return the known Figure-2 contour after its 10 mm edge is merged."""
+    count = len(template)
+    index = min(
+        range(count),
+        key=lambda value: _free_distance(
+            template[value], template[(value + 1) % count]
+        ),
+    )
+    following = (index + 1) % count
+    midpoint = (
+        0.5 * (template[index][0] + template[following][0]),
+        0.5 * (template[index][1] + template[following][1]),
+    )
+    if following == 0:
+        return tuple([midpoint] + list(template[1:index]))
+    return tuple(
+        list(template[:index])
+        + [midpoint]
+        + list(template[following + 1 :])
+    )
+
+
+def _free_figure2_permutations(values):
+    """Yield the 24 four-item assignments without depending on itertools."""
+    for first in range(4):
+        for second in range(4):
+            if second == first:
+                continue
+            for third in range(4):
+                if third == first or third == second:
+                    continue
+                for fourth in range(4):
+                    if fourth in (first, second, third):
+                        continue
+                    yield (
+                        values[first],
+                        values[second],
+                        values[third],
+                        values[fourth],
+                    )
 
 
 def _free_figure2_assignment(pieces, source_area):
@@ -360,6 +405,171 @@ def _free_figure2_match(pieces, source_area):
     return match, None
 
 
+def _free_figure2_three_of_four_match(pieces, source_area):
+    """Recover the fixed set when only its 10 mm-edge piece was simplified.
+
+    The ordinary matcher remains authoritative whenever all four contours
+    match.  This narrow fallback requires three independently valid template
+    fits, then uses the known short-edge variant only to recover the pose and
+    original centroid of the remaining MIDDLE_LEFT piece.
+    """
+    if not bool(
+        getattr(cfg, "FREE_RECT_FIGURE2_DIRECT_ENABLED", True)
+    ):
+        return None, "disabled"
+    if len(pieces) != 4 or source_area <= EPS:
+        return None, "three_of_four_requires_four_pieces"
+
+    area_tolerance = float(
+        getattr(
+            cfg,
+            "FREE_RECT_FIGURE2_AREA_RATIO_TOLERANCE",
+            0.06,
+        )
+    )
+    rms_tolerance = float(
+        getattr(
+            cfg,
+            "FREE_RECT_FIGURE2_RMS_TOLERANCE_MM",
+            6.0,
+        )
+    )
+    vertex_tolerance = float(
+        getattr(
+            cfg,
+            "FREE_RECT_FIGURE2_MAX_VERTEX_TOLERANCE_MM",
+            10.0,
+        )
+    )
+    scale = math.sqrt(FIGURE2_RECT_AREA_MM2 / source_area)
+    indexed = list(enumerate(pieces))
+    best = None
+
+    for ordered in _free_figure2_permutations(indexed):
+        assignment = {
+            role: ordered[index]
+            for index, role in enumerate(FIGURE2_TEMPLATE_ORDER)
+        }
+        ratio_errors = {
+            role: abs(
+                float(assignment[role][1].area_mm2)
+                / source_area
+                - FIGURE2_TEMPLATE_AREA_RATIOS[role]
+            )
+            for role in FIGURE2_TEMPLATE_ORDER
+        }
+        if sum(
+            1
+            for role in FIGURE2_TEMPLATE_ORDER
+            if ratio_errors[role] <= area_tolerance
+        ) < 3:
+            continue
+
+        for layout in ("NORMAL", "MIRROR_X"):
+            templates = _free_figure2_layout_polygons(layout)
+            fits = {}
+            matched_roles = []
+            for role in FIGURE2_TEMPLATE_ORDER:
+                fit = _free_figure2_fit(
+                    assignment[role][1].polygon_mm,
+                    templates[role],
+                    scale,
+                )
+                fits[role] = fit
+                if (
+                    ratio_errors[role] <= area_tolerance
+                    and fit is not None
+                    and fit["rms_mm"] <= rms_tolerance
+                    and fit["max_mm"] <= vertex_tolerance
+                ):
+                    matched_roles.append(role)
+
+            if len(matched_roles) != 3:
+                continue
+            inferred_roles = [
+                role
+                for role in FIGURE2_TEMPLATE_ORDER
+                if role not in matched_roles
+            ]
+            inferred_role = inferred_roles[0]
+            if inferred_role != "MIDDLE_LEFT":
+                continue
+
+            inferred_fit = fits[inferred_role]
+            if inferred_fit is None:
+                recovery_template = _free_figure2_short_edge_variant(
+                    templates[inferred_role]
+                )
+                inferred_fit = _free_figure2_fit(
+                    assignment[inferred_role][1].polygon_mm,
+                    recovery_template,
+                    scale,
+                )
+            if inferred_fit is None:
+                continue
+
+            # Recover the true centroid that existed before the 10 mm edge was
+            # collapsed.  The fit angle maps measured coordinates into the
+            # fixed template, so apply its inverse to the centroid offset.
+            fixed_center = polygon_centroid(
+                templates[inferred_role]
+            )
+            fitted_center = inferred_fit["template_center"]
+            dx = fixed_center[0] - fitted_center[0]
+            dy = fixed_center[1] - fitted_center[1]
+            angle = math.radians(inferred_fit["rotation_deg"])
+            cosine = math.cos(angle)
+            sine = math.sin(angle)
+            observed_center = inferred_fit["observed_center"]
+            inferred_fit["source_center_mm"] = (
+                observed_center[0]
+                + (cosine * dx + sine * dy) / scale,
+                observed_center[1]
+                + (-sine * dx + cosine * dy) / scale,
+            )
+            inferred_fit["short_edge_fit_cancelled"] = True
+            fits[inferred_role] = inferred_fit
+
+            maximum_rms = max(
+                fits[role]["rms_mm"] for role in matched_roles
+            )
+            maximum_vertex = max(
+                fits[role]["max_mm"] for role in matched_roles
+            )
+            total_rms = sum(
+                fits[role]["rms_mm"] for role in matched_roles
+            )
+            key = (
+                maximum_rms,
+                maximum_vertex,
+                total_rms,
+                sum(ratio_errors[role] for role in matched_roles),
+                layout,
+            )
+            if best is None or key < best["key"]:
+                best = {
+                    "key": key,
+                    "layout": layout,
+                    "templates": templates,
+                    "fits": fits,
+                    "maximum_rms_mm": maximum_rms,
+                    "maximum_vertex_mm": maximum_vertex,
+                    "total_rms_mm": total_rms,
+                    "assignment": assignment,
+                    "area_ratio_errors": ratio_errors,
+                    "global_similarity_scale": scale,
+                    "matched_piece_count": 3,
+                    "matched_roles": tuple(matched_roles),
+                    "inferred_roles": (inferred_role,),
+                    "short_edge_fit_cancelled": True,
+                }
+
+    if best is None:
+        return None, "three_of_four_fixed_template_not_matched"
+    best.pop("key", None)
+    return best, None
+
+
 def match_fixed_figure2_piece_set(pieces):
     """Return the reusable fixed Figure 2 match evaluation."""
     pieces = list(pieces)
@@ -375,7 +585,19 @@ def match_fixed_figure2_piece_set(pieces):
         for piece in pieces
     ):
         return None, "invalid_source_polygon"
-    return _free_figure2_match(pieces, source_area)
+    match, reason = _free_figure2_match(pieces, source_area)
+    if match is not None:
+        match["matched_piece_count"] = 4
+        match["matched_roles"] = FIGURE2_TEMPLATE_ORDER
+        match["inferred_roles"] = ()
+        match["short_edge_fit_cancelled"] = False
+        return match, None
+    recovered, recovered_reason = (
+        _free_figure2_three_of_four_match(pieces, source_area)
+    )
+    if recovered is not None:
+        return recovered, None
+    return None, "{};{}".format(reason, recovered_reason)
 
 
 def is_fixed_figure2_piece_set(pieces):
@@ -424,7 +646,12 @@ def _free_figure2_direct_result(
             origin_x + local_center[0],
             origin_y + local_center[1],
         )
-        source_center = piece.centroid_mm
+        short_edge_fit_cancelled = bool(
+            fit.get("short_edge_fit_cancelled", False)
+        )
+        source_center = fit.get(
+            "source_center_mm", piece.centroid_mm
+        )
         angle_deg = normalize_angle_deg(
             fit["rotation_deg"]
         )
@@ -446,9 +673,18 @@ def _free_figure2_direct_result(
             ),
             angle_deg,
         )
-        target_polygon = transform_polygon(
-            piece.polygon_mm, transform
-        )
+        if short_edge_fit_cancelled:
+            # The measured triangle is only the result of merging the real
+            # 10 mm edge.  Restore the known four-corner target instead of
+            # carrying that recognition artefact into the fixed plan.
+            target_polygon = [
+                (origin_x + point[0], origin_y + point[1])
+                for point in template
+            ]
+        else:
+            target_polygon = transform_polygon(
+                piece.polygon_mm, transform
+            )
         piece_id = getattr(
             piece, "piece_id", None
         ) or "P{}".format(_index + 1)
@@ -479,6 +715,9 @@ def _free_figure2_direct_result(
                 "rms_mm": fit["rms_mm"],
                 "max_vertex_mm": fit["max_mm"],
                 "rotation_deg": angle_deg,
+                "short_edge_fit_cancelled": (
+                    short_edge_fit_cancelled
+                ),
             }
         )
         maximum_fit_error = max(
@@ -488,7 +727,8 @@ def _free_figure2_direct_result(
             "FREE_FIXED_TEMPLATE_PIECE,role={},piece_id={},"
             "source_x={:.2f},source_y={:.2f},target_x={:.2f},"
             "target_y={:.2f},rotation_deg={:.2f},"
-            "fit_rms_mm={:.2f},fit_max_mm={:.2f}".format(
+            "fit_rms_mm={:.2f},fit_max_mm={:.2f},"
+            "short_edge_fit_cancelled={}".format(
                 role,
                 piece_id,
                 source_center[0],
@@ -498,6 +738,7 @@ def _free_figure2_direct_result(
                 angle_deg,
                 fit["rms_mm"],
                 fit["max_mm"],
+                int(short_edge_fit_cancelled),
             )
         )
 
@@ -530,6 +771,15 @@ def _free_figure2_direct_result(
             "engine": "simulator-free-rectangle-figure2-direct-k230",
             "plan_ms": elapsed_ms,
             "fixed_template_matched": True,
+            "fixed_template_matched_piece_count": match.get(
+                "matched_piece_count", 4
+            ),
+            "fixed_template_inferred_roles": match.get(
+                "inferred_roles", ()
+            ),
+            "short_edge_fit_cancelled": bool(
+                match.get("short_edge_fit_cancelled", False)
+            ),
             "fixed_template_layout": match["layout"],
             "enumeration_skipped": True,
             "safety_gates_applied": False,
@@ -1968,9 +2218,16 @@ def _plan_simulator_free_rectangle(
         if fixed_match is not None:
             print(
                 "FREE_FIXED_TEMPLATE_CHECK,matched=1,layout={},"
+                "matched_pieces={}/4,short_edge_fit_cancelled={},"
                 "max_area_ratio_error={:.4f},"
                 "max_fit_rms_mm={:.2f},max_fit_vertex_mm={:.2f}".format(
                     fixed_match["layout"],
+                    fixed_match.get("matched_piece_count", 4),
+                    int(
+                        fixed_match.get(
+                            "short_edge_fit_cancelled", False
+                        )
+                    ),
                     max(
                         fixed_match[
                             "area_ratio_errors"

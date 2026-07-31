@@ -2417,6 +2417,34 @@ def main():
                         pieces = last_pieces
                         stable = last_piece_stable
                     if stable and not final_refinement_done:
+                        fixed_before_refine, _fixed_reason = (
+                            match_fixed_figure2_piece_set(pieces)
+                        )
+                        if fixed_before_refine is not None:
+                            # Fixed mode already knows the fourth contour once
+                            # three pieces match.  Do not run the final contour
+                            # fit again: it can collapse the real 10 mm edge on
+                            # MIDDLE_LEFT and move its fitted centroid.
+                            final_refinement_done = True
+                            pending_reason = "fixed_template_ready"
+                            matched_count = fixed_before_refine.get(
+                                "matched_piece_count", 4
+                            )
+                            print(
+                                "PIECE_REFINE,frame={},status="
+                                "skipped_fixed_template,matched={}/4,"
+                                "short_edge_fit_cancelled={}".format(
+                                    frame_index,
+                                    matched_count,
+                                    int(
+                                        fixed_before_refine.get(
+                                            "short_edge_fit_cancelled",
+                                            False,
+                                        )
+                                    ),
+                                )
+                            )
+                    if stable and not final_refinement_done:
                         coarse_pieces = pieces
                         refined_pieces, refined_diagnostics = (
                             _detect_frame_pieces(

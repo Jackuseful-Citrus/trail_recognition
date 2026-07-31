@@ -367,6 +367,60 @@ class FreeRectanglePlannerTests(unittest.TestCase):
         )
         self.assertNotIn("FREE_PLAN_START", log)
 
+    def test_three_fixed_pieces_restore_merged_ten_mm_edge(self):
+        partition = []
+        for role in free_planner.FIGURE2_TEMPLATE_ORDER:
+            polygon = free_planner.FIGURE2_TEMPLATE_POLYGONS[role]
+            if role == "MIDDLE_LEFT":
+                polygon = (
+                    free_planner._free_figure2_short_edge_variant(
+                        polygon
+                    )
+                )
+            partition.append(polygon)
+        pieces = _make_pieces(partition)
+
+        match, reason = match_fixed_figure2_piece_set(pieces)
+        self.assertIsNotNone(match, reason)
+        self.assertEqual(match["matched_piece_count"], 3)
+        self.assertEqual(match["inferred_roles"], ("MIDDLE_LEFT",))
+        self.assertTrue(match["short_edge_fit_cancelled"])
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = plan_simulator_free_rectangle(
+                pieces,
+                fixed_template_evaluation=(match, None),
+            )
+        self.assertTrue(result.valid, result.reason)
+        self.assertEqual(
+            result.mode, free_planner.FIGURE2_DIRECT_MODE
+        )
+        self.assertEqual(
+            result.plan_stats["fixed_template_matched_piece_count"],
+            3,
+        )
+        self.assertTrue(
+            result.plan_stats["short_edge_fit_cancelled"]
+        )
+        middle_piece = match["assignment"]["MIDDLE_LEFT"][1]
+        self.assertEqual(
+            len(result.target_polygons[middle_piece.piece_id]), 4
+        )
+        self.assertNotEqual(
+            tuple(
+                operation["source_center_mm"]
+                for operation in result.operations
+                if operation["template_role"] == "MIDDLE_LEFT"
+            )[0],
+            middle_piece.centroid_mm,
+        )
+        self.assertIn("matched_pieces=3/4", output.getvalue())
+        self.assertIn(
+            "short_edge_fit_cancelled=1", output.getvalue()
+        )
+        self.assertNotIn("FREE_PLAN_START", output.getvalue())
+
     def test_frame_33_fixture_uses_direct_plan(self):
         _payload, pieces = _load_frame_33()
         self.assertTrue(is_fixed_figure2_piece_set(pieces))
