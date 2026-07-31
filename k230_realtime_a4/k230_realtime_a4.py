@@ -9,6 +9,24 @@ import image
 from media.display import Display
 from media.media import MediaManager
 
+UART_COMMUNICATION_ENABLED = globals().get(
+    "UART_COMMUNICATION_ENABLED", True
+)
+UART_IDE_DEBUG_MODE = not UART_COMMUNICATION_ENABLED
+UART_IMPORT_ERROR = (
+    "disabled_by_build" if UART_IDE_DEBUG_MODE else "none"
+)
+protocal_execute_plan = None
+if UART_COMMUNICATION_ENABLED:
+    try:
+        from protocal_puzzle_motion import protocal_execute_plan
+    except ImportError as exc:
+        # The IDE single-file runner does not upload the optional UART modules.
+        # Recognition and planning must remain usable without touching pins.
+        UART_COMMUNICATION_ENABLED = False
+        UART_IDE_DEBUG_MODE = True
+        UART_IMPORT_ERROR = str(exc).replace(",", ";")
+
 import realtime_a4_config as cfg
 from k230_puzzle_planner import (
     COLORS,
@@ -34,12 +52,10 @@ from puzzle_geometry import (
     PieceTracker,
     begin_plan_debug,
     end_plan_debug,
-    plan_outer_first_rectangle,
-    plan_rectangle_assembly,
     polygon_overlap_area,
 )
-from puzzle_simulator_planner import plan_simulator_rectangle
 from puzzle_simulator_free_rect_planner import (
+    match_fixed_figure2_piece_set,
     plan_simulator_free_rectangle,
 )
 from puzzle_placement import (
@@ -53,15 +69,17 @@ from puzzle_realtime_state import (
     MotionDetector,
     PieceCountConsensus,
     a4_detection_interval,
+    divider_overlay_endpoints,
     phase_allows_vision,
     operator_overlay_visibility,
     operator_status_line,
-    plan_frozen_pieces,
-    planning_input_integrity,
+    planning_input_integrity_unless_fixed_template,
     periodic_output_due,
+    recognition_gate_ready,
     should_render_ui,
     status_ui_key,
     top_right_thumbnail_rect,
+    tracking_expected_piece_count,
 )
 from puzzle_vision import (
     background_difference_threshold,
@@ -78,25 +96,8 @@ FINAL_PHASES = (
     "WAIT_FINAL_CHECK",
     "COMPLETE",
 )
-
-
-def _planner_selection():
-    backend = getattr(cfg, "PLANNER_BACKEND", "outer_first")
-    if backend == "simulator_free_rect":
-        return (
-            "simulator_free_rect",
-            plan_simulator_free_rectangle,
-            True,
-        )
-    if backend == "simulator":
-        return "simulator", plan_simulator_rectangle, True
-    prefer_unknown = (
-        cfg.TARGET_RECT_SIZE_MM is None
-        or cfg.PREFER_OUTER_FIRST_PLANNER
-    )
-    if prefer_unknown:
-        return "outer_first", plan_outer_first_rectangle, True
-    return "fixed_rectangle", plan_outer_first_rectangle, False
+ACTIVE_PLANNER = "simulator_free_rect"
+CYAN = (0, 255, 255)
 
 
 def _draw_quad(frame, corners, color, thickness=3):
@@ -156,22 +157,83 @@ def _draw_piece_overlay(
         )
 
 
+def _draw_source_raw_contours(
+    frame, raw_pieces, corners, diagnostics
+):
+    """Project rectified raw boundaries back onto the live camera image."""
+    if corners is None or not raw_pieces:
+        return
+    work_width = max(
+        2,
+        int(
+            (diagnostics or {}).get(
+                "recognition_width",
+                cfg.REALTIME_PIECE_WORK_WIDTH,
+            )
+        ),
+    )
+    work_height = max(
+        2,
+        int(
+            (diagnostics or {}).get(
+                "recognition_height",
+                cfg.REALTIME_PIECE_WORK_HEIGHT,
+            )
+        ),
+    )
+    max_points = max(
+        12,
+        int(
+            getattr(
+                cfg, "DEBUG_RECTIFIED_RAW_MAX_POINTS", 240
+            )
+        ),
+    )
+    for piece in raw_pieces:
+        boundary = piece.contour_px
+        if not boundary:
+            continue
+        step = max(
+            1,
+            int(len(boundary) / float(max_points) + 0.999),
+        )
+        projected = []
+        for point in boundary[::step]:
+            point_mm = (
+                float(point[0])
+                * cfg.A4_WIDTH_MM
+                / float(work_width - 1),
+                float(point[1])
+                * cfg.A4_HEIGHT_MM
+                / float(work_height - 1),
+            )
+            projected.append(
+                _a4_mm_to_frame(point_mm, corners)
+            )
+        _draw_polyline(
+            frame, projected, CYAN, thickness=1
+        )
+
+
 def _draw_a4_operator_overlay(
-    frame, corners, divider_y_mm=None
+    frame, corners, divider_state=None
 ):
     if corners is None:
         return
     _draw_quad(frame, corners, GREEN, thickness=3)
-    divider = (
-        cfg.DIVIDER_Y_MM
-        if divider_y_mm is None
-        else float(divider_y_mm)
+    endpoints = divider_overlay_endpoints(
+        divider_state, cfg.A4_WIDTH_MM
     )
+    # Never draw the nominal midpoint as if it were an observation.  Until a
+    # piece-stage strip has actually been confirmed, the A4 outline is the
+    # only calibration overlay shown.
+    if endpoints is None:
+        return
     divider_left = _a4_mm_to_frame(
-        (0.0, divider), corners
+        endpoints[0], corners
     )
     divider_right = _a4_mm_to_frame(
-        (cfg.A4_WIDTH_MM, divider), corners
+        endpoints[1], corners
     )
     frame.draw_line(
         int(divider_left[0]),
@@ -281,6 +343,9 @@ def _render_live_operator_view(
     motion_active,
     error,
     candidate=None,
+    divider_state=None,
+    raw_pieces=None,
+    piece_diagnostics=None,
 ):
     """Render the real grayscale feed with A4-space operator overlays."""
     base_error = None
@@ -317,7 +382,7 @@ def _render_live_operator_view(
     _draw_a4_operator_overlay(
         canvas,
         corners,
-        a4_state.get("divider_y_mm", cfg.DIVIDER_Y_MM),
+        divider_state,
     )
 
     if getattr(
@@ -344,6 +409,15 @@ def _render_live_operator_view(
                 "S:" if phase in FINAL_PHASES else ""
             ),
         )
+        if getattr(
+            cfg, "DEBUG_DRAW_SOURCE_RAW_CONTOURS", False
+        ):
+            _draw_source_raw_contours(
+                canvas,
+                raw_pieces,
+                corners,
+                piece_diagnostics,
+            )
     if visibility["targets"]:
         _draw_plan_target_overlay(
             canvas,
@@ -399,6 +473,8 @@ def _draw_gray_work_thumbnail(
     source_frame_index,
     threshold,
     contour_threshold,
+    raw_pieces=None,
+    diagnostics=None,
 ):
     """Draw a rectified A4-only grayscale image at the top-right."""
     if (
@@ -426,6 +502,88 @@ def _draw_gray_work_thumbnail(
             y_scale=scale,
             alpha=256,
         )
+        if getattr(
+            cfg, "DEBUG_DRAW_RECTIFIED_CONTOURS", False
+        ):
+            max_raw_points = max(
+                12,
+                int(
+                    getattr(
+                        cfg,
+                        "DEBUG_RECTIFIED_RAW_MAX_POINTS",
+                        240,
+                    )
+                ),
+            )
+            pixels_per_mm_x = float(
+                gray_image.width() - 1
+            ) / cfg.A4_WIDTH_MM
+            pixels_per_mm_y = float(
+                gray_image.height() - 1
+            ) / cfg.A4_HEIGHT_MM
+            for index, piece in enumerate(raw_pieces or ()):
+                raw_boundary = piece.contour_px
+                if raw_boundary:
+                    step = max(
+                        1,
+                        int(
+                            len(raw_boundary)
+                            / float(max_raw_points)
+                            + 0.999
+                        ),
+                    )
+                    raw_points = [
+                        (
+                            x + float(point[0]) * scale,
+                            y + float(point[1]) * scale,
+                        )
+                        for point in raw_boundary[::step]
+                    ]
+                    _draw_polyline(
+                        canvas,
+                        raw_points,
+                        CYAN,
+                        thickness=1,
+                    )
+                fitted_points = [
+                    (
+                        x
+                        + float(point[0])
+                        * pixels_per_mm_x
+                        * scale,
+                        y
+                        + float(point[1])
+                        * pixels_per_mm_y
+                        * scale,
+                    )
+                    for point in piece.polygon_mm
+                ]
+                color = COLORS[index % len(COLORS)]
+                _draw_polyline(
+                    canvas,
+                    fitted_points,
+                    color,
+                    thickness=2,
+                )
+                center_x = (
+                    x
+                    + piece.centroid_mm[0]
+                    * pixels_per_mm_x
+                    * scale
+                )
+                center_y = (
+                    y
+                    + piece.centroid_mm[1]
+                    * pixels_per_mm_y
+                    * scale
+                )
+                _draw_text(
+                    canvas,
+                    int(center_x) + 2,
+                    int(center_y) - 7,
+                    "{}v".format(len(piece.polygon_mm)),
+                    color,
+                )
         _draw_box(
             canvas,
             x - 1,
@@ -434,13 +592,23 @@ def _draw_gray_work_thumbnail(
             height + 2,
             WHITE,
         )
-        label = "A4 B:{} C:{} F:{}".format(
-            threshold if threshold is not None else "-",
-            (
+        used_thresholds = (
+            diagnostics.get("contour_thresholds", ())
+            if diagnostics is not None
+            else ()
+        )
+        contour_label = (
+            "|".join(str(int(value)) for value in used_thresholds)
+            if used_thresholds
+            else (
                 contour_threshold
                 if contour_threshold is not None
                 else "-"
-            ),
+            )
+        )
+        label = "A4 B:{} C:{} F:{}".format(
+            threshold if threshold is not None else "-",
+            contour_label,
             source_frame_index,
         )
         label_y = min(
@@ -641,14 +809,9 @@ def _render_final_status(
     frame_index,
     fps,
     error,
-    divider_y_mm=None,
+    divider_state=None,
 ):
     """Render every frozen S/T/R operation and whole-scene final state."""
-    divider = (
-        cfg.DIVIDER_Y_MM
-        if divider_y_mm is None
-        else float(divider_y_mm)
-    )
     canvas.clear()
     _draw_text(
         canvas, 12, 8, "K230 PUZZLE PLACEMENT", WHITE, 2
@@ -674,20 +837,24 @@ def _render_final_status(
         GRAY,
         thickness=2,
     )
-    divider_a = _final_screen_point(
-        (0.0, divider)
+    divider_endpoints = divider_overlay_endpoints(
+        divider_state, cfg.A4_WIDTH_MM
     )
-    divider_b = _final_screen_point(
-        (cfg.A4_WIDTH_MM, divider)
-    )
-    canvas.draw_line(
-        divider_a[0],
-        divider_a[1],
-        divider_b[0],
-        divider_b[1],
-        color=GRAY,
-        thickness=2,
-    )
+    if divider_endpoints is not None:
+        divider_a = _final_screen_point(
+            divider_endpoints[0]
+        )
+        divider_b = _final_screen_point(
+            divider_endpoints[1]
+        )
+        canvas.draw_line(
+            divider_a[0],
+            divider_a[1],
+            divider_b[0],
+            divider_b[1],
+            color=GRAY,
+            thickness=2,
+        )
     _draw_text(canvas, 20, 431, "A4 / mm", GRAY)
 
     for piece in reference_pieces:
@@ -848,6 +1015,49 @@ def _render_planning_status(canvas, pieces, frame_index):
     )
 
 
+def _projection_closure_diagnostics(
+    pieces,
+    corners_px,
+    work_corners_px,
+    work_width,
+    work_height,
+):
+    """Compare full-frame projection with the rounded work-image mapping."""
+    if not corners_px or not work_corners_px:
+        return {"max_px": 0.0, "mean_px": 0.0, "samples": 0}
+    residuals = []
+    scale_x = float(cfg.FRAME_WIDTH - 1) / max(
+        1.0, float(work_width - 1)
+    )
+    scale_y = float(cfg.FRAME_HEIGHT - 1) / max(
+        1.0, float(work_height - 1)
+    )
+    for piece in pieces:
+        for point_mm in list(piece.polygon_mm) + [piece.centroid_mm]:
+            direct = project_a4_mm_to_frame(point_mm, corners_px)
+            work = project_a4_mm_to_frame(
+                point_mm, work_corners_px
+            )
+            if direct is None or work is None:
+                continue
+            work_in_source = (
+                float(work[0]) * scale_x,
+                float(work[1]) * scale_y,
+            )
+            residuals.append(
+                ((direct[0] - work_in_source[0]) ** 2
+                 + (direct[1] - work_in_source[1]) ** 2)
+                ** 0.5
+            )
+    if not residuals:
+        return {"max_px": 0.0, "mean_px": 0.0, "samples": 0}
+    return {
+        "max_px": max(residuals),
+        "mean_px": sum(residuals) / len(residuals),
+        "samples": len(residuals),
+    }
+
+
 def _detect_frame_pieces(
     frame,
     corners_px,
@@ -855,12 +1065,24 @@ def _detect_frame_pieces(
     threshold,
     divider_y_mm=None,
     collect_sanity=False,
+    work_width=None,
+    work_height=None,
 ):
-    piece_gray = frame.to_grayscale(
-        x_size=cfg.REALTIME_PIECE_WORK_WIDTH,
-        y_size=cfg.REALTIME_PIECE_WORK_HEIGHT,
+    work_width = int(
+        cfg.REALTIME_PIECE_WORK_WIDTH
+        if work_width is None
+        else work_width
     )
-    return detect_pieces_from_canmv_image(
+    work_height = int(
+        cfg.REALTIME_PIECE_WORK_HEIGHT
+        if work_height is None
+        else work_height
+    )
+    piece_gray = frame.to_grayscale(
+        x_size=work_width,
+        y_size=work_height,
+    )
+    pieces, diagnostics = detect_pieces_from_canmv_image(
         piece_gray,
         corners_px,
         (cfg.FRAME_WIDTH, cfg.FRAME_HEIGHT),
@@ -869,6 +1091,48 @@ def _detect_frame_pieces(
         divider_y_mm=divider_y_mm,
         collect_sanity=collect_sanity,
     )
+    diagnostics["projection_closure"] = (
+        _projection_closure_diagnostics(
+            pieces,
+            corners_px,
+            diagnostics.get("work_corners_px"),
+            work_width,
+            work_height,
+        )
+    )
+    diagnostics["recognition_width"] = work_width
+    diagnostics["recognition_height"] = work_height
+    return pieces, diagnostics
+
+
+def _transfer_piece_ids(reference_pieces, refined_pieces):
+    """Transfer stable IDs to a same-frame higher-resolution observation."""
+    if len(reference_pieces) != len(refined_pieces):
+        return False
+    remaining = list(refined_pieces)
+    for reference in reference_pieces:
+        if not remaining:
+            return False
+        best = min(
+            remaining,
+            key=lambda piece: (
+                (piece.centroid_mm[0] - reference.centroid_mm[0]) ** 2
+                + (piece.centroid_mm[1] - reference.centroid_mm[1]) ** 2
+            ),
+        )
+        distance = (
+            (best.centroid_mm[0] - reference.centroid_mm[0]) ** 2
+            + (best.centroid_mm[1] - reference.centroid_mm[1]) ** 2
+        ) ** 0.5
+        if distance > cfg.CENTER_STABLE_TOLERANCE_MM:
+            return False
+        best.piece_id = reference.piece_id
+        best.stable = True
+        remaining.remove(best)
+    refined_pieces.sort(
+        key=lambda piece: int(piece.piece_id[1:])
+    )
+    return True
 
 
 def _rectified_gray(frame, corners_px, width, height):
@@ -1128,7 +1392,15 @@ def _print_piece_diagnostics(
         "polygon_failure_rects={},"
         "boundary_steps={},pixel_reads={},"
         "raw_vertices={},vertices={},areas_mm2={},"
+        "center_gray={},contour_used={},contour_mode={},"
+        "projection_closure_px={:.2f}|{:.2f}|{},"
         "divider_y_mm={:.1f},divider_detected={},"
+        "divider_strip={},divider_source={},divider_reason={},"
+        "divider_threshold={},divider_bg={:.1f},"
+        "divider_hits={}/{},divider_coverage={:.2f},"
+        "divider_thickness_px={:.1f},divider_slope_mm={:.2f},"
+        "divider_residual_px={:.2f},divider_mask_half_px={},"
+        "divider_masked_pixels={},"
         "expected={},samples={}".format(
             frame_index,
             region,
@@ -1193,12 +1465,59 @@ def _print_piece_diagnostics(
                 for piece in pieces
             )
             or "none",
+            "|".join(
+                "{:.0f}".format(value)
+                for value in diagnostics.get(
+                    "center_grays", ()
+                )
+            )
+            or "none",
+            "|".join(
+                str(int(value))
+                for value in diagnostics.get(
+                    "contour_thresholds", ()
+                )
+            )
+            or "none",
+            "|".join(
+                str(value)
+                for value in diagnostics.get(
+                    "contour_threshold_modes", ()
+                )
+            )
+            or "none",
+            diagnostics.get("projection_closure", {}).get(
+                "max_px", 0.0
+            ),
+            diagnostics.get("projection_closure", {}).get(
+                "mean_px", 0.0
+            ),
+            diagnostics.get("projection_closure", {}).get(
+                "samples", 0
+            ),
             diagnostics.get(
                 "divider_y_mm", cfg.DIVIDER_Y_MM
             ),
             int(
                 diagnostics.get("divider_detected", False)
             ),
+            int(
+                diagnostics.get(
+                    "divider_strip_detected", False
+                )
+            ),
+            diagnostics.get("divider_source", "unknown"),
+            diagnostics.get("divider_reason", "none") or "none",
+            diagnostics.get("divider_threshold", 0),
+            diagnostics.get("divider_background_gray", 0.0),
+            diagnostics.get("divider_hits", 0),
+            diagnostics.get("divider_samples", 0),
+            diagnostics.get("divider_coverage", 0.0),
+            diagnostics.get("divider_thickness_px", 0.0),
+            diagnostics.get("divider_slope_mm", 0.0),
+            diagnostics.get("divider_residual_px", 0.0),
+            diagnostics.get("divider_mask_half_width_px", 0),
+            diagnostics.get("divider_masked_pixels", 0),
             expected,
             samples,
         )
@@ -1345,6 +1664,13 @@ def main():
     sensor = None
     canvases = []
     completion_light = _CompletionLight()
+    print(
+        "UART_MODE,enabled={},ide_debug={},reason={}".format(
+            int(UART_COMMUNICATION_ENABLED),
+            int(UART_IDE_DEBUG_MODE),
+            UART_IMPORT_ERROR,
+        )
+    )
     _audit_runtime_api()
     auto_calibrate_a4 = bool(cfg.AUTO_CALIBRATE_A4)
     boundary_tracker = (
@@ -1355,7 +1681,6 @@ def main():
         if auto_calibrate_a4
         else _manual_a4_state()
     )
-    piece_tracker = PieceTracker()
     frame_index = 0
     fps = 0.0
     start_ms = _ms_now()
@@ -1366,6 +1691,7 @@ def main():
     last_piece_stable = False
     last_a4_locked = False
     last_pieces = []
+    last_raw_pieces = []
     last_piece_detection_frame = -1000000
     last_boundary_diagnostics = {}
     canvas_index = 0
@@ -1379,9 +1705,6 @@ def main():
         "mean_abs_diff": 0.0,
         "changed_ratio": 0.0,
         "motion": False,
-        "scene_mean_abs_diff": 0.0,
-        "scene_changed_ratio": 0.0,
-        "scene_change": False,
     }
     last_rendered_state = None
     complete_displayed = False
@@ -1397,11 +1720,16 @@ def main():
         cfg.PIECE_COUNT_MIN_CONFIRMATIONS,
     )
     consensus_state = piece_count_consensus.state()
-    tracker_expected_count = None
+    tracker_expected_count = tracking_expected_piece_count(
+        cfg.PLANNING_REQUIRED_PIECE_COUNT,
+        consensus_state,
+    )
+    piece_tracker = PieceTracker(tracker_expected_count)
     bad_count_detections = 0
     piece_detection_count = 0
     last_piece_diagnostic_signature = None
     last_piece_diagnostics = {}
+    confirmed_divider = None
     last_input_integrity_signature = None
     pending_reason = "a4_unlocked"
     last_piece_gray = None
@@ -1410,6 +1738,8 @@ def main():
     last_piece_contour_threshold = None
     last_thumbnail_error = None
     last_operator_view_error = None
+    debug_hold_announced = False
+    final_refinement_done = False
     ide_output_index = 0
     last_ide_stream_error = None
     PERF_STATS.enabled = bool(cfg.ENABLE_STAGE_TIMING)
@@ -1434,8 +1764,10 @@ def main():
             ),
         ]
         print(
-            "START_REALTIME_A4,frame={}x{},boundary={}x{},"
-            "piece_work={}x{},a4_every={},piece_every={},"
+            "START_REALTIME_A4,frame={}x{},camera={},boundary={}x{},"
+            "a4_refine={}x{}|{},"
+            "piece_work={}x{},piece_final={}x{},"
+            "a4_every={},piece_every={},"
             "debug_camera={},planner={},"
             "source_clear={:.2f}|{},a4_hold_misses={},"
             "piece_segment={},piece_deltas={}|{},"
@@ -1444,17 +1776,31 @@ def main():
             "ide_stream=explicit,ide_quality={},"
             "ide_every={},plan_debug={},"
             "plan_debug_ms={},dynamic_divider={},"
+            "piece_divider_strip={},"
+            "piece_divider_gray={}|{},"
+            "adaptive_contour={},adaptive_alpha={:.2f},"
+            "recognition_debug_hold={},"
             "operator_view={},a4_calibration={}".format(
                 cfg.FRAME_WIDTH,
                 cfg.FRAME_HEIGHT,
+                (
+                    "grayscale"
+                    if getattr(cfg, "CAMERA_GRAYSCALE", False)
+                    else "rgb565"
+                ),
                 cfg.A4_DETECT_WIDTH,
                 cfg.A4_DETECT_HEIGHT,
+                cfg.A4_REFINE_WIDTH,
+                cfg.A4_REFINE_HEIGHT,
+                int(cfg.A4_FULL_RES_REFINE_ENABLED),
                 cfg.REALTIME_PIECE_WORK_WIDTH,
                 cfg.REALTIME_PIECE_WORK_HEIGHT,
+                cfg.REALTIME_PIECE_FINAL_WIDTH,
+                cfg.REALTIME_PIECE_FINAL_HEIGHT,
                 cfg.A4_DETECT_INTERVAL_ACQUIRE,
                 cfg.PIECE_DETECT_EVERY_N_FRAMES,
                 int(cfg.DEBUG_SHOW_CAMERA),
-                _planner_selection()[0],
+                ACTIVE_PLANNER,
                 cfg.FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX,
                 cfg.FINAL_TRIGGER_STABLE_FRAMES,
                 cfg.A4_HOLD_MISSED_FRAMES,
@@ -1480,6 +1826,36 @@ def main():
                 int(
                     cfg.ENABLE_DYNAMIC_DIVIDER
                     and auto_calibrate_a4
+                ),
+                int(
+                    getattr(
+                        cfg,
+                        "PIECE_DIVIDER_DETECTION_ENABLED",
+                        False,
+                    )
+                ),
+                getattr(cfg, "PIECE_DIVIDER_MIN_GRAY", 50),
+                getattr(
+                    cfg,
+                    "PIECE_DIVIDER_MIN_CONTRAST_GRAY",
+                    20,
+                ),
+                int(
+                    getattr(
+                        cfg,
+                        "PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED",
+                        False,
+                    )
+                ),
+                getattr(
+                    cfg, "PIECE_CONTOUR_ADAPTIVE_ALPHA", 0.42
+                ),
+                int(
+                    getattr(
+                        cfg,
+                        "DEBUG_RECOGNITION_HOLD_BEFORE_PLANNING",
+                        False,
+                    )
                 ),
                 (
                     "live_grayscale"
@@ -1547,7 +1923,6 @@ def main():
                     boundary_interval = a4_detection_interval(
                         phase,
                         cfg.A4_DETECT_INTERVAL_ACQUIRE,
-                        cfg.A4_DETECT_INTERVAL_PLACING,
                         a4_state["locked"],
                     )
                     boundary_due = (
@@ -1572,6 +1947,62 @@ def main():
                                 ),
                             )
                         )
+                        boundary_diagnostics["full_refine_attempted"] = 0
+                        boundary_diagnostics["full_refine_used"] = 0
+                        if (
+                            candidate is not None
+                            and getattr(
+                                cfg,
+                                "A4_FULL_RES_REFINE_ENABLED",
+                                False,
+                            )
+                        ):
+                            boundary_diagnostics[
+                                "full_refine_attempted"
+                            ] = 1
+                            refine_gray = frame.to_grayscale(
+                                x_size=cfg.A4_REFINE_WIDTH,
+                                y_size=cfg.A4_REFINE_HEIGHT,
+                            )
+                            (
+                                refined_candidate,
+                                refine_diagnostics,
+                            ) = detect_a4_boundary(
+                                refine_gray,
+                                (
+                                    cfg.FRAME_WIDTH,
+                                    cfg.FRAME_HEIGHT,
+                                ),
+                            )
+                            boundary_diagnostics[
+                                "full_refine_candidates"
+                            ] = refine_diagnostics.get(
+                                "valid_candidates", 0
+                            )
+                            boundary_diagnostics[
+                                "full_refine_rejected"
+                            ] = refine_diagnostics.get(
+                                "rejected", {}
+                            )
+                            if refined_candidate is not None:
+                                refined_candidate["source"] = (
+                                    "{}_full_refine".format(
+                                        refined_candidate.get(
+                                            "source", "unknown"
+                                        )
+                                    )
+                                )
+                                candidate = refined_candidate
+                                boundary_diagnostics[
+                                    "full_refine_used"
+                                ] = 1
+                            else:
+                                # A coarse candidate is sufficient to trigger
+                                # refinement, but never sufficient to define
+                                # the final homography when refinement is
+                                # enabled. Keep searching instead of locking
+                                # coordinates known to be lower precision.
+                                candidate = None
                         last_boundary_diagnostics = (
                             boundary_diagnostics
                         )
@@ -1595,7 +2026,9 @@ def main():
 
                 if a4_state["locked"] and phase == "ACQUIRE":
                     piece_due = (
-                        frame_index - last_piece_detection_frame
+                        not final_refinement_done
+                        and frame_index
+                        - last_piece_detection_frame
                         >= cfg.PIECE_DETECT_EVERY_N_FRAMES
                     )
                     if piece_due:
@@ -1702,6 +2135,51 @@ def main():
                                 )
                                 retry_used = True
                         last_piece_diagnostics = piece_diagnostics
+                        if piece_diagnostics.get(
+                            "divider_strip_detected", False
+                        ):
+                            next_divider = {
+                                "detected": True,
+                                "divider_y_mm": float(
+                                    piece_diagnostics[
+                                        "divider_y_mm"
+                                    ]
+                                ),
+                                "slope_mm": float(
+                                    piece_diagnostics.get(
+                                        "divider_slope_mm", 0.0
+                                    )
+                                ),
+                                "frame": frame_index,
+                            }
+                            if (
+                                confirmed_divider is None
+                                or abs(
+                                    next_divider["divider_y_mm"]
+                                    - confirmed_divider[
+                                        "divider_y_mm"
+                                    ]
+                                )
+                                >= 0.25
+                                or abs(
+                                    next_divider["slope_mm"]
+                                    - confirmed_divider["slope_mm"]
+                                )
+                                >= 0.25
+                            ):
+                                print(
+                                    "DIVIDER_DISPLAY,frame={},"
+                                    "detected=1,y_mm={:.2f},"
+                                    "slope_mm={:.2f},source="
+                                    "rectified_strip".format(
+                                        frame_index,
+                                        next_divider[
+                                            "divider_y_mm"
+                                        ],
+                                        next_divider["slope_mm"],
+                                    )
+                                )
+                            confirmed_divider = next_divider
                         last_piece_gray = piece_diagnostics.get(
                             "rectified"
                         )
@@ -1719,6 +2197,7 @@ def main():
                             )
                         )
                         raw_pieces = pieces
+                        last_raw_pieces = raw_pieces
                         raw_piece_count = len(raw_pieces)
                         polygon_fit_incomplete = (
                             piece_diagnostics.get(
@@ -1727,19 +2206,26 @@ def main():
                             > 0
                         )
                         if (
-                            tracker_expected_count is None
-                            and not polygon_fit_incomplete
+                            not polygon_fit_incomplete
+                            and not consensus_state["ready"]
                         ):
                             consensus_state = (
                                 piece_count_consensus.update(
                                     raw_piece_count
                                 )
                             )
-                            if consensus_state["ready"]:
+                            next_tracking_count = (
+                                tracking_expected_piece_count(
+                                    cfg.PLANNING_REQUIRED_PIECE_COUNT,
+                                    consensus_state,
+                                )
+                            )
+                            if (
+                                next_tracking_count
+                                != tracker_expected_count
+                            ):
                                 tracker_expected_count = (
-                                    consensus_state[
-                                        "expected_count"
-                                    ]
+                                    next_tracking_count
                                 )
                                 piece_tracker.reset(
                                     tracker_expected_count
@@ -1747,6 +2233,13 @@ def main():
                         if polygon_fit_incomplete:
                             tracker_stable = False
                             stable = False
+                            if (
+                                tracker_expected_count is not None
+                                and not consensus_state["ready"]
+                            ):
+                                piece_tracker.reset(
+                                    tracker_expected_count
+                                )
                             # Show the current frame's accepted contours so a
                             # fit failure cannot leave stale, misleading
                             # overlays on screen. Planning remains fail-closed.
@@ -1770,6 +2263,17 @@ def main():
                                 pending_reason = consensus_state[
                                     "reason"
                                 ]
+                            elif not consensus_state["ready"]:
+                                # A missing piece breaks the provisional
+                                # fixed-count history. Count consensus and
+                                # geometric tracking still continue together
+                                # once all four pieces reappear.
+                                piece_tracker.reset(
+                                    tracker_expected_count
+                                )
+                                pending_reason = consensus_state[
+                                    "reason"
+                                ]
                             else:
                                 bad_count_detections += 1
                                 pending_reason = (
@@ -1786,8 +2290,15 @@ def main():
                                     consensus_state = (
                                         piece_count_consensus.state()
                                     )
-                                    piece_tracker.reset()
-                                    tracker_expected_count = None
+                                    tracker_expected_count = (
+                                        tracking_expected_piece_count(
+                                            cfg.PLANNING_REQUIRED_PIECE_COUNT,
+                                            consensus_state,
+                                        )
+                                    )
+                                    piece_tracker.reset(
+                                        tracker_expected_count
+                                    )
                                     bad_count_detections = 0
                                     pending_reason = (
                                         "count_reacquire"
@@ -1797,12 +2308,28 @@ def main():
                             pieces, tracker_stable = (
                                 piece_tracker.update(raw_pieces)
                             )
-                            stable = tracker_stable
+                            stable = recognition_gate_ready(
+                                consensus_state, tracker_stable
+                            )
                             pending_reason = (
                                 "ready"
-                                if tracker_stable
-                                else "tracker_stabilizing"
+                                if stable
+                                else (
+                                    consensus_state["reason"]
+                                    if not consensus_state["ready"]
+                                    else "tracker_stabilizing"
+                                )
                             )
+                        if getattr(
+                            cfg,
+                            "DEBUG_DRAW_RECTIFIED_CONTOURS",
+                            False,
+                        ):
+                            # In the recognition diagnostic build the main
+                            # projected outline and the thumbnail must both
+                            # describe this exact detection, not the tracker's
+                            # modal historical representative.
+                            pieces = raw_pieces
                         diagnostic_signature = (
                             raw_piece_count,
                             int(
@@ -1838,6 +2365,26 @@ def main():
                                     * 2.0
                                 )
                             ),
+                            bool(
+                                piece_diagnostics.get(
+                                    "divider_strip_detected",
+                                    False,
+                                )
+                            ),
+                            piece_diagnostics.get(
+                                "divider_source", "unknown"
+                            ),
+                            piece_diagnostics.get(
+                                "divider_reason", ""
+                            ),
+                            int(
+                                round(
+                                    piece_diagnostics.get(
+                                        "divider_coverage", 0.0
+                                    )
+                                    * 20.0
+                                )
+                            ),
                             consensus_state["reason"],
                         )
                         diagnostic_due = (
@@ -1869,6 +2416,98 @@ def main():
                     else:
                         pieces = last_pieces
                         stable = last_piece_stable
+                    if stable and not final_refinement_done:
+                        coarse_pieces = pieces
+                        refined_pieces, refined_diagnostics = (
+                            _detect_frame_pieces(
+                                frame,
+                                a4_state["corners_px"],
+                                "upper",
+                                last_piece_gray_threshold,
+                                (
+                                    a4_state["divider_y_mm"]
+                                    if a4_state.get(
+                                        "divider_detected",
+                                        False,
+                                    )
+                                    else None
+                                ),
+                                collect_sanity=False,
+                                work_width=(
+                                    cfg.REALTIME_PIECE_FINAL_WIDTH
+                                ),
+                                work_height=(
+                                    cfg.REALTIME_PIECE_FINAL_HEIGHT
+                                ),
+                            )
+                        )
+                        refined_polygon_rejected = (
+                            refined_diagnostics.get(
+                                "rejected", {}
+                            ).get("polygon", 0)
+                            > 0
+                        )
+                        refined_ids_ok = _transfer_piece_ids(
+                            coarse_pieces, refined_pieces
+                        )
+                        final_refinement_done = (
+                            not refined_polygon_rejected
+                            and refined_ids_ok
+                            and len(refined_pieces)
+                            == tracker_expected_count
+                        )
+                        print(
+                            "PIECE_REFINE,frame={},work={}x{},"
+                            "coarse_count={},refined_count={},"
+                            "ids={},polygon_rejected={},status={}".format(
+                                frame_index,
+                                cfg.REALTIME_PIECE_FINAL_WIDTH,
+                                cfg.REALTIME_PIECE_FINAL_HEIGHT,
+                                len(coarse_pieces),
+                                len(refined_pieces),
+                                int(refined_ids_ok),
+                                int(refined_polygon_rejected),
+                                (
+                                    "accepted"
+                                    if final_refinement_done
+                                    else "retry_after_stability"
+                                ),
+                            )
+                        )
+                        if final_refinement_done:
+                            pieces = refined_pieces
+                            raw_pieces = refined_pieces
+                            last_pieces = refined_pieces
+                            last_raw_pieces = refined_pieces
+                            last_piece_diagnostics = (
+                                refined_diagnostics
+                            )
+                            last_piece_gray = (
+                                refined_diagnostics.get("rectified")
+                            )
+                            last_piece_gray_frame = frame_index
+                            last_piece_gray_threshold = int(
+                                refined_diagnostics.get(
+                                    "threshold",
+                                    cfg.WHITE_GRAY_THRESHOLD,
+                                )
+                            )
+                            last_piece_contour_threshold = int(
+                                refined_diagnostics.get(
+                                    "contour_threshold",
+                                    last_piece_gray_threshold,
+                                )
+                            )
+                            last_piece_stable = True
+                            pending_reason = "refined_ready"
+                        else:
+                            pieces = coarse_pieces
+                            stable = False
+                            last_piece_stable = False
+                            pending_reason = "refinement_failed"
+                            piece_tracker.reset(
+                                tracker_expected_count
+                            )
                 elif (
                     a4_state["locked"]
                     and phase in FINAL_PHASES
@@ -1951,6 +2590,7 @@ def main():
                                 )
                 elif phase == "ACQUIRE":
                     pieces = []
+                    final_refinement_done = False
                     last_piece_stable = False
                     last_piece_detection_frame = -1000000
                     pending_reason = "a4_unlocked"
@@ -1958,6 +2598,7 @@ def main():
                     last_piece_gray_frame = -1
                     last_piece_gray_threshold = None
                     last_piece_contour_threshold = None
+                    last_raw_pieces = []
                 elif final_check_flow is not None:
                     # A frozen plan never returns to piece detection.
                     pieces = reference_pieces
@@ -1985,19 +2626,58 @@ def main():
                 _print_a4_lock(frame_index, a4_state)
             elif not a4_state["locked"]:
                 a4_lock_frame = None
+                confirmed_divider = None
                 if last_a4_locked and phase == "ACQUIRE":
+                    final_refinement_done = False
                     piece_count_consensus.reset()
-                    piece_tracker.reset()
-                    tracker_expected_count = None
-                    bad_count_detections = 0
                     consensus_state = (
                         piece_count_consensus.state()
                     )
+                    tracker_expected_count = (
+                        tracking_expected_piece_count(
+                            cfg.PLANNING_REQUIRED_PIECE_COUNT,
+                            consensus_state,
+                        )
+                    )
+                    piece_tracker.reset(tracker_expected_count)
+                    bad_count_detections = 0
                     piece_detection_count = 0
                     last_piece_diagnostic_signature = None
 
             if phase == "ACQUIRE":
-                if (
+                debug_hold_active = (
+                    bool(
+                        getattr(
+                            cfg,
+                            "DEBUG_RECOGNITION_HOLD_BEFORE_PLANNING",
+                            False,
+                        )
+                    )
+                    and stable
+                    and not error
+                    and a4_state["locked"]
+                )
+                if debug_hold_active:
+                    active_plan = None
+                    active_plan_key = None
+                    pending_reason = "recognition_debug_hold"
+                    if not debug_hold_announced:
+                        closure = last_piece_diagnostics.get(
+                            "projection_closure", {}
+                        )
+                        print(
+                            "RECOGNITION_DEBUG_HOLD,frame={},"
+                            "phase=ACQUIRE,stable=1,count={},"
+                            "raw=cyan,fitted=piece_color,"
+                            "projection_closure_px={:.2f}|{:.2f}".format(
+                                frame_index,
+                                len(pieces),
+                                closure.get("max_px", 0.0),
+                                closure.get("mean_px", 0.0),
+                            )
+                        )
+                        debug_hold_announced = True
+                elif (
                     not stable
                     or error
                     or not a4_state["locked"]
@@ -2006,51 +2686,67 @@ def main():
                     active_plan_key = None
                 else:
                     key = _plan_key(pieces)
-                    input_integrity = planning_input_integrity(
-                        pieces,
-                        cfg.TARGET_RECT_SIZE_MM,
-                        polygon_overlap_area,
-                        required_piece_count=(
-                            cfg.PLANNING_REQUIRED_PIECE_COUNT
-                        ),
-                        area_ratio_min=(
-                            cfg.PLANNING_INPUT_AREA_RATIO_MIN
-                        ),
-                        area_ratio_max=(
-                            cfg.PLANNING_INPUT_AREA_RATIO_MAX
-                        ),
-                        max_pair_overlap_ratio=(
-                            cfg.PLANNING_INPUT_MAX_PAIR_OVERLAP_RATIO
-                        ),
-                        rejected_border_blobs=(
-                            last_piece_diagnostics.get(
-                                "rejected", {}
-                            ).get("border", 0)
-                        ),
-                        max_rejected_border_blobs=(
-                            cfg.PLANNING_INPUT_MAX_BORDER_BLOBS
-                        ),
+                    fixed_template_evaluation = (
+                        match_fixed_figure2_piece_set(pieces)
+                    )
+                    fixed_template_match = (
+                        fixed_template_evaluation[0] is not None
+                    )
+                    input_integrity = (
+                        planning_input_integrity_unless_fixed_template(
+                            fixed_template_match,
+                            pieces,
+                            None,
+                            polygon_overlap_area,
+                            required_piece_count=(
+                                cfg.PLANNING_REQUIRED_PIECE_COUNT
+                            ),
+                            area_ratio_min=(
+                                cfg.PLANNING_INPUT_AREA_RATIO_MIN
+                            ),
+                            area_ratio_max=(
+                                cfg.PLANNING_INPUT_AREA_RATIO_MAX
+                            ),
+                            max_pair_overlap_ratio=(
+                                cfg.PLANNING_INPUT_MAX_PAIR_OVERLAP_RATIO
+                            ),
+                            rejected_border_blobs=(
+                                last_piece_diagnostics.get(
+                                    "rejected", {}
+                                ).get("border", 0)
+                            ),
+                            max_rejected_border_blobs=(
+                                cfg.PLANNING_INPUT_MAX_BORDER_BLOBS
+                            ),
+                        )
                     )
                     integrity_signature = (
-                        input_integrity["valid"],
-                        input_integrity["failures"],
-                        input_integrity["piece_count"],
-                        int(
-                            input_integrity["total_area_mm2"]
-                            + 0.5
-                        ),
-                        int(
+                        ("fixed_figure2_direct",)
+                        if fixed_template_match
+                        else (
+                            input_integrity["valid"],
+                            input_integrity["failures"],
+                            input_integrity["piece_count"],
+                            int(
+                                input_integrity["total_area_mm2"]
+                                + 0.5
+                            ),
+                            int(
+                                input_integrity[
+                                    "max_pair_overlap_ratio"
+                                ]
+                                * 1000.0
+                                + 0.5
+                            ),
                             input_integrity[
-                                "max_pair_overlap_ratio"
-                            ]
-                            * 1000.0
-                            + 0.5
-                        ),
-                        input_integrity[
-                            "rejected_border_blobs"
-                        ],
+                                "rejected_border_blobs"
+                            ],
+                        )
                     )
-                    if not input_integrity["valid"]:
+                    if (
+                        input_integrity is not None
+                        and not input_integrity["valid"]
+                    ):
                         active_plan = None
                         active_plan_key = None
                         pending_reason = "input_{}".format(
@@ -2139,11 +2835,18 @@ def main():
                     elif not last_stable or active_plan is None:
                         last_input_integrity_signature = None
                         plan_start_ms = _ms_now()
-                        (
-                            configured_planner,
-                            unknown_planner,
-                            prefer_unknown_planner,
-                        ) = _planner_selection()
+                        configured_planner = ACTIVE_PLANNER
+                        if fixed_template_match:
+                            print(
+                                "PLANNING_INPUT_BYPASS,frame={},"
+                                "reason=fixed_figure2_direct,"
+                                "border_blobs={}".format(
+                                    frame_index,
+                                    last_piece_diagnostics.get(
+                                        "rejected", {}
+                                    ).get("border", 0),
+                                )
+                            )
                         print(
                             "PLANNING_START,frame={},planner="
                             "{},count={}".format(
@@ -2180,6 +2883,9 @@ def main():
                                     False,
                                     error,
                                     candidate,
+                                    confirmed_divider,
+                                    last_raw_pieces,
+                                    last_piece_diagnostics,
                                 )
                             )
                         thumbnail_error = (
@@ -2189,6 +2895,8 @@ def main():
                                 last_piece_gray_frame,
                                 last_piece_gray_threshold,
                                 last_piece_contour_threshold,
+                                last_raw_pieces,
+                                last_piece_diagnostics,
                             )
                         )
                         if (
@@ -2228,36 +2936,16 @@ def main():
                             configured_planner, len(pieces)
                         )
                         try:
-                            routing = plan_frozen_pieces(
-                                pieces,
-                                cfg.TARGET_RECT_SIZE_MM,
-                                plan_rectangle_assembly,
-                                unknown_planner,
-                                allow_unknown_fallback=(
-                                    cfg.ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE
-                                ),
-                                prefer_outer_first=(
-                                    prefer_unknown_planner
-                                ),
-                                preferred_planner_name=(
-                                    configured_planner
-                                ),
+                            active_plan = (
+                                plan_simulator_free_rectangle(
+                                    pieces,
+                                    fixed_template_evaluation=(
+                                        fixed_template_evaluation
+                                    ),
+                                )
                             )
                         finally:
                             end_plan_debug()
-                        active_plan = routing["plan"]
-                        if routing["fallback_used"]:
-                            print(
-                                "PLANNER_FALLBACK,frame={},from=fixed_rectangle,"
-                                "to={},reason={}".format(
-                                    frame_index,
-                                    configured_planner,
-                                    routing.get(
-                                        "fixed_failure_reason",
-                                        "unknown",
-                                    ).replace(",", ";"),
-                                )
-                            )
                         active_plan_key = key
                         print(
                             "PLANNING_DONE,frame={},elapsed_ms={},"
@@ -2284,6 +2972,13 @@ def main():
                                 for piece in reference_pieces
                             )
                             _print_all_plan_operations(active_plan)
+                            if UART_COMMUNICATION_ENABLED:
+                                protocal_execute_plan(active_plan)
+                            else:
+                                print(
+                                    "PROTOCAL_EXECUTION_SKIPPED,"
+                                    "reason=ide_debug_import_failed"
+                                )
                             phase = "WAIT_FINAL_CHECK"
                             motion_detector = _new_motion_detector(
                                 a4_state.get(
@@ -2311,6 +3006,7 @@ def main():
                         else:
                             last_failed_plan_key = key
                             phase = "ACQUIRE"
+                            final_refinement_done = False
 
             elapsed = max(1, _ms_delta(_ms_now(), frame_start))
             instant_fps = 1000.0 / elapsed
@@ -2336,7 +3032,8 @@ def main():
                 elif not a4_state["locked"]:
                     print(
                         "A4_SEARCH,frame={},rects={},dark_blobs={},"
-                        "candidates={},valid_frames={},missed={},"
+                        "candidates={},full_refine={}|{},"
+                        "valid_frames={},missed={},"
                         "divider_rescues={},rejected={}".format(
                             frame_index,
                             boundary_diagnostics.get("raw_rects", 0),
@@ -2345,6 +3042,12 @@ def main():
                             ),
                             boundary_diagnostics.get(
                                 "valid_candidates", 0
+                            ),
+                            boundary_diagnostics.get(
+                                "full_refine_attempted", 0
+                            ),
+                            boundary_diagnostics.get(
+                                "full_refine_used", 0
                             ),
                             a4_state["valid_frames"],
                             a4_state["missed_frames"],
@@ -2453,22 +3156,27 @@ def main():
                     error,
                 ) + (last_piece_gray_frame,)
             current_render_state += (
-                int(
-                    round(
-                        a4_state.get(
-                            "divider_y_mm",
-                            cfg.DIVIDER_Y_MM,
+                (
+                    int(
+                        round(
+                            confirmed_divider[
+                                "divider_y_mm"
+                            ]
+                            * 2.0
                         )
-                        * 2.0
                     )
+                    if confirmed_divider is not None
+                    else -1
                 ),
-                int(
-                    round(
-                        a4_state.get(
-                            "divider_slope_mm", 0.0
+                (
+                    int(
+                        round(
+                            confirmed_divider["slope_mm"]
+                            * 2.0
                         )
-                        * 2.0
                     )
+                    if confirmed_divider is not None
+                    else 0
                 ),
             )
             ui_dirty = should_render_ui(
@@ -2516,6 +3224,9 @@ def main():
                         bool(motion_metrics.get("motion")),
                         error,
                         candidate,
+                        confirmed_divider,
+                        last_raw_pieces,
+                        last_piece_diagnostics,
                     )
                     if (
                         operator_error
@@ -2537,6 +3248,8 @@ def main():
                             last_piece_gray_frame,
                             last_piece_gray_threshold,
                             last_piece_contour_threshold,
+                            last_raw_pieces,
+                            last_piece_diagnostics,
                         )
                     )
                     if (
@@ -2652,10 +3365,7 @@ def main():
                             frame_index,
                             fps,
                             error,
-                            a4_state.get(
-                                "divider_y_mm",
-                                cfg.DIVIDER_Y_MM,
-                            ),
+                            confirmed_divider,
                         )
                     else:
                         _render_status(
@@ -2666,29 +3376,35 @@ def main():
                             frame_index,
                             fps,
                             error,
-                            divider_y_mm=a4_state.get(
-                                "divider_y_mm",
-                                cfg.DIVIDER_Y_MM,
+                            divider_y_mm=(
+                                confirmed_divider[
+                                    "divider_y_mm"
+                                ]
+                                if confirmed_divider is not None
+                                else None
                             ),
+                        )
+                        divider_status = (
+                            "D:{:.1f} S:{:+.1f}".format(
+                                confirmed_divider[
+                                    "divider_y_mm"
+                                ],
+                                confirmed_divider["slope_mm"],
+                            )
+                            if confirmed_divider is not None
+                            else "D:- S:-"
                         )
                         _draw_text(
                             canvas,
                             520,
                             38,
-                            "A4:{} C:{:.2f} M:{:.1f}px "
-                            "D:{:.1f} S:{:+.1f}".format(
+                            "A4:{} C:{:.2f} M:{:.1f}px {}".format(
                                 "LOCK"
                                 if a4_state["locked"]
                                 else "SEARCH",
                                 a4_state["confidence"],
                                 a4_state["motion_px"],
-                                a4_state.get(
-                                    "divider_y_mm",
-                                    cfg.DIVIDER_Y_MM,
-                                ),
-                                a4_state.get(
-                                    "divider_slope_mm", 0.0
-                                ),
+                                divider_status,
                             ),
                             GREEN
                             if a4_state["locked"]
@@ -2701,6 +3417,8 @@ def main():
                             last_piece_gray_frame,
                             last_piece_gray_threshold,
                             last_piece_contour_threshold,
+                            last_raw_pieces,
+                            last_piece_diagnostics,
                         )
                     )
                     if (

@@ -8,6 +8,9 @@ conversion factor used by the vision adapters.
 # Camera/display geometry. Lowering the frame size usually increases FPS.
 FRAME_WIDTH = 800
 FRAME_HEIGHT = 480
+# Generic entrypoints retain the RGB565 camera stream. Realtime black/white
+# puzzle profiles can request VICAP's grayscale/luma output directly.
+CAMERA_GRAYSCALE = False
 # Native CanMV processing image. Both dimensions are multiples of 16; its
 # aspect ratio is close to A4 so native perspective correction retains detail
 # without needing the optional cv2 firmware module.
@@ -28,6 +31,7 @@ A4_CORNERS_PX = [
 # emergency fallback/debug reference; normal board operation detects the black
 # A4 work surface at startup and locks it after consecutive valid frames.
 AUTO_CALIBRATE_A4 = True
+# Detect the A4 boundary in the original lightweight 320x192 work image.
 A4_DETECT_WIDTH = 320
 A4_DETECT_HEIGHT = 192
 A4_RECT_EDGE_THRESHOLD = 7000
@@ -104,10 +108,40 @@ PIECE_BACKGROUND_MIN_SAMPLES = 96
 # the discovery threshold for contour tracing; the realtime black-surface
 # profile raises this floor independently.
 PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 0
+# Optional per-piece high-threshold contour refinement. Blob discovery remains
+# at the shared background-relative threshold; only the identity-bound white
+# core is adapted from a small robust sample around that Blob's centroid.
+PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED = False
+PIECE_CONTOUR_CENTER_SAMPLE_RADIUS_PX = 2
+PIECE_CONTOUR_CENTER_MIN_CONTRAST_GRAY = 40
+PIECE_CONTOUR_ADAPTIVE_ALPHA = 0.42
+PIECE_CONTOUR_ADAPTIVE_MIN_GRAY = 85
+PIECE_CONTOUR_ADAPTIVE_MAX_GRAY = 140
 # Optional in-place black safety band after perspective correction. Realtime
 # profiles can enable it to prevent interpolated exterior paper/table pixels
 # from joining a physical piece to the A4 image boundary.
 PIECE_RECTIFIED_BORDER_BLACK_PX = 0
+# After A4 perspective correction, independently locate the physical white
+# separator before any piece Blob search.  The detector samples a narrow band
+# around the A4 midpoint and only accepts a thin bright run that crosses most
+# of the rectified page, so an ordinary fragment cannot become the divider.
+PIECE_DIVIDER_DETECTION_ENABLED = True
+PIECE_DIVIDER_SEARCH_HALF_RANGE_MM = 8.0
+PIECE_DIVIDER_SAMPLE_COUNT = 31
+# The real divider is grey after the 240x336 warp (the supplied board log
+# shows it at the piece threshold around 59).  Geometry provides the strong
+# rejection here, so keep the brightness gate deliberately lower than the
+# white-piece contour threshold.
+PIECE_DIVIDER_MIN_GRAY = 50
+PIECE_DIVIDER_MIN_CONTRAST_GRAY = 20
+PIECE_DIVIDER_MIN_COVERAGE = 0.72
+PIECE_DIVIDER_MAX_THICKNESS_MM = 5.0
+PIECE_DIVIDER_MAX_RESIDUAL_PX = 2.5
+PIECE_DIVIDER_MAX_SLOPE_MM = 5.0
+# The detected painted/taped strip and a small anti-aliasing halo are erased
+# from the same shared grayscale array later consumed by find_blobs.
+PIECE_DIVIDER_MASK_MARGIN_MM = 1.5
+PIECE_DIVIDER_FALLBACK_GAP_MM = 2.0
 MORPH_KERNEL_PX = 3
 MORPH_OPEN_ITERATIONS = 1
 MORPH_CLOSE_ITERATIONS = 2
@@ -115,7 +149,7 @@ MORPH_CLOSE_ITERATIONS = 2
 # Piece filters. Lowering the minimum accepts smaller noise regions.
 MIN_PIECE_AREA_MM2 = 220.0
 MAX_PIECE_AREA_MM2 = 6500.0
-MIN_PIECE_COUNT = 2
+MIN_PIECE_COUNT = 4
 MAX_PIECE_COUNT = 4
 DETECTION_BORDER_MARGIN_MM = 3.0
 
@@ -125,13 +159,14 @@ COLLINEAR_ANGLE_TOLERANCE_DEG = 9.0
 MIN_VALID_EDGE_MM = 18.0
 MIN_POLYGON_VERTICES = 3
 MAX_POLYGON_VERTICES = 5
-# Robust vertex cleanup after contour simplification.  Contest edges are at
-# least 20 mm long, while the current hand-cut prototype contains a real edge
-# of about 10 mm.  A 7 mm merge radius therefore removes small reflection
-# chamfers/duplicate corners while preserving both sets of legitimate edges.
-VERTEX_MERGE_DISTANCE_MM = 7.0
-VERTEX_MERGE_MAX_EXTRAPOLATION_MM = 14.0
-VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG = 12.0
+# Robust vertex cleanup after contour simplification.  Every physical edge is
+# longer than 20 mm, so a fitted edge below 18 mm is a raster/reflection
+# artefact.  Merging replaces its two endpoints by their midpoint, assigning
+# one half of the removed edge to each neighbouring edge.
+VERTEX_MERGE_DISTANCE_MM = 18.0
+# This is expressed as deviation from a straight 180-degree vertex: 30 degrees
+# therefore smooths vertices whose measured interior angle is at least 150.
+VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG = 30.0
 VERTEX_COLLINEAR_MAX_OFFSET_MM = 3.0
 VERTEX_CLEANUP_MAX_AREA_CHANGE_RATIO = 0.08
 VERTEX_CLEANUP_MAX_PASSES = 8
@@ -151,74 +186,16 @@ BOUNDARY_TRACE_MIN_POINTS = 12
 ENABLE_BOUNDARY_FLOOD_FALLBACK = True
 FORCE_CONVEX_CONTOURS = False
 
-# Edge attachment. Larger values admit less exact seams and grow search time.
-EDGE_LENGTH_ABS_TOLERANCE_MM = 3.0
-EDGE_LENGTH_REL_TOLERANCE = 0.10
-EDGE_ENDPOINT_TOLERANCE_MM = 3.0
-OVERLAP_TOLERANCE_MM2 = 8.0
-MAX_SEARCH_NODES = 30000
-
-# Competition fallback for hand-cut pieces. Corresponding seam endpoints may
-# differ by at most 20 mm; lowering this produces tighter but fewer solutions.
-ENABLE_TOLERANT_FALLBACK = True
-CORRESPONDING_VERTEX_TOLERANCE_MM = 20.0
-TOLERANT_RECTANGLE_SCORE_THRESHOLD = 0.32
-TOLERANT_MAX_FILL_GAP_RATIO = 0.30
-# Seam measurement error is intentionally independent from the final 20 mm
-# placement allowance in the competition rules.
-SEAM_LENGTH_ABS_TOLERANCE_MM = 4.0
-SEAM_LENGTH_REL_TOLERANCE = 0.05
-SEAM_ENDPOINT_ANGLE_TOLERANCE_DEG = 35.0
-FINAL_VERTEX_TOLERANCE_MM = 20.0
-FINAL_CENTER_TOLERANCE_MM = 15.0
-FINAL_ANGLE_TOLERANCE_DEG = 12.0
-
-# Rectangle validation. Score is dimensionless; lower is stricter.
-RECT_MIN_WIDTH_MM = 90.0
-RECT_MAX_WIDTH_MM = 120.0
-RECT_MIN_HEIGHT_MM = 50.0
-RECT_MAX_HEIGHT_MM = 90.0
-RECTANGLE_SCORE_THRESHOLD = 0.095
-RECT_FILL_GAP_TOLERANCE_MM2 = 180.0
-OUTER_EDGE_TOLERANCE_MM = 3.0
-
-# Unknown on-site rectangle planner.  It anchors one likely outside edge to a
-# rectangle axis before matching seams.  This uses the contest guarantee that
-# every piece contributes at least one target-boundary edge and avoids the
-# orientation-free search explosion on K230.
-OUTER_FIRST_AXIS_TOLERANCE_DEG = 12.0
-OUTER_FIRST_TOLERANT_AXIS_TOLERANCE_DEG = 22.0
-OUTER_FIRST_PARTIAL_BOUND_SLACK_MM = 12.0
-OUTER_FIRST_CORNER_MAX_SEARCH_NODES = 3000
-OUTER_FIRST_CORNER_BEAM_WIDTH = 128
-OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE = 32
-
-# ``lvreng/puzzle-vision-simulator`` compatible planner.  The K230 port keeps
-# the upstream candidate semantics (full-edge and T-junction partial matches),
-# but replaces NumPy/OpenCV masks with the local pure-Python polygon geometry.
-# ``local`` validation is fail-closed for real placement; ``upstream`` can be
-# selected explicitly for simulator-only A/B experiments.
-PLANNER_BACKEND = "outer_first"
-SIMULATOR_PLANNER_CUT_MODE = "auto"
-SIMULATOR_PLANNER_VALIDATION = "local"
-# Upstream mode always publishes the lowest-cost connected proposal. These
-# multipliers retain the former safety thresholds as diagnostic warnings only;
-# local validation remains the fail-closed A/B path.
-SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER = 2.0
-# T-junctions fitted from raster contours can report overlap at their shared
-# endpoint even when the visible topology is correct.
-SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER = 5.0
+# Edge-match and pose-refinement primitives used by the active free-rectangle
+# planner. The implementation is pure Python for CanMV MicroPython.
 SIMULATOR_MATCH_REL_TOLERANCE = 0.12
 SIMULATOR_PARTIAL_MIN_RATIO = 0.22
 SIMULATOR_PARTIAL_MAX_RATIO = 0.88
 SIMULATOR_PARTIAL_MATCH_PENALTY = 0.15
 SIMULATOR_MAX_CANDIDATES = 80
-SIMULATOR_MAX_MATCHING_SETS = 4000
 SIMULATOR_POSE_OPTIMIZATION_STEPS = 20
 
-# Experimental unknown-size rectangle backend. These settings are deliberately
-# isolated from the fixed-size simulator backend above: changing a FREE_RECT_*
-# value must not change the established 100x60 mm search path.
+# Active free-rectangle planner.
 FREE_RECT_MIN_PIECE_COUNT = 1
 FREE_RECT_MAX_PIECE_COUNT = 4
 FREE_RECT_MATCH_REL_TOLERANCE = 0.12
@@ -248,6 +225,11 @@ FREE_RECT_LONG_SIDE_MIN_MM = 90.0
 FREE_RECT_LONG_SIDE_MAX_MM = 120.0
 FREE_RECT_SHORT_SIDE_MIN_MM = 50.0
 FREE_RECT_SHORT_SIDE_MAX_MM = 90.0
+# Prefer plausible competition rectangles without making the aspect range a
+# hard validity gate. If no in-range proposal exists, publish the proposal
+# closest to this interval.
+FREE_RECT_PREFERRED_ASPECT_MIN = 1.33
+FREE_RECT_PREFERRED_ASPECT_MAX = 1.67
 FREE_RECT_OUTER_EDGE_TOLERANCE_MM = 5.0
 FREE_RECT_PARTIAL_COUNT_PENALTY = 1.0
 
@@ -270,13 +252,6 @@ FREE_RECT_TARGET_MARGIN_MM = 10.0
 FREE_RECT_WARN_OVERLAP_RATIO = 0.03
 FREE_RECT_WARN_FILL_GAP_RATIO = 0.08
 FREE_RECT_WARN_HULL_GAP_RATIO = 0.08
-OUTER_FIRST_MAX_SEARCH_NODES = 1200
-OUTER_FIRST_BRANCH_LIMIT = 48
-MAX_RECTANGLE_HYPOTHESES = 12
-MAX_DFS_NODES = 1200
-MAX_PLAN_TIME_MS = 3000
-STATE_POSITION_QUANTIZATION_MM = 0.5
-STATE_ANGLE_QUANTIZATION_DEG = 0.5
 # Low-overhead planner heartbeat. The shared default stays off so desktop
 # benchmarks and non-realtime entrypoints remain quiet; the realtime CanMV
 # profile enables it. Time is sampled only at existing search batch/exitpoint
@@ -291,35 +266,14 @@ OVERLAP_AREA_TOLERANCE_MM2 = 8.0
 # Final placement. Increase the margin to keep farther from paper/divider edges.
 TARGET_CENTER_MM = (105.0, 225.0)
 TARGET_MARGIN_MM = 10.0
-# Known prototype target. Set to None for unknown on-site rectangle dimensions.
-TARGET_RECT_SIZE_MM = (100.0, 60.0)
-PREFER_OUTER_FIRST_PLANNER = False
-ENABLE_UNKNOWN_PLANNER_FALLBACK_AFTER_FIXED_FAILURE = False
 
-# Frozen-input integrity gate before any planner is called. A deployment may
-# set an exact piece count; the shared desktop profile remains count-agnostic.
-PLANNING_REQUIRED_PIECE_COUNT = None
+# Frozen-input integrity gate before generic planning. The physical task always
+# starts from exactly four pieces; the known template bypasses the other gates.
+PLANNING_REQUIRED_PIECE_COUNT = 4
 PLANNING_INPUT_AREA_RATIO_MIN = 0.85
 PLANNING_INPUT_AREA_RATIO_MAX = 1.15
 PLANNING_INPUT_MAX_PAIR_OVERLAP_RATIO = 0.20
 PLANNING_INPUT_MAX_BORDER_BLOBS = 0
-
-# Fixed-rectangle packing tolerances for hand-cut 100x60 mm prototypes.
-FIXED_RECT_BEAM_WIDTH = 1200
-FIXED_RECT_MAX_OUTSIDE_MM2 = 250.0
-FIXED_RECT_MAX_OVERLAP_MM2 = 30.0
-FIXED_RECT_MAX_GAP_MM2 = 220.0
-FIXED_RECT_SCORE_THRESHOLD = 0.06
-FIXED_RECT_BOUNDARY_TOLERANCE_MM = 5.0
-# The fast outer-first search may use tolerant seam matching, but a known-size
-# target is accepted only when its final bounding dimensions stay close to the
-# configured prototype. This is a final-result gate, not a seam tolerance.
-KNOWN_TARGET_DIMENSION_TOLERANCE_MM = 5.0
-# A4 rectification and foreground expansion can bias every detected length by
-# the same small factor. For a known complete partition, total piece area gives
-# a robust global scale correction. Larger corrections are refused because
-# they more likely indicate a missing/extra blob than calibration drift.
-KNOWN_TARGET_MAX_AREA_SCALE_DELTA = 0.04
 
 # Multi-frame stability. Increasing the window reduces false stable plans but
 # delays output. Tolerances are maximum deviations within the stable window.
@@ -349,29 +303,6 @@ A4_RELOCK_CONFIRM_FRAMES = 3
 BAD_COUNT_HOLD_DETECTIONS = 3
 COUNT_REACQUIRE_FAILURES = 6
 
-# Closed-loop placement. All distances and areas are in A4 millimetres/mm².
-PLACEMENT_SHAPE_COST_LIMIT = 0.34
-PLACEMENT_CONTOUR_SAMPLE_COUNT = 32
-PLACEMENT_CONTOUR_RMS_MAX_MM = 5.0
-PLACEMENT_CONTOUR_P90_MAX_MM = 8.0
-PLACEMENT_CONTOUR_P95_HARD_MAX_MM = 18.0
-PLACEMENT_CENTER_COARSE_MAX_MM = 20.0
-PLACEMENT_AREA_RATIO_MIN = 0.70
-PLACEMENT_AREA_RATIO_MAX = 1.30
-PLACEMENT_POSE_BOUND_MM = 8.0
-PLACEMENT_ORIENTATION_LONGEST_EDGE_RATIO_MIN = 1.15
-PLACEMENT_ORIENTATION_SAMPLE_SPREAD_MAX_DEG = 8.0
-PLACEMENT_TARGET_WHITE_COVERAGE = 0.72
-PLACEMENT_REQUIRED_CHECKS = 1
-PLACEMENT_VERIFY_REQUIRED_PASSES = 2
-PLACEMENT_COVERAGE_SAMPLE_STRIDE = 2
-PLACEMENT_DELTA_TARGET_COVERAGE_MIN = 0.65
-PLACEMENT_DELTA_AREA_RATIO_MIN = 0.55
-PLACEMENT_DELTA_AREA_RATIO_MAX = 1.40
-PLACEMENT_DELTA_SPILL_MAX = 0.15
-PLACEMENT_SOURCE_REMOVAL_MIN = 0.40
-PLACEMENT_DELTA_ENVELOPE_MM = 8.0
-
 # Lightweight motion detection on the rectified A4 grayscale image.
 MOTION_SAMPLE_WIDTH = 80
 MOTION_SAMPLE_HEIGHT = 112
@@ -380,11 +311,6 @@ MOTION_DIVIDER_IGNORE_MM = 3.0
 MOTION_PIXEL_DIFF_THRESHOLD = 18
 MOTION_MEAN_ABS_DIFF_THRESHOLD = 5.0
 MOTION_CHANGED_PIXEL_RATIO = 0.035
-MOTION_START_CONFIRM_FRAMES = 2
-MOTION_END_CONFIRM_FRAMES = 4
-POST_MOTION_STABLE_FRAMES = 4
-POST_MOTION_VERIFY_SAMPLES = 3
-MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 
 # Runtime completion uses only the source half: after its white area remains at
 # or below 3% of the frozen initial piece area for ten motion-free frames, all
@@ -392,31 +318,22 @@ MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 # target-half and rectangle metrics below remain available for offline
 # diagnostics, but never veto runtime completion.
 FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX = 0.03
-FINAL_TRIGGER_LOWER_AREA_RATIO_MIN = 0.70
 FINAL_TRIGGER_STABLE_FRAMES = 10
-FINAL_RECT_FILL_MIN = 0.70
-FINAL_AREA_RATIO_MIN = 0.75
-FINAL_AREA_RATIO_MAX = 1.25
-FINAL_RECT_DIM_TOLERANCE_MM = 15.0
-FINAL_RECT_ENVELOPE_MM = 20.0
-FINAL_RECT_SPILL_MAX = 0.15
-FINAL_VERIFY_SAMPLE_COUNT = 3
-FINAL_VERIFY_REQUIRED_PASSES = 2
 
 # Runtime/UI controls.
 DEBUG_SHOW_CAMERA = False
+# Recognition-only debug builds may hold the state machine in ACQUIRE after
+# stable detection and compare the traced boundary with the fitted polygon on
+# the exact rectified image. Production profiles leave both switches disabled.
+DEBUG_RECOGNITION_HOLD_BEFORE_PLANNING = False
+DEBUG_DRAW_RECTIFIED_CONTOURS = False
+DEBUG_RECTIFIED_RAW_MAX_POINTS = 240
 DISPLAY_EVERY_N_FRAMES = 2
 PENDING_PRINT_EVERY_N_FRAMES = 15
 LOOP_IDLE_MS = 5
 AUTO_STOP_SECONDS = 0
 MAX_FRAME_COUNT = 0
 A4_DETECT_INTERVAL_ACQUIRE = 2
-A4_DETECT_INTERVAL_PLACING = 8
-# Disabled by default: normal placement checks are motion-triggered. When
-# enabled this low-frequency watchdog is diagnostic/recovery only.
-PLACING_VERIFICATION_INTERVAL_MS = 30000
-ENABLE_PLACEMENT_WATCHDOG = False
-UI_COUNTDOWN_REFRESH_INTERVAL_MS = 1000
 
 # Lightweight performance instrumentation.  Detailed collection and reporting
 # are disabled by default so the instrumentation itself does not reduce FPS.

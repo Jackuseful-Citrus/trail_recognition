@@ -23,7 +23,9 @@ from puzzle_geometry import (
     PieceTracker,
     begin_plan_debug,
     end_plan_debug,
-    plan_rectangle_assembly,
+)
+from puzzle_simulator_free_rect_planner import (
+    plan_simulator_free_rectangle,
 )
 from puzzle_vision import detect_pieces_from_canmv_image
 
@@ -90,7 +92,11 @@ def _init_hardware():
     sensor.set_framesize(
         width=cfg.FRAME_WIDTH, height=cfg.FRAME_HEIGHT
     )
-    sensor.set_pixformat(Sensor.RGB565)
+    sensor.set_pixformat(
+        Sensor.GRAYSCALE
+        if getattr(cfg, "CAMERA_GRAYSCALE", False)
+        else Sensor.RGB565
+    )
 
     Display.init(
         Display.ST7701,
@@ -840,13 +846,11 @@ def main():
                 # not rerun the beam search every frame.
                 if not last_stable or active_plan is None:
                     begin_plan_debug(
-                        "fixed_rectangle"
-                        if cfg.TARGET_RECT_SIZE_MM is not None
-                        else "outer_first",
+                        "simulator_free_rect",
                         len(pieces),
                     )
                     try:
-                        active_plan = plan_rectangle_assembly(
+                        active_plan = plan_simulator_free_rectangle(
                             pieces
                         )
                     finally:

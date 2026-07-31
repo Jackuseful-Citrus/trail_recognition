@@ -1,64 +1,49 @@
-"""Focused tests for source-clear completion and offline final metrics."""
+"""Focused tests for the retained source-clear completion flow."""
 
 import unittest
 
 import puzzle_config as cfg
 from puzzle_placement import (
-    final_frame_pass,
-    final_rectangle_consensus,
-    final_rectangle_metrics,
+    final_foreground_mask_from_gray,
+    final_region_white_metrics,
 )
 from puzzle_realtime_state import (
     FinalCheckState,
-    placement_phase_actions,
+    divider_overlay_endpoints,
+    phase_allows_vision,
 )
 
 
 class FinalCheckTests(unittest.TestCase):
     WIDTH = 210
     HEIGHT = 297
-    TARGET = (55.0, 190.0, 155.0, 250.0)
+    class _GrayRows(list):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.shape = (len(rows), len(rows[0]))
 
-    @classmethod
-    def _rectangle_mask(cls, rect):
-        mask = bytearray(cls.WIDTH * cls.HEIGHT)
-        for y in range(rect[1], rect[3]):
-            for x in range(rect[0], rect[2]):
-                mask[y * cls.WIDTH + x] = 1
-        return mask
-
-    def _metrics(self, rect):
-        return final_rectangle_metrics(
-            self._rectangle_mask(rect),
-            self.WIDTH,
-            self.HEIGHT,
-            self.TARGET,
-            6000.0,
+    def test_final_mask_excludes_border_and_divider(self):
+        gray = self._GrayRows([[255] * 6 for _ in range(6)])
+        mask = final_foreground_mask_from_gray(
+            gray,
+            180,
+            border_px=1,
+            divider_y_mm=cfg.A4_HEIGHT_MM * 2.5 / 6.0,
         )
+        self.assertEqual(sum(mask), 12)
 
-    def test_final_pass(self):
-        metrics = self._metrics((55, 190, 155, 250))
-        metrics["valid"] = final_frame_pass(metrics, 0.0)
-        result = final_rectangle_consensus(
-            [metrics, metrics, dict(metrics, valid=False)]
+    def test_final_region_metrics_split_source_and_target(self):
+        mask = bytearray(4 * 4)
+        mask[0:4] = b"\x01" * 4
+        mask[12:16] = b"\x01" * 4
+        metrics = final_region_white_metrics(
+            mask,
+            4,
+            4,
+            1000.0,
         )
-        self.assertTrue(result["valid"])
-        self.assertEqual(result["pass_count"], 2)
-
-    def test_final_fail(self):
-        metrics = self._metrics((15, 190, 115, 250))
-        self.assertGreater(metrics["center_error_mm"], 15.0)
-        metrics["valid"] = final_frame_pass(metrics, 0.0)
-        result = final_rectangle_consensus(
-            [metrics, metrics, dict(metrics, valid=True)]
-        )
-        self.assertFalse(result["valid"])
-        self.assertEqual(result["pass_count"], 1)
-
-    def test_final_width_height_swap(self):
-        metrics = self._metrics((75, 170, 135, 270))
-        self.assertTrue(metrics["dimensions_swapped"])
-        self.assertTrue(final_frame_pass(metrics, 0.0))
+        self.assertEqual(metrics["upper_foreground_count"], 4)
+        self.assertEqual(metrics["lower_foreground_count"], 4)
 
     def test_source_clear_requires_consecutive_still_frames(self):
         flow = FinalCheckState(
@@ -87,10 +72,34 @@ class FinalCheckTests(unittest.TestCase):
         self.assertEqual(state["stable_frames"], 10)
 
     def test_final_phases_never_run_piece_detection(self):
-        for phase in ("WAIT_FINAL_CHECK", "COMPLETE"):
-            actions = placement_phase_actions(phase)
-            self.assertFalse(actions["piece_detection"])
-            self.assertFalse(actions["tracker_update"])
+        self.assertTrue(phase_allows_vision("WAIT_FINAL_CHECK"))
+        self.assertFalse(phase_allows_vision("COMPLETE"))
+
+    def test_divider_overlay_requires_confirmation_and_keeps_slope(self):
+        self.assertIsNone(
+            divider_overlay_endpoints(None, cfg.A4_WIDTH_MM)
+        )
+        self.assertIsNone(
+            divider_overlay_endpoints(
+                {
+                    "detected": False,
+                    "divider_y_mm": 148.5,
+                    "slope_mm": 0.0,
+                },
+                cfg.A4_WIDTH_MM,
+            )
+        )
+        self.assertEqual(
+            divider_overlay_endpoints(
+                {
+                    "detected": True,
+                    "divider_y_mm": 150.0,
+                    "slope_mm": 4.0,
+                },
+                cfg.A4_WIDTH_MM,
+            ),
+            ((0.0, 148.0), (210.0, 152.0)),
+        )
 
 
 if __name__ == "__main__":

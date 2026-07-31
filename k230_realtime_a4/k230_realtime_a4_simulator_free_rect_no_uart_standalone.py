@@ -9515,7 +9515,8 @@ def _plan_key(pieces):
 
 
 
-
+# Test-build invariant: never import or execute UART support.
+UART_COMMUNICATION_ENABLED = False
 
 #!/usr/bin/env python3
 """K230 puzzle recognition using a fixed manual A4 calibration."""

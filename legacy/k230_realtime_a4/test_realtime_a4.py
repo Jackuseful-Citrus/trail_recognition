@@ -26,20 +26,16 @@ from puzzle_a4_boundary import (
 from puzzle_realtime_state import (
     MotionDetector,
     PieceCountConsensus,
-    PlacementMotionState,
-    RealtimePhaseState,
     a4_detection_interval,
     bottom_right_thumbnail_rect,
-    phase_allows_vision,
     operator_overlay_visibility,
     operator_status_line,
-    placement_phase_actions,
-    plan_frozen_pieces,
     planning_input_integrity,
-    placement_ui_key,
+    planning_input_integrity_unless_fixed_template,
     periodic_output_due,
-    should_render_ui,
+    recognition_gate_ready,
     top_right_thumbnail_rect,
+    tracking_expected_piece_count,
 )
 
 
@@ -165,7 +161,9 @@ class AutomaticA4Tests(unittest.TestCase):
         self.assertEqual(diagnostics["valid_candidates"], 1)
         self.assertAlmostEqual(
             candidate["corners_px"][0][0],
-            self.corners[0][0] * 799.0 / 319.0,
+            self.corners[0][0]
+            * 799.0
+            / float(cfg.A4_DETECT_WIDTH - 1),
             places=4,
         )
 
@@ -584,7 +582,7 @@ class AutomaticA4Tests(unittest.TestCase):
 class RealtimeDisplayStateTests(unittest.TestCase):
     def test_operator_view_hides_piece_layers_during_motion(self):
         waiting = operator_overlay_visibility(
-            "WAIT_FOR_MOTION", False
+            "ACQUIRE", False
         )
         self.assertTrue(waiting["a4"])
         self.assertTrue(waiting["status"])
@@ -592,33 +590,27 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         self.assertTrue(waiting["targets"])
 
         moving = operator_overlay_visibility(
-            "WAIT_FOR_MOTION", True
+            "ACQUIRE", True
         )
         self.assertTrue(moving["a4"])
         self.assertTrue(moving["status"])
         self.assertFalse(moving["pieces"])
         self.assertFalse(moving["targets"])
-        self.assertEqual(
-            operator_overlay_visibility("MOVING"),
-            moving,
+        final = operator_overlay_visibility(
+            "WAIT_FINAL_CHECK", True
         )
+        self.assertTrue(final["pieces"])
+        self.assertTrue(final["targets"])
 
     def test_operator_status_line_is_short_and_state_specific(self):
         self.assertEqual(
             operator_status_line(
-                "WAIT_FOR_MOTION",
+                "WAIT_FINAL_CHECK",
                 4,
                 plan_available=True,
                 plan_valid=True,
-                next_piece_id="P2",
-                completed_count=1,
-                total_count=4,
             ),
-            "WAIT MOVE | NEXT:P2 | DONE:1/4",
-        )
-        self.assertEqual(
-            operator_status_line("MOVING", 4),
-            "MOVING | OVERLAYS PAUSED",
+            "WAIT FINAL CHECK",
         )
         self.assertEqual(
             operator_status_line(
@@ -631,65 +623,20 @@ class RealtimeDisplayStateTests(unittest.TestCase):
             "ACQUIRE | PLAN BLOCKED | P:4",
         )
 
-    def _placement_state(self, completed=None, next_id="P1"):
-        return {
-            "completed": set(completed or ()),
-            "next_piece_id": next_id,
-            "observed_count": 2,
-            "matched_count": 2,
-            "visible_pieces": [],
-        }
-
-    def test_static_placing_state_skips_full_render(self):
-        state = self._placement_state()
-        key = placement_ui_key(
-            "PLACING", state, 4200, 1000
-        )
-        same_bucket = placement_ui_key(
-            "PLACING", state, 4001, 1000
-        )
-        self.assertFalse(should_render_ui(key, same_bucket))
-
-    def test_countdown_or_result_change_requests_render(self):
-        state = self._placement_state()
-        initial = placement_ui_key(
-            "PLACING", state, 4200, 1000
-        )
-        countdown_changed = placement_ui_key(
-            "PLACING", state, 3900, 1000
-        )
-        completed_changed = placement_ui_key(
-            "PLACING",
-            self._placement_state({"P1"}, "P2"),
-            3900,
-            1000,
-        )
-        self.assertTrue(
-            should_render_ui(initial, countdown_changed)
-        )
-        self.assertTrue(
-            should_render_ui(
-                countdown_changed, completed_changed
-            )
-        )
-
-    def test_placing_freezes_a4_updates(self):
+    def test_locked_or_final_state_freezes_a4_updates(self):
         self.assertEqual(
-            a4_detection_interval("ACQUIRE", 2, 8), 2
+            a4_detection_interval("ACQUIRE", 2), 2
         )
         self.assertIsNone(
             a4_detection_interval(
-                "ACQUIRE", 2, 8, locked=True
+                "ACQUIRE", 2, locked=True
             )
         )
         self.assertIsNone(
-            a4_detection_interval("PLACING", 2, 8)
+            a4_detection_interval("WAIT_FINAL_CHECK", 2)
         )
         self.assertIsNone(
-            a4_detection_interval("MOVING", 2, 8)
-        )
-        self.assertIsNone(
-            a4_detection_interval("COMPLETE", 2, 8)
+            a4_detection_interval("COMPLETE", 2)
         )
 
     def test_gray_thumbnail_fits_bottom_right_and_keeps_aspect(self):
@@ -736,16 +683,6 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         ]
         self.assertEqual(due, [0, 2, 4])
 
-    def test_complete_disables_vision_and_reset_restores_acquire(self):
-        flow = RealtimePhaseState()
-        flow.start_placing()
-        flow.complete()
-        self.assertFalse(flow.vision_enabled())
-        self.assertFalse(phase_allows_vision("COMPLETE"))
-        flow.reset()
-        self.assertEqual(flow.phase, "ACQUIRE")
-        self.assertTrue(flow.vision_enabled())
-
     def test_unknown_two_piece_count_becomes_ready(self):
         consensus = PieceCountConsensus(2, 4, 12, 5, 2)
         state = None
@@ -779,38 +716,25 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         self.assertTrue(state["ready"])
         self.assertEqual(state["expected_count"], 3)
 
-    def test_motion_state_pauses_until_one_stable_verify_pulse(self):
-        detector = MotionDetector(18, 5.0, 0.035)
-        flow = PlacementMotionState(2, 4, 4)
-        still = np.full((12, 12), 40, dtype=np.uint8)
-        moving = still.copy()
-        moving[2:10, 2:10] = 180
-        frames = [
-            still,
-            moving,
-            still,
-            still,
-            still,
-            still,
-            still,
-        ]
-        phases = []
-        trigger_frames = []
-        for frame_index, frame in enumerate(frames):
-            metrics = detector.update(frame)
-            state = flow.update(
-                metrics["motion"], frame_index
+    def test_fixed_count_tracking_runs_while_consensus_settles(self):
+        consensus = PieceCountConsensus(4, 4, 12, 4, 2)
+        state = consensus.state()
+        self.assertEqual(
+            tracking_expected_piece_count(4, state), 4
+        )
+        for _ in range(3):
+            state = consensus.update(4)
+            self.assertFalse(
+                recognition_gate_ready(state, True)
             )
-            phases.append(state["phase"])
-            if state["trigger_verify"]:
-                trigger_frames.append(frame_index)
-        # Adjacent-frame differencing sees both the entry and exit transition
-        # as motion, then four unchanged frames end/settle the move.
-        self.assertIn("MOVING", phases)
-        self.assertEqual(trigger_frames, [6])
-        self.assertEqual(flow.verify_trigger_count, 1)
-        flow.verification_finished()
-        self.assertEqual(flow.phase, "WAIT_FOR_MOTION")
+            self.assertEqual(
+                tracking_expected_piece_count(4, state), 4
+            )
+        state = consensus.update(4)
+        self.assertTrue(recognition_gate_ready(state, True))
+
+    def test_production_disables_full_gray_sanity_scan(self):
+        self.assertFalse(cfg.ENABLE_GRAY_SANITY_DIAGNOSTICS)
 
     def test_motion_detector_uses_both_mean_and_changed_ratio(self):
         detector = MotionDetector(18, 5.0, 0.20)
@@ -823,60 +747,6 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         broad = np.full((10, 10), 80, dtype=np.uint8)
         metrics = detector.update(broad)
         self.assertTrue(metrics["motion"])
-
-    def test_slow_cumulative_scene_change_triggers_placement(self):
-        detector = MotionDetector(18, 5.0, 0.035)
-        flow = PlacementMotionState(2, 4, 4)
-        base = np.zeros((20, 20), dtype=np.uint8)
-        detector.update(base)
-        phases = []
-        for frame_index, changed_pixels in enumerate(
-            (20, 40, 60), start=1
-        ):
-            frame = base.copy()
-            frame.flat[:changed_pixels] = 80
-            metrics = detector.update(frame)
-            # Each adjacent step changes too little mean intensity to trigger.
-            self.assertFalse(metrics["motion"])
-            signal = (
-                metrics["motion"]
-                or metrics["scene_change"]
-            )
-            phases.append(
-                flow.update(signal, frame_index)["phase"]
-            )
-        self.assertIn("MOVING", phases)
-
-        placed = base.copy()
-        placed.flat[:60] = 80
-        state = None
-        for frame_index in range(4, 8):
-            metrics = detector.update(placed)
-            state = flow.update(
-                metrics["motion"], frame_index
-            )
-        self.assertTrue(state["trigger_verify"])
-        flow.verification_finished()
-        detector.accept_current_as_reference()
-        metrics = detector.update(placed)
-        self.assertFalse(metrics["scene_change"])
-
-    def test_moving_phase_pauses_all_expensive_vision(self):
-        for phase in (
-            "WAIT_FOR_MOTION",
-            "MOVING",
-            "POST_MOTION_SETTLE",
-        ):
-            actions = placement_phase_actions(phase)
-            self.assertTrue(actions["motion_detection"])
-            self.assertFalse(actions["piece_detection"])
-            self.assertFalse(actions["tracker_update"])
-            self.assertFalse(actions["placement_check"])
-            self.assertFalse(actions["a4_update"])
-        verify = placement_phase_actions("VERIFY_PLACEMENT")
-        self.assertTrue(verify["piece_detection"])
-        self.assertTrue(verify["placement_check"])
-        self.assertFalse(verify["tracker_update"])
 
     def test_planning_input_gate_rejects_missing_duplicate_and_border(self):
         polygons = [
@@ -939,102 +809,16 @@ class RealtimeDisplayStateTests(unittest.TestCase):
         self.assertFalse(border["valid"])
         self.assertIn("border_blob", border["failures"])
 
-    def test_fixed_target_routes_only_to_fixed_planner(self):
-        calls = []
-
-        class Result:
-            valid = True
-            reason = "ok"
-
-        def fixed(pieces):
-            calls.append(("fixed", tuple(pieces)))
-            return Result()
-
-        def unknown(pieces, target_size_mm=None):
-            calls.append(
-                (
-                    "unknown",
-                    tuple(pieces),
-                    target_size_mm,
-                )
-            )
-            return Result()
-
-        routing = plan_frozen_pieces(
-            ["P1", "P2"],
-            (100.0, 60.0),
-            fixed,
-            unknown,
-        )
-        self.assertEqual(routing["planner"], "fixed_rectangle")
-        self.assertEqual(
-            [item[0] for item in calls],
-            ["fixed"],
-        )
-
-        calls.clear()
-        routing = plan_frozen_pieces(
-            ["P1", "P2"],
+        bypass = planning_input_integrity_unless_fixed_template(
+            True,
+            pieces,
             None,
-            fixed,
-            unknown,
+            polygon_overlap_area,
+            required_piece_count=4,
+            rejected_border_blobs=1,
+            max_rejected_border_blobs=0,
         )
-        self.assertEqual(routing["planner"], "outer_first")
-        self.assertEqual(
-            calls,
-            [("unknown", ("P1", "P2"), None)],
-        )
-
-        calls.clear()
-        routing = plan_frozen_pieces(
-            ["P1", "P2"],
-            (100.0, 60.0),
-            fixed,
-            unknown,
-            prefer_outer_first=True,
-            preferred_planner_name="simulator",
-        )
-        self.assertEqual(routing["planner"], "simulator")
-        self.assertEqual(
-            calls,
-            [
-                (
-                    "unknown",
-                    ("P1", "P2"),
-                    (100.0, 60.0),
-                )
-            ],
-        )
-
-        class InvalidResult:
-            valid = False
-            reason = "fixed failed"
-
-        def invalid_fixed(pieces):
-            calls.append(("fixed", tuple(pieces)))
-            return InvalidResult()
-
-        calls.clear()
-        routing = plan_frozen_pieces(
-            ["P1", "P2"],
-            (100.0, 60.0),
-            invalid_fixed,
-            unknown,
-            allow_unknown_fallback=True,
-        )
-        self.assertTrue(routing["fallback_used"])
-        self.assertEqual(
-            calls,
-            [
-                ("fixed", ("P1", "P2")),
-                (
-                    "unknown",
-                    ("P1", "P2"),
-                    (100.0, 60.0),
-                ),
-            ],
-        )
-
+        self.assertIsNone(bypass)
 
 if __name__ == "__main__":
     unittest.main()

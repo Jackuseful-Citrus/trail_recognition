@@ -18,9 +18,10 @@ from puzzle_geometry import (
 )
 import puzzle_simulator_free_rect_planner as free_planner
 from puzzle_simulator_free_rect_planner import (
+    is_fixed_figure2_piece_set,
+    match_fixed_figure2_piece_set,
     plan_simulator_free_rectangle,
 )
-from puzzle_simulator_planner import plan_simulator_rectangle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -366,33 +367,9 @@ class FreeRectanglePlannerTests(unittest.TestCase):
         )
         self.assertNotIn("FREE_PLAN_START", log)
 
-    def test_frame_33_fixture_keeps_fixed_baseline_and_uses_direct_plan(self):
-        payload, pieces = _load_frame_33()
-        baseline = payload["current_fixed_baseline"]
-        fixed = plan_simulator_rectangle(
-            pieces, validation="upstream"
-        )
-        self.assertEqual(fixed.valid, baseline["valid"])
-        self.assertEqual(
-            fixed.plan_stats["candidate_count"],
-            baseline["candidate_count"],
-        )
-        self.assertEqual(
-            fixed.plan_stats["matching_sets_evaluated"],
-            baseline["matching_sets_evaluated"],
-        )
-        self.assertAlmostEqual(
-            fixed.score, baseline["score"], places=10
-        )
-        self.assertAlmostEqual(
-            fixed.overlap_mm2,
-            baseline["overlap_mm2"],
-            places=8,
-        )
-        self.assertEqual(
-            list(fixed.target_rect), baseline["target_rect"]
-        )
-
+    def test_frame_33_fixture_uses_direct_plan(self):
+        _payload, pieces = _load_frame_33()
+        self.assertTrue(is_fixed_figure2_piece_set(pieces))
         cfg.FREE_RECT_MAX_COMPLETE_SETS = 400
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -426,6 +403,100 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             "FREE_FIXED_TEMPLATE_BYPASS,enumeration=SKIPPED,"
             "safety_gates=SKIPPED",
             output.getvalue(),
+        )
+
+    def test_cached_fixed_match_is_reused_by_planner(self):
+        _payload, pieces = _load_frame_33()
+        evaluation = match_fixed_figure2_piece_set(pieces)
+        self.assertIsNotNone(evaluation[0])
+        original = free_planner._free_figure2_match
+
+        def unexpected_recalculation(*_args, **_kwargs):
+            raise AssertionError("fixed template match recalculated")
+
+        free_planner._free_figure2_match = unexpected_recalculation
+        try:
+            result = plan_simulator_free_rectangle(
+                pieces,
+                fixed_template_evaluation=evaluation,
+            )
+        finally:
+            free_planner._free_figure2_match = original
+        self.assertTrue(result.valid, result.reason)
+        self.assertEqual(
+            result.mode, free_planner.FIGURE2_DIRECT_MODE
+        )
+
+    def test_timed_board_geometry_prefers_requested_aspect_band(self):
+        rows = [
+            (
+                "P1",
+                3072.3,
+                (156.82, 56.83),
+                [
+                    (113.11, 33.64),
+                    (180.41, 107.47),
+                    (194.66, 98.26),
+                    (156.08, 12.84),
+                ],
+            ),
+            (
+                "P2",
+                1401.7,
+                (62.02, 87.95),
+                [
+                    (50.08, 105.11),
+                    (82.86, 115.08),
+                    (84.61, 98.70),
+                    (57.87, 60.20),
+                    (41.70, 57.40),
+                ],
+            ),
+            (
+                "P3",
+                1107.5,
+                (93.78, 41.55),
+                [
+                    (64.45, 34.08),
+                    (106.53, 64.62),
+                    (119.69, 54.44),
+                    (91.63, 19.03),
+                ],
+            ),
+            (
+                "P4",
+                495.0,
+                (137.52, 105.20),
+                [
+                    (128.46, 126.59),
+                    (152.13, 107.11),
+                    (131.96, 81.89),
+                ],
+            ),
+        ]
+        pieces = [
+            PieceObservation(
+                piece_id,
+                [],
+                polygon,
+                centroid_mm=center,
+                area_mm2=area,
+            )
+            for piece_id, area, center, polygon in rows
+        ]
+        cfg.FREE_RECT_MAX_PLAN_TIME_MS = 0
+        cfg.FREE_RECT_MAX_COMPLETE_SETS = 54
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = plan_simulator_free_rectangle(pieces)
+        self.assertTrue(result.valid, result.reason)
+        self.assertTrue(result.plan_stats["aspect_preferred"])
+        self.assertGreaterEqual(
+            result.plan_stats["aspect_ratio"],
+            cfg.FREE_RECT_PREFERRED_ASPECT_MIN,
+        )
+        self.assertLessEqual(
+            result.plan_stats["aspect_ratio"],
+            cfg.FREE_RECT_PREFERRED_ASPECT_MAX,
         )
 
     def test_timeout_returns_best_so_far(self):
@@ -513,13 +584,18 @@ class FreeRectanglePlannerTests(unittest.TestCase):
         for log in logs[1:]:
             self.assertEqual(log, logs[0])
 
-    def test_fixed_defaults_are_unchanged(self):
-        self.assertEqual(cfg.PLANNER_BACKEND, "outer_first")
-        self.assertEqual(cfg.TARGET_RECT_SIZE_MM, (100.0, 60.0))
-        self.assertEqual(cfg.MAX_PLAN_TIME_MS, 3000)
+    def test_removed_planner_modes_have_no_config_switches(self):
+        for name in (
+            "PLANNER_BACKEND",
+            "TARGET_RECT_SIZE_MM",
+            "MAX_PLAN_TIME_MS",
+            "SIMULATOR_MAX_MATCHING_SETS",
+            "PREFER_OUTER_FIRST_PLANNER",
+            "FIXED_RECT_BEAM_WIDTH",
+        ):
+            self.assertFalse(hasattr(cfg, name), name)
         self.assertEqual(cfg.SIMULATOR_MAX_CANDIDATES, 80)
-        self.assertEqual(cfg.SIMULATOR_MAX_MATCHING_SETS, 4000)
-        self.assertEqual(cfg.MIN_PIECE_COUNT, 2)
+        self.assertEqual(cfg.MIN_PIECE_COUNT, 4)
         self.assertEqual(cfg.MAX_PIECE_COUNT, 4)
 
     def test_module_and_generated_bundle_are_micropython_safe(self):
@@ -549,8 +625,6 @@ class FreeRectanglePlannerTests(unittest.TestCase):
                         / "k230_realtime_a4"
                         / "build_standalone.py"
                     ),
-                    "--planner-backend",
-                    "simulator_free_rect",
                     "--output",
                     str(output),
                 ],
@@ -562,12 +636,19 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             bundle = output.read_text(encoding="utf-8")
             compile(bundle, str(output), "exec")
             self.assertIn(
-                "cfg.PLANNER_BACKEND = 'simulator_free_rect'",
-                bundle,
+                'ACTIVE_PLANNER = "simulator_free_rect"', bundle
             )
             self.assertIn(
                 "def plan_simulator_free_rectangle", bundle
             )
+            for removed in (
+                "def plan_simulator_rectangle",
+                "def plan_outer_first_rectangle",
+                "def plan_rectangle_assembly",
+                "def detect_pieces_from_gray",
+                "class PlacementMonitor",
+            ):
+                self.assertNotIn(removed, bundle)
             self.assertIn(
                 "FREE_FIXED_TEMPLATE_BYPASS,"
                 "enumeration=SKIPPED",

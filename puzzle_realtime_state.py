@@ -1,6 +1,26 @@
 """Pure state/scheduling helpers shared by K230 runtime and desktop tests."""
 
 
+def divider_overlay_endpoints(divider_state, a4_width_mm):
+    """Return confirmed left/right divider endpoints, or no display line.
+
+    ``slope_mm`` is the total vertical change across the rectified A4 width,
+    matching the piece-stage divider detector's diagnostics.
+    """
+    if (
+        not divider_state
+        or not divider_state.get("detected", False)
+    ):
+        return None
+    center_y_mm = float(divider_state["divider_y_mm"])
+    slope_mm = float(divider_state.get("slope_mm", 0.0))
+    half_slope = 0.5 * slope_mm
+    return (
+        (0.0, center_y_mm - half_slope),
+        (float(a4_width_mm), center_y_mm + half_slope),
+    )
+
+
 def phase_allows_vision(phase):
     """COMPLETE retains the last display but performs no more vision work."""
     return phase != "COMPLETE"
@@ -9,7 +29,6 @@ def phase_allows_vision(phase):
 def a4_detection_interval(
     phase,
     acquire_interval,
-    placing_interval,
     locked=False,
 ):
     # The board and camera are fixed.  Once the initial A4 acquisition has
@@ -17,63 +36,9 @@ def a4_detection_interval(
     # into a different perspective transform every few frames.
     if locked:
         return None
-    if phase in (
-        "WAIT_FINAL_CHECK",
-        "FINAL_VERIFY",
-        "WAIT_FOR_MOTION",
-        "MOVING",
-        "POST_MOTION_SETTLE",
-        "VERIFY_PLACEMENT",
-        "PLACING",
-    ):
-        return None
-    if phase == "COMPLETE":
+    if phase in ("WAIT_FINAL_CHECK", "COMPLETE"):
         return None
     return max(1, int(acquire_interval))
-
-
-def countdown_bucket(remaining_ms, refresh_interval_ms):
-    """Quantize countdown display updates to remaining whole intervals."""
-    remaining = max(0, int(remaining_ms))
-    interval = max(1, int(refresh_interval_ms))
-    if remaining == 0:
-        return 0
-    return (remaining + interval - 1) // interval
-
-
-def _visible_piece_key(placement_state):
-    result = []
-    for piece in placement_state.get("visible_pieces", ()):
-        center = piece.centroid_mm
-        result.append(
-            (
-                piece.piece_id,
-                int(round(center[0] * 2.0)),
-                int(round(center[1] * 2.0)),
-                len(piece.polygon_mm),
-            )
-        )
-    return tuple(result)
-
-
-def placement_ui_key(
-    phase,
-    placement_state,
-    remaining_ms,
-    refresh_interval_ms,
-    error=None,
-):
-    """Return a compact key containing every dynamic placement UI field."""
-    return (
-        phase,
-        tuple(sorted(placement_state.get("completed", ()))),
-        placement_state.get("next_piece_id"),
-        int(placement_state.get("observed_count", 0)),
-        int(placement_state.get("matched_count", 0)),
-        _visible_piece_key(placement_state),
-        countdown_bucket(remaining_ms, refresh_interval_ms),
-        str(error or ""),
-    )
 
 
 def status_ui_key(
@@ -164,43 +129,16 @@ def periodic_output_due(output_index, every_n_outputs):
     return max(0, int(output_index)) % interval == 0
 
 
-def placement_phase_actions(phase):
-    """Declare which expensive actions are permitted in each frozen-plan phase."""
-    if phase in ("WAIT_FINAL_CHECK", "FINAL_VERIFY", "COMPLETE"):
-        return {
-            "motion_detection": phase != "COMPLETE",
-            "piece_detection": False,
-            "tracker_update": False,
-            "placement_check": phase == "FINAL_VERIFY",
-            "a4_update": False,
-        }
-    verify = phase in ("VERIFY_PLACEMENT", "FINAL_VERIFY")
-    return {
-        "motion_detection": phase
-        in (
-            "WAIT_FOR_MOTION",
-            "MOVING",
-            "POST_MOTION_SETTLE",
-            "VERIFY_PLACEMENT",
-            "FINAL_VERIFY",
-        ),
-        "piece_detection": verify,
-        "tracker_update": False,
-        "placement_check": verify,
-        "a4_update": False,
-    }
-
-
 def operator_overlay_visibility(phase, motion_active=False):
     """Return the live operator-view layers allowed in the current phase."""
-    if phase in ("WAIT_FINAL_CHECK", "FINAL_VERIFY", "COMPLETE"):
+    if phase in ("WAIT_FINAL_CHECK", "COMPLETE"):
         return {
             "a4": True,
             "status": True,
             "pieces": True,
             "targets": True,
         }
-    moving = bool(motion_active) or phase == "MOVING"
+    moving = bool(motion_active)
     return {
         "a4": True,
         "status": True,
@@ -215,9 +153,6 @@ def operator_status_line(
     stable=False,
     plan_available=False,
     plan_valid=False,
-    next_piece_id=None,
-    completed_count=0,
-    total_count=0,
     error=None,
 ):
     """Build one short line for the narrow strip below the camera-view A4."""
@@ -225,22 +160,8 @@ def operator_status_line(
         return "{} | ERROR".format(phase)
     if phase == "WAIT_FINAL_CHECK":
         return "WAIT FINAL CHECK"
-    if phase == "MOVING":
-        return "MOVING | OVERLAYS PAUSED"
-    if phase == "POST_MOTION_SETTLE":
-        return "SETTLING | KEEP CLEAR"
-    if phase == "VERIFY_PLACEMENT":
-        return "VERIFY | {}".format(next_piece_id or "-")
-    if phase == "FINAL_VERIFY":
-        return "FINAL VERIFY"
     if phase == "COMPLETE":
         return "COMPLETE | PASS"
-    if phase == "WAIT_FOR_MOTION":
-        return "WAIT MOVE | NEXT:{} | DONE:{}/{}".format(
-            next_piece_id or "-",
-            completed_count,
-            total_count,
-        )
     if phase == "PLANNING":
         return "PLANNING | P:{}".format(piece_count)
     if plan_available and not plan_valid:
@@ -251,49 +172,6 @@ def operator_status_line(
         piece_count,
         "STABLE" if stable else "TRACKING",
     )
-
-
-def plan_frozen_pieces(
-    pieces,
-    target_rect_size_mm,
-    fixed_planner,
-    unknown_planner,
-    allow_unknown_fallback=False,
-    prefer_outer_first=False,
-    preferred_planner_name="outer_first",
-):
-    """Route one frozen input to the configured planner exactly once."""
-    if target_rect_size_mm is None:
-        return {
-            "plan": unknown_planner(pieces),
-            "planner": preferred_planner_name,
-            "fallback_used": False,
-        }
-    if prefer_outer_first:
-        return {
-            "plan": unknown_planner(
-                pieces,
-                target_size_mm=target_rect_size_mm,
-            ),
-            "planner": preferred_planner_name,
-            "fallback_used": False,
-        }
-    fixed_result = fixed_planner(pieces)
-    if fixed_result.valid or not allow_unknown_fallback:
-        return {
-            "plan": fixed_result,
-            "planner": "fixed_rectangle",
-            "fallback_used": False,
-        }
-    return {
-        "plan": unknown_planner(
-            pieces,
-            target_size_mm=target_rect_size_mm,
-        ),
-        "planner": preferred_planner_name,
-        "fallback_used": True,
-        "fixed_failure_reason": fixed_result.reason,
-    }
 
 
 def planning_input_integrity(
@@ -379,6 +257,24 @@ def planning_input_integrity(
     }
 
 
+def planning_input_integrity_unless_fixed_template(
+    fixed_template_match,
+    pieces,
+    target_rect_size_mm,
+    overlap_area,
+    **kwargs
+):
+    """Bypass generic frozen-input gates for the known four-piece set."""
+    if fixed_template_match:
+        return None
+    return planning_input_integrity(
+        pieces,
+        target_rect_size_mm,
+        overlap_area,
+        **kwargs
+    )
+
+
 class MotionDetector:
     """Low-cost adjacent-frame gray difference on sparse A4 samples."""
 
@@ -390,7 +286,6 @@ class MotionDetector:
         "divider_start",
         "divider_end",
         "previous",
-        "reference",
         "last_metrics",
     )
 
@@ -413,37 +308,21 @@ class MotionDetector:
             self.divider_start = int(divider_rows[0])
             self.divider_end = int(divider_rows[1])
         self.previous = None
-        self.reference = None
         self.last_metrics = {
             "mean_abs_diff": 0.0,
             "changed_ratio": 0.0,
             "motion": False,
-            "scene_mean_abs_diff": 0.0,
-            "scene_changed_ratio": 0.0,
-            "scene_change": False,
             "sample_count": 0,
         }
 
     def reset(self):
         self.previous = None
-        self.reference = None
         self.last_metrics = {
             "mean_abs_diff": 0.0,
             "changed_ratio": 0.0,
             "motion": False,
-            "scene_mean_abs_diff": 0.0,
-            "scene_changed_ratio": 0.0,
-            "scene_change": False,
             "sample_count": 0,
         }
-
-    def accept_current_as_reference(self):
-        """Make the latest stable sample the next placement baseline."""
-        self.reference = (
-            bytearray(self.previous)
-            if self.previous is not None
-            else None
-        )
 
     def update(self, gray_array):
         height = int(gray_array.shape[0])
@@ -457,60 +336,35 @@ class MotionDetector:
                 current.append(int(row[x]))
         if (
             self.previous is None
-            or self.reference is None
             or len(self.previous) != len(current)
-            or len(self.reference) != len(current)
         ):
             self.previous = current
-            self.reference = bytearray(current)
             self.last_metrics = {
                 "mean_abs_diff": 0.0,
                 "changed_ratio": 0.0,
                 "motion": False,
-                "scene_mean_abs_diff": 0.0,
-                "scene_changed_ratio": 0.0,
-                "scene_change": False,
                 "sample_count": len(current),
             }
             return dict(self.last_metrics)
         total = 0
         changed = 0
-        scene_total = 0
-        scene_changed = 0
-        for before, reference, after in zip(
-            self.previous, self.reference, current
-        ):
+        for before, after in zip(self.previous, current):
             difference = abs(int(after) - int(before))
             total += difference
             if difference >= self.pixel_threshold:
                 changed += 1
-            scene_difference = abs(
-                int(after) - int(reference)
-            )
-            scene_total += scene_difference
-            if scene_difference >= self.pixel_threshold:
-                scene_changed += 1
         count = max(1, len(current))
         mean_abs_diff = float(total) / count
         changed_ratio = float(changed) / count
-        scene_mean_abs_diff = float(scene_total) / count
-        scene_changed_ratio = float(scene_changed) / count
         motion = (
             mean_abs_diff >= self.mean_threshold
             and changed_ratio >= self.ratio_threshold
-        )
-        scene_change = (
-            scene_mean_abs_diff >= self.mean_threshold
-            and scene_changed_ratio >= self.ratio_threshold
         )
         self.previous = current
         self.last_metrics = {
             "mean_abs_diff": mean_abs_diff,
             "changed_ratio": changed_ratio,
             "motion": motion,
-            "scene_mean_abs_diff": scene_mean_abs_diff,
-            "scene_changed_ratio": scene_changed_ratio,
-            "scene_change": scene_change,
             "sample_count": len(current),
         }
         return dict(self.last_metrics)
@@ -599,118 +453,6 @@ class FinalCheckState:
             ),
             "lower_area_ratio": self.lower_area_ratio,
         }
-
-
-class PlacementMotionState:
-    """Event-driven move/settle/verify controller with a single verify pulse."""
-
-    __slots__ = (
-        "start_confirm_frames",
-        "end_confirm_frames",
-        "post_stable_frames",
-        "phase",
-        "motion_count",
-        "stable_after_motion_count",
-        "motion_start_frame",
-        "motion_end_frame",
-        "verify_trigger_count",
-    )
-
-    def __init__(
-        self,
-        start_confirm_frames,
-        end_confirm_frames,
-        post_stable_frames,
-    ):
-        self.start_confirm_frames = max(
-            1, int(start_confirm_frames)
-        )
-        self.end_confirm_frames = max(1, int(end_confirm_frames))
-        self.post_stable_frames = max(1, int(post_stable_frames))
-        self.reset()
-
-    def reset(self):
-        self.phase = "WAIT_FOR_MOTION"
-        self.motion_count = 0
-        self.stable_after_motion_count = 0
-        self.motion_start_frame = None
-        self.motion_end_frame = None
-        self.verify_trigger_count = 0
-
-    def update(self, motion, frame_index):
-        motion = bool(motion)
-        event = None
-        motion_ended = False
-        trigger_verify = False
-        if self.phase == "WAIT_FOR_MOTION":
-            if motion:
-                self.motion_count += 1
-                if self.motion_count == 1:
-                    self.motion_start_frame = int(frame_index)
-                if self.motion_count >= self.start_confirm_frames:
-                    self.phase = "MOVING"
-                    self.stable_after_motion_count = 0
-                    event = "MOTION_START"
-            else:
-                self.motion_count = 0
-                self.motion_start_frame = None
-        elif self.phase in ("MOVING", "POST_MOTION_SETTLE"):
-            if motion:
-                if self.phase == "POST_MOTION_SETTLE":
-                    event = "MOTION_ACTIVE"
-                self.phase = "MOVING"
-                self.stable_after_motion_count = 0
-                self.motion_end_frame = None
-            else:
-                self.stable_after_motion_count += 1
-                if (
-                    self.phase == "MOVING"
-                ):
-                    self.phase = "POST_MOTION_SETTLE"
-                if (
-                    self.motion_end_frame is None
-                    and self.stable_after_motion_count
-                    >= self.end_confirm_frames
-                ):
-                    self.motion_end_frame = int(frame_index)
-                    event = "MOTION_END"
-                    motion_ended = True
-                if (
-                    self.phase == "POST_MOTION_SETTLE"
-                    and self.stable_after_motion_count
-                    >= max(
-                        self.end_confirm_frames,
-                        self.post_stable_frames,
-                    )
-                ):
-                    self.phase = "VERIFY_PLACEMENT"
-                    self.verify_trigger_count += 1
-                    event = "POST_MOTION_STABLE"
-                    trigger_verify = True
-        return {
-            "phase": self.phase,
-            "event": event,
-            "motion_ended": motion_ended,
-            "trigger_verify": trigger_verify,
-            "motion_start_frame": self.motion_start_frame,
-            "motion_end_frame": self.motion_end_frame,
-            "stable_after_motion_count": (
-                self.stable_after_motion_count
-            ),
-            "verify_trigger_count": self.verify_trigger_count,
-        }
-
-    def verification_finished(self, complete=False):
-        self.motion_count = 0
-        self.stable_after_motion_count = 0
-        self.phase = "COMPLETE" if complete else "WAIT_FOR_MOTION"
-        return self.phase
-
-    def verification_interrupted(self):
-        self.phase = "MOVING"
-        self.motion_count = self.start_confirm_frames
-        self.stable_after_motion_count = 0
-        return self.phase
 
 
 class PieceCountConsensus:
@@ -811,22 +553,25 @@ class PieceCountConsensus:
         }
 
 
-class RealtimePhaseState:
-    """Minimal resettable phase controller for runtime/simulation tests."""
+def tracking_expected_piece_count(
+    required_piece_count, consensus_state
+):
+    """Allow a fixed-count tracker to run while count consensus settles."""
+    if required_piece_count is not None:
+        return max(1, int(required_piece_count))
+    if not consensus_state.get("ready", False):
+        return None
+    expected_count = consensus_state.get("expected_count")
+    return (
+        None
+        if expected_count is None
+        else max(1, int(expected_count))
+    )
 
-    __slots__ = ("phase",)
 
-    def __init__(self):
-        self.phase = "ACQUIRE"
-
-    def start_placing(self):
-        self.phase = "PLACING"
-
-    def complete(self):
-        self.phase = "COMPLETE"
-
-    def reset(self):
-        self.phase = "ACQUIRE"
-
-    def vision_enabled(self):
-        return phase_allows_vision(self.phase)
+def recognition_gate_ready(consensus_state, tracker_stable):
+    """Require both gates without forcing them to run sequentially."""
+    return bool(
+        consensus_state.get("ready", False)
+        and tracker_stable
+    )

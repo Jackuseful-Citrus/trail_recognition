@@ -1,10 +1,4 @@
-"""Vision adapters for desktop OpenCV and CanMV's native ``image`` module.
-
-The desktop path keeps OpenCV for repeatable photo regression.  The K230 path
-uses only firmware-standard ``image.Image`` operations plus pure Python contour
-geometry, because some CanMV v1.6 images do not include the optional ``cv2``
-module.
-"""
+"""CanMV-native piece recognition without OpenCV or NumPy."""
 
 import math
 import os
@@ -15,7 +9,6 @@ from puzzle_geometry import (
     PieceObservation,
     edge_lengths,
     ensure_clockwise,
-    point_in_polygon,
     polygon_area,
     polygon_centroid,
     polygon_is_convex,
@@ -31,100 +24,6 @@ def _vision_exitpoint(counter, interval=256):
     exitpoint = getattr(os, "exitpoint", None)
     if exitpoint is not None:
         exitpoint()
-
-
-def mm_to_rectified_px(point_mm):
-    return (
-        float(point_mm[0]) * cfg.RECTIFIED_PX_PER_MM,
-        float(point_mm[1]) * cfg.RECTIFIED_PX_PER_MM,
-    )
-
-
-def rectified_px_to_mm(point_px):
-    return (
-        float(point_px[0]) / cfg.RECTIFIED_PX_PER_MM,
-        float(point_px[1]) / cfg.RECTIFIED_PX_PER_MM,
-    )
-
-
-def make_perspective_transform(corners_px, cv2_module, np_module):
-    """Build the camera-to-standard-A4 homography."""
-    src = np_module.array(corners_px, dtype=np_module.float32)
-    dst = np_module.array(
-        [
-            (0.0, 0.0),
-            (cfg.RECTIFIED_WIDTH_PX - 1.0, 0.0),
-            (cfg.RECTIFIED_WIDTH_PX - 1.0, cfg.RECTIFIED_HEIGHT_PX - 1.0),
-            (0.0, cfg.RECTIFIED_HEIGHT_PX - 1.0),
-        ],
-        dtype=np_module.float32,
-    )
-    return cv2_module.getPerspectiveTransform(src, dst)
-
-
-def rectify_gray(
-    gray_array,
-    corners_px,
-    cv2_module,
-    np_module,
-    perspective_matrix=None,
-):
-    matrix = perspective_matrix
-    if matrix is None:
-        matrix = make_perspective_transform(
-            corners_px, cv2_module, np_module
-        )
-    return cv2_module.warpPerspective(
-        gray_array,
-        matrix,
-        (cfg.RECTIFIED_WIDTH_PX, cfg.RECTIFIED_HEIGHT_PX),
-        flags=cv2_module.INTER_LINEAR,
-        borderMode=cv2_module.BORDER_CONSTANT,
-        borderValue=0,
-    )
-
-
-def _find_divider_row(binary_mask, nominal_row):
-    half_range = int(
-        cfg.DIVIDER_SEARCH_HALF_RANGE_MM * cfg.RECTIFIED_PX_PER_MM + 0.5
-    )
-    height = binary_mask.shape[0]
-    width = binary_mask.shape[1]
-    start = max(0, nominal_row - half_range)
-    end = min(height - 1, nominal_row + half_range)
-    best_row = nominal_row
-    best_count = 0
-    # Avoid np.sum axis compatibility differences between NumPy and ulab.
-    for y in range(start, end + 1):
-        count = 0
-        row = binary_mask[y]
-        for x in range(width):
-            if int(row[x]) != 0:
-                count += 1
-        if count > best_count:
-            best_count = count
-            best_row = y
-    # A divider should span most of A4. Otherwise keep the configured location.
-    if best_count < int(width * 0.55):
-        return nominal_row, False
-    return best_row, True
-
-
-def _contour_points(contour):
-    """Convert OpenCV/ulab contour layouts (N,1,2) or (N,2) to tuples."""
-    result = []
-    for item in contour:
-        try:
-            if len(item) == 1:
-                item = item[0]
-        except TypeError:
-            pass
-        result.append((float(item[0]), float(item[1])))
-    return result
-
-
-def _points_array(points, np_module):
-    return np_module.array(points, dtype=np_module.float32)
 
 
 def _reduce_polygon_to_limit(points, maximum):
@@ -476,203 +375,6 @@ def _ordered_contour_polygon(points_mm, fit_diagnostics=None):
     return polygon
 
 
-def _extract_polygon(contour, cv2_module, np_module):
-    del np_module
-
-    def approximate(source):
-        perimeter = float(cv2_module.arcLength(source, True))
-        epsilon = (
-            cfg.CONTOUR_DP_TOLERANCE_MM
-            * cfg.RECTIFIED_PX_PER_MM
-        )
-        approx = None
-        cleanup_limit = (
-            cfg.MAX_POLYGON_VERTICES
-            + cfg.VERTEX_CLEANUP_EXTRA_VERTICES
-        )
-        for _ in range(10):
-            approx = cv2_module.approxPolyDP(
-                source, epsilon, True
-            )
-            if len(approx) <= cleanup_limit:
-                break
-            epsilon *= 1.35
-        source_mm = [
-            rectified_px_to_mm(point)
-            for point in _contour_points(source)
-        ]
-        polygon_mm = [
-            rectified_px_to_mm(point)
-            for point in _contour_points(approx)
-        ]
-        return (
-            _finalize_fitted_polygon(
-                source_mm, polygon_mm
-            ),
-            bool(cv2_module.isContourConvex(approx)),
-        )
-
-    polygon, simplified_is_convex = approximate(contour)
-    # Raster shadows can make a physically convex hand-cut piece locally
-    # jagged.  A hull is used only after the ordered fit itself proves convex;
-    # a meaningful concavity therefore remains the primary model.
-    if (
-        cfg.FORCE_CONVEX_CONTOURS
-        or (
-            polygon is not None
-            and simplified_is_convex
-        )
-    ):
-        stable, _ = approximate(
-            cv2_module.convexHull(contour)
-        )
-        if stable is not None:
-            polygon = stable
-    return polygon
-
-
-def detect_pieces_from_gray(
-    gray_array,
-    corners_px,
-    cv2_module,
-    np_module,
-    perspective_matrix=None,
-):
-    """Rectify, segment, and return ``(observations, diagnostics)``."""
-    rectified = rectify_gray(
-        gray_array,
-        corners_px,
-        cv2_module,
-        np_module,
-        perspective_matrix=perspective_matrix,
-    )
-
-    threshold_mode = cfg.THRESHOLD_MODE
-    threshold_flags = cv2_module.THRESH_BINARY
-    threshold_value = cfg.WHITE_GRAY_THRESHOLD
-    if threshold_mode == "otsu":
-        threshold_flags |= cv2_module.THRESH_OTSU
-    try:
-        used_threshold, mask = cv2_module.threshold(
-            rectified, threshold_value, 255, threshold_flags
-        )
-    except Exception:
-        # Fixed threshold is the explicit no-silent-failure fallback.
-        used_threshold, mask = cv2_module.threshold(
-            rectified,
-            cfg.WHITE_GRAY_THRESHOLD,
-            255,
-            cv2_module.THRESH_BINARY,
-        )
-        threshold_mode = "fixed_fallback"
-
-    nominal_divider = int(cfg.DIVIDER_Y_MM * cfg.RECTIFIED_PX_PER_MM + 0.5)
-    divider_row, divider_detected = _find_divider_row(mask, nominal_divider)
-    detection_end = max(
-        1, divider_row - int(2.0 * cfg.RECTIFIED_PX_PER_MM + 0.5)
-    )
-    # Keep divider/lower region out of contour extraction. cv2 drawing avoids a
-    # slow Python pixel loop on the K230.
-    cv2_module.rectangle(
-        mask,
-        (0, detection_end),
-        (mask.shape[1] - 1, mask.shape[0] - 1),
-        0,
-        cv2_module.FILLED,
-    )
-
-    kernel = cv2_module.getStructuringElement(
-        cv2_module.MORPH_RECT,
-        (cfg.MORPH_KERNEL_PX, cfg.MORPH_KERNEL_PX),
-    )
-    if cfg.MORPH_OPEN_ITERATIONS > 0:
-        mask = cv2_module.morphologyEx(
-            mask,
-            cv2_module.MORPH_OPEN,
-            kernel,
-            iterations=cfg.MORPH_OPEN_ITERATIONS,
-        )
-    if cfg.MORPH_CLOSE_ITERATIONS > 0:
-        mask = cv2_module.morphologyEx(
-            mask,
-            cv2_module.MORPH_CLOSE,
-            kernel,
-            iterations=cfg.MORPH_CLOSE_ITERATIONS,
-        )
-
-    contour_result = cv2_module.findContours(
-        mask, cv2_module.RETR_EXTERNAL, cv2_module.CHAIN_APPROX_SIMPLE
-    )
-    contours = contour_result[-2]
-    margin_px = cfg.DETECTION_BORDER_MARGIN_MM * cfg.RECTIFIED_PX_PER_MM
-    observations = []
-    rejected = {
-        "area": 0,
-        "border": 0,
-        "polygon": 0,
-    }
-    for contour in contours:
-        contour_area_px = float(cv2_module.contourArea(contour))
-        area_mm2 = contour_area_px / (
-            cfg.RECTIFIED_PX_PER_MM * cfg.RECTIFIED_PX_PER_MM
-        )
-        if (
-            area_mm2 < cfg.MIN_PIECE_AREA_MM2
-            or area_mm2 > cfg.MAX_PIECE_AREA_MM2
-        ):
-            rejected["area"] += 1
-            continue
-        x, y, width, height = cv2_module.boundingRect(contour)
-        if (
-            x <= margin_px
-            or y <= margin_px
-            or x + width >= cfg.RECTIFIED_WIDTH_PX - margin_px
-            or y + height >= detection_end - margin_px
-        ):
-            rejected["border"] += 1
-            continue
-        polygon_mm = _extract_polygon(contour, cv2_module, np_module)
-        if polygon_mm is None:
-            rejected["polygon"] += 1
-            continue
-
-        hull = cv2_module.convexHull(contour)
-        hull_area_px = max(1.0, float(cv2_module.contourArea(hull)))
-        convexity = min(1.0, contour_area_px / hull_area_px)
-        vertex_confidence = 1.0 if 3 <= len(polygon_mm) <= 5 else 0.0
-        confidence = max(
-            0.0,
-            min(1.0, 0.55 * convexity + 0.35 * vertex_confidence + 0.10),
-        )
-        contour_px = _contour_points(contour)
-        observations.append(
-            PieceObservation(
-                "",
-                contour_px,
-                polygon_mm,
-                centroid_mm=polygon_centroid(polygon_mm),
-                area_mm2=polygon_area(polygon_mm),
-                confidence=confidence,
-            )
-        )
-
-    observations.sort(key=lambda piece: piece.area_mm2, reverse=True)
-    if len(observations) > cfg.MAX_PIECE_COUNT:
-        observations = observations[: cfg.MAX_PIECE_COUNT]
-    diagnostics = {
-        "rectified": rectified,
-        "mask": mask,
-        "divider_y_mm": divider_row / cfg.RECTIFIED_PX_PER_MM,
-        "divider_detected": divider_detected,
-        "threshold": float(used_threshold),
-        "threshold_mode": threshold_mode,
-        "raw_contours": len(contours),
-        "rejected": rejected,
-        "detection_end_row": detection_end,
-    }
-    return observations, diagnostics
-
-
 def _blob_value(blob, method_name, tuple_index=None):
     """Read a CanMV blob method, with tuple-index compatibility."""
     method = getattr(blob, method_name, None)
@@ -799,10 +501,6 @@ def _array_gray_region_sanity(gray_array, roi, threshold):
     }
 
 
-def _pixel_is_white(gray_array, x, y, threshold):
-    return int(gray_array[y][x]) >= threshold
-
-
 def estimate_background_gray(
     gray_array,
     roi,
@@ -924,6 +622,376 @@ def blacken_rectified_border(gray_array, border_px):
     return border
 
 
+def _median_scalar(values):
+    """Return a small-list median without NumPy/statistics dependencies."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return 0.5 * (
+        float(ordered[middle - 1])
+        + float(ordered[middle])
+    )
+
+
+def detect_rectified_divider_strip(
+    gray_array,
+    nominal_y_mm=None,
+    margin_x_px=0,
+):
+    """Find a thin bright separator near the rectified A4 midpoint.
+
+    Only sparse vertical scans are used.  A candidate must be thin at every
+    sampled column, cover most of the page width, and fit one near-horizontal
+    line.  This runs after perspective correction and before ``find_blobs``.
+    """
+    height = int(gray_array.shape[0])
+    width = int(gray_array.shape[1])
+    nominal_mm = (
+        cfg.DIVIDER_Y_MM
+        if nominal_y_mm is None
+        else max(
+            0.0,
+            min(cfg.A4_HEIGHT_MM, float(nominal_y_mm)),
+        )
+    )
+    result = {
+        "enabled": bool(
+            getattr(
+                cfg,
+                "PIECE_DIVIDER_DETECTION_ENABLED",
+                False,
+            )
+        ),
+        "detected": False,
+        "line_found": False,
+        "reason": "",
+        "divider_y_mm": nominal_mm,
+        "center_y_px": 0.0,
+        "intercept_px": 0.0,
+        "slope_px_per_x": 0.0,
+        "slope_mm": 0.0,
+        "coverage": 0.0,
+        "residual_px": 0.0,
+        "thickness_px": 0.0,
+        "threshold": 0,
+        "background_gray": 0.0,
+        "sample_count": 0,
+        "hit_count": 0,
+        "inlier_count": 0,
+        "search_rows": (0, 0),
+    }
+    if not result["enabled"]:
+        result["reason"] = "disabled"
+        return result
+    if width < 8 or height < 8:
+        result["reason"] = "image_size"
+        return result
+
+    pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
+    nominal_y_px = nominal_mm * pixels_per_mm_y
+    result["center_y_px"] = nominal_y_px
+    search_half_mm = float(
+        getattr(
+            cfg,
+            "PIECE_DIVIDER_SEARCH_HALF_RANGE_MM",
+            cfg.DIVIDER_SEARCH_HALF_RANGE_MM,
+        )
+    )
+    search_half_px = max(
+        2, int(search_half_mm * pixels_per_mm_y + 0.5)
+    )
+    search_start = max(
+        1, int(nominal_y_px + 0.5) - search_half_px
+    )
+    search_end = min(
+        height - 2,
+        int(nominal_y_px + 0.5) + search_half_px,
+    )
+    result["search_rows"] = (search_start, search_end)
+    if search_end - search_start < 4:
+        result["reason"] = "search_band"
+        return result
+
+    edge_inset = max(
+        int(margin_x_px),
+        int(0.05 * float(width - 1) + 0.5),
+    )
+    x_start = min(width - 2, max(1, edge_inset))
+    x_end = max(
+        x_start + 1,
+        min(width - 2, width - 1 - edge_inset),
+    )
+    if x_end - x_start < 4:
+        result["reason"] = "search_width"
+        return result
+
+    background_stats = estimate_background_gray(
+        gray_array,
+        (
+            x_start,
+            search_start,
+            x_end - x_start + 1,
+            search_end - search_start + 1,
+        ),
+        sample_stride=2,
+        histogram_bins=32,
+    )
+    background_gray = float(
+        background_stats.get("background_gray", 0.0)
+    )
+    bright_threshold = max(
+        float(
+            getattr(cfg, "PIECE_DIVIDER_MIN_GRAY", 50)
+        ),
+        background_gray
+        + float(
+            getattr(
+                cfg,
+                "PIECE_DIVIDER_MIN_CONTRAST_GRAY",
+                20,
+            )
+        ),
+    )
+    bright_threshold = max(
+        0, min(255, int(bright_threshold + 0.5))
+    )
+    result["threshold"] = bright_threshold
+    result["background_gray"] = background_gray
+
+    requested_samples = max(
+        7,
+        int(getattr(cfg, "PIECE_DIVIDER_SAMPLE_COUNT", 31)),
+    )
+    sample_count = min(
+        requested_samples, x_end - x_start + 1
+    )
+    result["sample_count"] = sample_count
+    maximum_thickness_px = max(
+        1,
+        int(
+            float(
+                getattr(
+                    cfg,
+                    "PIECE_DIVIDER_MAX_THICKNESS_MM",
+                    5.0,
+                )
+            )
+            * pixels_per_mm_y
+            + 0.5
+        ),
+    )
+    samples = []
+    for index in range(sample_count):
+        _vision_exitpoint(index, interval=8)
+        x = int(
+            x_start
+            + (x_end - x_start)
+            * index
+            / max(1, sample_count - 1)
+            + 0.5
+        )
+        runs = []
+        run_start = None
+        run_sum = 0.0
+        run_count = 0
+        for y in range(search_start, search_end + 2):
+            value = (
+                int(gray_array[y][x])
+                if y <= search_end
+                else -1
+            )
+            if value >= bright_threshold:
+                if run_start is None:
+                    run_start = y
+                    run_sum = 0.0
+                    run_count = 0
+                run_sum += value
+                run_count += 1
+                continue
+            if run_start is None:
+                continue
+            run_end = y - 1
+            thickness = run_end - run_start + 1
+            # A run clipped by either scan edge is usually a large fragment,
+            # not a thin separator whose complete thickness is observable.
+            if (
+                run_start > search_start
+                and run_end < search_end
+                and thickness <= maximum_thickness_px
+            ):
+                center_y = 0.5 * (run_start + run_end)
+                runs.append(
+                    (
+                        abs(center_y - nominal_y_px),
+                        -(run_sum / max(1, run_count)),
+                        center_y,
+                        float(thickness),
+                    )
+                )
+            run_start = None
+            run_sum = 0.0
+            run_count = 0
+        if runs:
+            best = min(runs)
+            samples.append((float(x), best[2], best[3]))
+
+    result["hit_count"] = len(samples)
+    minimum_coverage = float(
+        getattr(cfg, "PIECE_DIVIDER_MIN_COVERAGE", 0.72)
+    )
+    minimum_hits = max(
+        5, int(math.ceil(sample_count * minimum_coverage))
+    )
+    if len(samples) < minimum_hits:
+        result["reason"] = "coverage"
+        result["coverage"] = float(len(samples)) / sample_count
+        return result
+
+    span = float(max(1, x_end - x_start))
+    left = [
+        item
+        for item in samples
+        if item[0] <= x_start + 0.30 * span
+    ]
+    right = [
+        item
+        for item in samples
+        if item[0] >= x_start + 0.70 * span
+    ]
+    if len(left) < 2 or len(right) < 2:
+        result["reason"] = "span"
+        result["coverage"] = float(len(samples)) / sample_count
+        return result
+    sample_span = (
+        max(item[0] for item in samples)
+        - min(item[0] for item in samples)
+    ) / span
+    if sample_span < minimum_coverage:
+        result["reason"] = "span"
+        result["coverage"] = float(len(samples)) / sample_count
+        return result
+
+    left_x = _median_scalar([item[0] for item in left])
+    right_x = _median_scalar([item[0] for item in right])
+    left_y = _median_scalar([item[1] for item in left])
+    right_y = _median_scalar([item[1] for item in right])
+    if right_x - left_x <= 1.0:
+        result["reason"] = "span"
+        return result
+    slope = (right_y - left_y) / (right_x - left_x)
+    intercept = _median_scalar(
+        [item[1] - slope * item[0] for item in samples]
+    )
+    maximum_residual_px = float(
+        getattr(
+            cfg,
+            "PIECE_DIVIDER_MAX_RESIDUAL_PX",
+            2.5,
+        )
+    )
+    inliers = [
+        item
+        for item in samples
+        if abs(item[1] - (intercept + slope * item[0]))
+        <= maximum_residual_px
+    ]
+    result["inlier_count"] = len(inliers)
+    result["coverage"] = float(len(inliers)) / sample_count
+    if len(inliers) < minimum_hits:
+        result["reason"] = "residual"
+        return result
+
+    mean_x = sum(item[0] for item in inliers) / len(inliers)
+    mean_y = sum(item[1] for item in inliers) / len(inliers)
+    denominator = sum(
+        (item[0] - mean_x) * (item[0] - mean_x)
+        for item in inliers
+    )
+    if denominator > 1e-9:
+        slope = sum(
+            (item[0] - mean_x) * (item[1] - mean_y)
+            for item in inliers
+        ) / denominator
+    intercept = mean_y - slope * mean_x
+    residual_px = sum(
+        abs(item[1] - (intercept + slope * item[0]))
+        for item in inliers
+    ) / len(inliers)
+    center_x = 0.5 * float(width - 1)
+    center_y = intercept + slope * center_x
+    if abs(center_y - nominal_y_px) > search_half_px + 1.0:
+        result["reason"] = "position"
+        return result
+    slope_mm = slope * float(width - 1) / pixels_per_mm_y
+    thickness_px = max(item[2] for item in inliers)
+    result.update(
+        {
+            "line_found": True,
+            "divider_y_mm": center_y / pixels_per_mm_y,
+            "center_y_px": center_y,
+            "intercept_px": intercept,
+            "slope_px_per_x": slope,
+            "slope_mm": slope_mm,
+            "residual_px": residual_px,
+            "thickness_px": thickness_px,
+        }
+    )
+    if abs(slope_mm) > float(
+        getattr(cfg, "PIECE_DIVIDER_MAX_SLOPE_MM", 5.0)
+    ):
+        result["reason"] = "slope"
+        return result
+    result["detected"] = True
+    result["reason"] = "ok"
+    return result
+
+
+def mask_rectified_divider_strip(gray_array, divider):
+    """Blacken the fitted separator and its interpolation halo in place."""
+    if not divider.get("detected", False):
+        return {"half_width_px": 0, "masked_pixels": 0}
+    height = int(gray_array.shape[0])
+    width = int(gray_array.shape[1])
+    pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
+    half_width_px = max(
+        1,
+        int(
+            math.ceil(
+                0.5 * float(divider.get("thickness_px", 1.0))
+                + float(
+                    getattr(
+                        cfg,
+                        "PIECE_DIVIDER_MASK_MARGIN_MM",
+                        1.5,
+                    )
+                )
+                * pixels_per_mm_y
+            )
+        ),
+    )
+    intercept = float(divider.get("intercept_px", 0.0))
+    slope = float(divider.get("slope_px_per_x", 0.0))
+    masked_pixels = 0
+    for x in range(width):
+        _vision_exitpoint(x, interval=64)
+        center_y = intercept + slope * x
+        y_start = max(0, int(math.floor(center_y - half_width_px)))
+        y_end = min(
+            height - 1,
+            int(math.ceil(center_y + half_width_px)),
+        )
+        for y in range(y_start, y_end + 1):
+            gray_array[y][x] = 0
+            masked_pixels += 1
+    return {
+        "half_width_px": half_width_px,
+        "masked_pixels": masked_pixels,
+    }
+
+
 def trace_ordered_boundary(
     gray_array,
     rect,
@@ -934,8 +1002,7 @@ def trace_ordered_boundary(
 
     Pixels outside ``rect`` or the array are treated as background.  The return
     value is ``(points, diagnostics)``; a failed trace returns an empty point
-    list and an explicit reason so callers can fail closed or use the measured
-    legacy fallback.
+    list and an explicit reason so callers can fail closed.
     """
     array_height = int(gray_array.shape[0])
     array_width = int(gray_array.shape[1])
@@ -1060,38 +1127,6 @@ def trace_ordered_boundary(
     return [
         (float(point[0]), float(point[1])) for point in result
     ], diagnostics
-
-
-def _nearest_white_pixel(
-    gray_array,
-    x0,
-    y0,
-    width,
-    height,
-    center_x,
-    center_y,
-    threshold,
-):
-    center_x = max(x0, min(x0 + width - 1, int(center_x)))
-    center_y = max(y0, min(y0 + height - 1, int(center_y)))
-    if _pixel_is_white(gray_array, center_x, center_y, threshold):
-        return center_x, center_y
-    best = None
-    best_distance = None
-    for y in range(y0, y0 + height):
-        _vision_exitpoint(y - y0, interval=16)
-        row = gray_array[y]
-        for x in range(x0, x0 + width):
-            if int(row[x]) < threshold:
-                continue
-            distance = (
-                (x - center_x) * (x - center_x)
-                + (y - center_y) * (y - center_y)
-            )
-            if best_distance is None or distance < best_distance:
-                best = (x, y)
-                best_distance = distance
-    return best
 
 
 class _ComponentMaskRow:
@@ -1395,104 +1430,6 @@ def _blob_component_boundary(
     ], diagnostics
 
 
-def _component_boundary(
-    gray_array,
-    rect,
-    center,
-    threshold,
-):
-    """Flood-isolate one component, then Moore-trace its ordered boundary."""
-    array_height = int(gray_array.shape[0])
-    array_width = int(gray_array.shape[1])
-    x0 = max(0, int(rect[0]))
-    y0 = max(0, int(rect[1]))
-    x1 = min(array_width, x0 + max(1, int(rect[2])))
-    y1 = min(array_height, y0 + max(1, int(rect[3])))
-    width = x1 - x0
-    height = y1 - y0
-    diagnostics = {
-        "ok": False,
-        "reason": "",
-        "pixel_reads": 0,
-        "boundary_steps": 0,
-        "component_pixels": 0,
-    }
-    if width <= 0 or height <= 0:
-        diagnostics["reason"] = "fallback_empty_bbox"
-        return [], diagnostics
-
-    seed = _nearest_white_pixel(
-        gray_array,
-        x0,
-        y0,
-        width,
-        height,
-        center[0],
-        center[1],
-        threshold,
-    )
-    if seed is None:
-        diagnostics["reason"] = "fallback_no_seed"
-        return [], diagnostics
-
-    # One byte per bounding-box pixel is predictable and much smaller than a
-    # Python set of coordinate tuples on MicroPython.
-    visited = bytearray(width * height)
-    seed_index = (seed[1] - y0) * width + (seed[0] - x0)
-    visited[seed_index] = 1
-    stack = [seed_index]
-    processed = 0
-    while stack:
-        processed += 1
-        _vision_exitpoint(processed)
-        local_index = stack.pop()
-        local_y = local_index // width
-        local_x = local_index - local_y * width
-        x = x0 + local_x
-        y = y0 + local_y
-        if not _pixel_is_white(gray_array, x, y, threshold):
-            continue
-        diagnostics["component_pixels"] += 1
-
-        for dx, dy in _COMPONENT_NEIGHBORS:
-            nx = x + dx
-            ny = y + dy
-            if (
-                nx < x0
-                or nx >= x1
-                or ny < y0
-                or ny >= y1
-                or not _pixel_is_white(
-                    gray_array, nx, ny, threshold
-                )
-            ):
-                continue
-            neighbor_index = (ny - y0) * width + (nx - x0)
-            if not visited[neighbor_index]:
-                visited[neighbor_index] = 1
-                stack.append(neighbor_index)
-    local_mask = _ComponentMask(visited, width, height)
-    boundary, trace = trace_ordered_boundary(
-        local_mask,
-        (0, 0, width, height),
-        1,
-    )
-    diagnostics["ok"] = bool(trace["ok"])
-    diagnostics["reason"] = (
-        "fallback_ok"
-        if trace["ok"]
-        else "fallback_{}".format(trace["reason"])
-    )
-    diagnostics["pixel_reads"] = trace["pixel_reads"]
-    diagnostics["boundary_steps"] = trace["boundary_steps"]
-    if not trace["ok"]:
-        return [], diagnostics
-    return [
-        (point[0] + x0, point[1] + y0)
-        for point in boundary
-    ], diagnostics
-
-
 def _cross(origin, a, b):
     return (
         (a[0] - origin[0]) * (b[1] - origin[1])
@@ -1537,41 +1474,6 @@ def _point_line_distance(point, a, b):
         dx * (a[1] - point[1])
         - (a[0] - point[0]) * dy
     ) / length
-
-
-def _polygon_perimeter(points):
-    total = 0.0
-    for index, point in enumerate(points):
-        other = points[(index + 1) % len(points)]
-        dx = other[0] - point[0]
-        dy = other[1] - point[1]
-        total += math.sqrt(dx * dx + dy * dy)
-    return total
-
-
-def _simplify_convex_polygon(points, epsilon):
-    """Remove hull stair-steps while preserving significant short corners."""
-    result = list(points)
-    while len(result) > cfg.MIN_POLYGON_VERTICES:
-        best_index = None
-        best_distance = None
-        for index, point in enumerate(result):
-            distance = _point_line_distance(
-                point,
-                result[(index - 1) % len(result)],
-                result[(index + 1) % len(result)],
-            )
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_index = index
-        if best_distance is None or best_distance > epsilon:
-            break
-        del result[best_index]
-    if len(result) > cfg.MAX_POLYGON_VERTICES:
-        result = _reduce_polygon_to_limit(
-            result, cfg.MAX_POLYGON_VERTICES
-        )
-    return result
 
 
 def _extract_canmv_polygon(
@@ -1651,6 +1553,115 @@ def _extract_canmv_polygon(
     return polygon_mm, boundary_px, trace_diagnostics
 
 
+def _piece_center_contour_threshold(
+    gray_array,
+    center,
+    background_gray,
+    discovery_threshold,
+    fallback_threshold,
+):
+    """Return a lightweight per-piece contour threshold and diagnostics.
+
+    Blob discovery has already established the component identity at the low
+    threshold.  A small median sample around that Blob centroid therefore
+    adapts only the white-core boundary trace and cannot add search candidates.
+    """
+    radius = max(
+        0,
+        int(
+            getattr(
+                cfg,
+                "PIECE_CONTOUR_CENTER_SAMPLE_RADIUS_PX",
+                2,
+            )
+        ),
+    )
+    height = int(gray_array.shape[0])
+    width = int(gray_array.shape[1])
+    center_x = max(
+        0, min(width - 1, int(round(float(center[0]))))
+    )
+    center_y = max(
+        0, min(height - 1, int(round(float(center[1]))))
+    )
+    samples = []
+    for y in range(
+        max(0, center_y - radius),
+        min(height, center_y + radius + 1),
+    ):
+        for x in range(
+            max(0, center_x - radius),
+            min(width, center_x + radius + 1),
+        ):
+            samples.append(float(gray_array[y][x]))
+    center_gray = _median_scalar(samples)
+    fallback = max(0, min(255, int(fallback_threshold)))
+    if not getattr(
+        cfg, "PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED", False
+    ):
+        return fallback, center_gray, "fixed"
+    if background_gray is None:
+        return fallback, center_gray, "fallback_no_background"
+    minimum_contrast = float(
+        getattr(
+            cfg,
+            "PIECE_CONTOUR_CENTER_MIN_CONTRAST_GRAY",
+            40,
+        )
+    )
+    if (
+        center_gray < float(discovery_threshold) + minimum_contrast
+        or center_gray <= float(background_gray) + minimum_contrast
+    ):
+        return fallback, center_gray, "fallback_low_contrast"
+    alpha = max(
+        0.0,
+        min(
+            1.0,
+            float(
+                getattr(
+                    cfg,
+                    "PIECE_CONTOUR_ADAPTIVE_ALPHA",
+                    0.42,
+                )
+            ),
+        ),
+    )
+    minimum = max(
+        int(discovery_threshold),
+        int(
+            getattr(
+                cfg,
+                "PIECE_CONTOUR_ADAPTIVE_MIN_GRAY",
+                85,
+            )
+        ),
+    )
+    maximum = max(
+        minimum,
+        min(
+            255,
+            int(
+                getattr(
+                    cfg,
+                    "PIECE_CONTOUR_ADAPTIVE_MAX_GRAY",
+                    140,
+                )
+            ),
+        ),
+    )
+    adaptive = int(
+        float(background_gray)
+        + alpha * (center_gray - float(background_gray))
+        + 0.5
+    )
+    return (
+        max(minimum, min(maximum, adaptive)),
+        center_gray,
+        "adaptive",
+    )
+
+
 def detect_pieces_from_canmv_image(
     gray_image,
     corners_px,
@@ -1705,25 +1716,13 @@ def detect_pieces_from_canmv_image(
 
     pixels_per_mm_x = float(work_width - 1) / cfg.A4_WIDTH_MM
     pixels_per_mm_y = float(work_height - 1) / cfg.A4_HEIGHT_MM
-    active_divider_y_mm = (
+    divider_hint_y_mm = (
         cfg.DIVIDER_Y_MM
         if divider_y_mm is None
         else max(
             0.0,
             min(cfg.A4_HEIGHT_MM, float(divider_y_mm)),
         )
-    )
-    nominal_divider = int(
-        active_divider_y_mm * pixels_per_mm_y + 0.5
-    )
-    upper_end = max(
-        2,
-        nominal_divider - int(2.0 * pixels_per_mm_y + 0.5),
-    )
-    lower_start = min(
-        work_height - 2,
-        nominal_divider
-        + int(2.0 * pixels_per_mm_y + 0.5),
     )
     safety_border_px = max(
         0,
@@ -1749,6 +1748,67 @@ def detect_pieces_from_canmv_image(
     safety_border_px = blacken_rectified_border(
         gray_array, safety_border_px
     )
+    divider_probe = detect_rectified_divider_strip(
+        gray_array,
+        nominal_y_mm=divider_hint_y_mm,
+        margin_x_px=margin_x,
+    )
+    divider_mask = {
+        "half_width_px": 0,
+        "masked_pixels": 0,
+    }
+    if divider_probe.get("detected", False):
+        active_divider_y_mm = float(
+            divider_probe["divider_y_mm"]
+        )
+        divider_source = "rectified_strip"
+        divider_mask = mask_rectified_divider_strip(
+            gray_array, divider_probe
+        )
+        intercept = float(divider_probe["intercept_px"])
+        slope = float(divider_probe["slope_px_per_x"])
+        left_y = intercept + slope * margin_x
+        right_y = intercept + slope * (
+            work_width - 1 - margin_x
+        )
+        half_width = int(divider_mask["half_width_px"])
+        upper_end = max(
+            2,
+            int(math.floor(min(left_y, right_y) - half_width)),
+        )
+        lower_start = min(
+            work_height - 2,
+            int(math.ceil(max(left_y, right_y) + half_width + 1)),
+        )
+    else:
+        active_divider_y_mm = divider_hint_y_mm
+        divider_source = (
+            "a4_hint"
+            if divider_y_mm is not None
+            else "nominal_fallback"
+        )
+        nominal_divider = int(
+            active_divider_y_mm * pixels_per_mm_y + 0.5
+        )
+        fallback_gap_px = max(
+            1,
+            int(
+                float(
+                    getattr(
+                        cfg,
+                        "PIECE_DIVIDER_FALLBACK_GAP_MM",
+                        2.0,
+                    )
+                )
+                * pixels_per_mm_y
+                + 0.5
+            ),
+        )
+        upper_end = max(2, nominal_divider - fallback_gap_px)
+        lower_start = min(
+            work_height - 2,
+            nominal_divider + fallback_gap_px,
+        )
     segmentation_mode = getattr(
         cfg, "PIECE_SEGMENTATION_MODE", "fixed"
     )
@@ -1907,7 +1967,7 @@ def detect_pieces_from_canmv_image(
                 for blob, _region_start, _region_end in blob_regions
             ],
         }
-    observations = []
+    observation_details = []
     rejected = {
         "area": 0,
         "border": 0,
@@ -1928,6 +1988,10 @@ def detect_pieces_from_canmv_image(
     trace_failures = {}
     for blob, region_start, region_end in blob_regions:
         rect = tuple(_blob_value(blob, "rect", None))
+        blob_center = (
+            float(_blob_value(blob, "cx", 5)),
+            float(_blob_value(blob, "cy", 6)),
+        )
         blob_pixels = float(_blob_value(blob, "pixels", 4))
         area_mm2 = blob_pixels / (
             pixels_per_mm_x * pixels_per_mm_y
@@ -1946,15 +2010,39 @@ def detect_pieces_from_canmv_image(
         ):
             rejected["border"] += 1
             continue
+        adaptive_background = (
+            background_stats["background_gray"]
+            if background_stats["sample_count"]
+            >= cfg.PIECE_BACKGROUND_MIN_SAMPLES
+            else None
+        )
+        (
+            piece_contour_threshold,
+            center_gray,
+            contour_threshold_mode,
+        ) = _piece_center_contour_threshold(
+            gray_array,
+            blob_center,
+            adaptive_background,
+            piece_threshold,
+            contour_threshold,
+        )
         polygon_mm, boundary_px, trace_diagnostics = (
             _extract_canmv_polygon(
                 gray_array,
                 blob,
                 piece_threshold,
-                contour_threshold,
+                piece_contour_threshold,
                 pixels_per_mm_x,
                 pixels_per_mm_y,
             )
+        )
+        trace_diagnostics["center_gray"] = center_gray
+        trace_diagnostics["contour_threshold_used"] = (
+            piece_contour_threshold
+        )
+        trace_diagnostics["contour_threshold_mode"] = (
+            contour_threshold_mode
         )
         boundary_steps += trace_diagnostics.get(
             "boundary_steps", 0
@@ -2035,11 +2123,28 @@ def detect_pieces_from_canmv_image(
                 trace_failures.get("piece_invalid", 0) + 1
             )
             continue
-        observations.append(observation)
+        observation_details.append(
+            (
+                observation,
+                center_gray,
+                piece_contour_threshold,
+                contour_threshold_mode,
+            )
+        )
 
-    observations.sort(key=lambda piece: piece.area_mm2, reverse=True)
-    if len(observations) > cfg.MAX_PIECE_COUNT:
-        observations = observations[: cfg.MAX_PIECE_COUNT]
+    observation_details.sort(
+        key=lambda item: item[0].area_mm2, reverse=True
+    )
+    if len(observation_details) > cfg.MAX_PIECE_COUNT:
+        observation_details = observation_details[
+            : cfg.MAX_PIECE_COUNT
+        ]
+    observations = [item[0] for item in observation_details]
+    center_grays = [item[1] for item in observation_details]
+    contour_thresholds = [item[2] for item in observation_details]
+    contour_threshold_modes = [
+        item[3] for item in observation_details
+    ]
     detected_vertex_counts = [
         len(piece.polygon_mm) for piece in observations
     ]
@@ -2047,9 +2152,43 @@ def detect_pieces_from_canmv_image(
         "rectified": gray_image,
         "mask": None,
         "divider_y_mm": active_divider_y_mm,
-        "divider_detected": divider_y_mm is not None,
+        "divider_detected": bool(
+            divider_probe.get("detected", False)
+            or divider_y_mm is not None
+        ),
+        "divider_strip_detected": bool(
+            divider_probe.get("detected", False)
+        ),
+        "divider_source": divider_source,
+        "divider_reason": divider_probe.get("reason", ""),
+        "divider_coverage": divider_probe.get("coverage", 0.0),
+        "divider_residual_px": divider_probe.get(
+            "residual_px", 0.0
+        ),
+        "divider_slope_mm": divider_probe.get("slope_mm", 0.0),
+        "divider_thickness_px": divider_probe.get(
+            "thickness_px", 0.0
+        ),
+        "divider_threshold": divider_probe.get("threshold", 0),
+        "divider_background_gray": divider_probe.get(
+            "background_gray", 0.0
+        ),
+        "divider_hits": divider_probe.get("hit_count", 0),
+        "divider_samples": divider_probe.get("sample_count", 0),
+        "divider_mask_half_width_px": divider_mask.get(
+            "half_width_px", 0
+        ),
+        "divider_masked_pixels": divider_mask.get(
+            "masked_pixels", 0
+        ),
+        "divider_search_rows": divider_probe.get(
+            "search_rows", (0, 0)
+        ),
         "threshold": float(piece_threshold),
         "contour_threshold": float(contour_threshold),
+        "center_grays": center_grays,
+        "contour_thresholds": contour_thresholds,
+        "contour_threshold_modes": contour_threshold_modes,
         "threshold_mode": threshold_mode,
         "segmentation_mode": segmentation_mode,
         "background_gray": background_stats[
@@ -2104,137 +2243,3 @@ def detect_pieces_from_canmv_image(
         "gray_sanity": gray_sanity,
     }
     return observations, diagnostics
-
-
-def build_polygon_scanlines(
-    polygon_mm,
-    width,
-    height,
-    sample_stride=2,
-):
-    """Precompute sampled x intervals for a millimetre-space polygon."""
-    width = int(width)
-    height = int(height)
-    stride = max(1, int(sample_stride))
-    if width <= 1 or height <= 1 or len(polygon_mm) < 3:
-        return {
-            "width": width,
-            "height": height,
-            "sample_stride": stride,
-            "lines": {},
-            "sample_count": 0,
-        }
-    pixels_per_mm_x = float(width - 1) / cfg.A4_WIDTH_MM
-    pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
-    polygon_px = [
-        (
-            point[0] * pixels_per_mm_x,
-            point[1] * pixels_per_mm_y,
-        )
-        for point in polygon_mm
-    ]
-    min_y = max(
-        0, int(min(point[1] for point in polygon_px))
-    )
-    max_y = min(
-        height - 1,
-        int(max(point[1] for point in polygon_px) + 1.0),
-    )
-    lines = {}
-    sample_count = 0
-    for y in range(min_y, max_y + 1, stride):
-        intersections = []
-        scan_y = float(y)
-        for index, a in enumerate(polygon_px):
-            b = polygon_px[(index + 1) % len(polygon_px)]
-            if abs(b[1] - a[1]) <= 1e-9:
-                continue
-            if not (
-                (a[1] <= scan_y < b[1])
-                or (b[1] <= scan_y < a[1])
-            ):
-                continue
-            ratio = (scan_y - a[1]) / (b[1] - a[1])
-            intersections.append(
-                a[0] + ratio * (b[0] - a[0])
-            )
-        intersections.sort()
-        intervals = []
-        for index in range(0, len(intersections) - 1, 2):
-            start_x = max(
-                0, int(math.ceil(intersections[index]))
-            )
-            end_x = min(
-                width - 1,
-                int(math.floor(intersections[index + 1])),
-            )
-            if start_x > end_x:
-                continue
-            intervals.append((start_x, end_x))
-            sample_count += (
-                (end_x - start_x) // stride + 1
-            )
-        if intervals:
-            lines[y] = intervals
-    return {
-        "width": width,
-        "height": height,
-        "sample_stride": stride,
-        "lines": lines,
-        "sample_count": sample_count,
-    }
-
-
-def polygon_white_coverage_scanlines(
-    gray_array,
-    target_scanlines,
-    threshold=None,
-):
-    """Evaluate one cached target without point-in-polygon calls."""
-    if threshold is None:
-        threshold = cfg.WHITE_GRAY_THRESHOLD
-    stride = target_scanlines["sample_stride"]
-    sample_count = 0
-    foreground_count = 0
-    loop_counter = 0
-    for y, intervals in target_scanlines["lines"].items():
-        row = gray_array[y]
-        for start_x, end_x in intervals:
-            for x in range(start_x, end_x + 1, stride):
-                loop_counter += 1
-                _vision_exitpoint(loop_counter)
-                sample_count += 1
-                if int(row[x]) >= threshold:
-                    foreground_count += 1
-    coverage = (
-        float(foreground_count) / float(sample_count)
-        if sample_count > 0
-        else 0.0
-    )
-    return {
-        "coverage_ratio": coverage,
-        "sample_count": sample_count,
-        "foreground_count": foreground_count,
-    }
-
-
-def polygon_white_coverage(
-    gray_array,
-    polygon_mm,
-    threshold=None,
-    sample_stride=2,
-):
-    """Compatibility wrapper around cached scanline coverage."""
-    height = int(gray_array.shape[0])
-    width = int(gray_array.shape[1])
-    target_scanlines = build_polygon_scanlines(
-        polygon_mm,
-        width,
-        height,
-        sample_stride=sample_stride,
-    )
-    return polygon_white_coverage_scanlines(
-        gray_array,
-        target_scanlines,
-        threshold=threshold,
-    )["coverage_ratio"]

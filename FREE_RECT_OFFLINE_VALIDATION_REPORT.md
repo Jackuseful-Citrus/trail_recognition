@@ -2,16 +2,14 @@
 
 ## 审计基线
 
-- 固定图 2 快捷路径修改前，分支为 `main`，HEAD 为
-  `6ed8027c0efe8288826ad1dbedcf1bb9118a20c8`。
-- `ad768d8` 修改了固定 simulator Planner、配置、测试和当时的
-  standalone；当前 HEAD 的 `puzzle_simulator_planner.py` 已不再包含该
-  commit 中的 prefix gate/branch-limit 实现。
-- 本任务未修改 `puzzle_simulator_planner.py`，也未修改固定
-  `100x60 mm` 配置默认值、固定搜索预算或固定 simulator standalone。
-- 审计时，现有固定 standalone 可由当时的模块源文件逐字节重建，
-  SHA-256 为
-  `04d4004a63d8b13a71ebb89096b9a5e22612912eb5aadabac4ac5b2e3cebe8a6`。
+- 当前部署只保留 CanMV 原生碎片识别、固定图 2 快速匹配和 free-rect
+  planner。OpenCV/NumPy 碎片识别、逐片摆放识别以及旧 planning 1/2/3
+  已从模块源文件和 free-rect standalone 中删除。
+- `puzzle_simulator_planner.py` 现在只保存当前 free-rect planner 仍调用的
+  edge-match、edge-align 和 pose-graph 底层原语，不再包含独立 planner
+  入口。
+- builder 只生成当前 free-rect standalone，不再提供 planner backend
+  切换参数。
 
 ## 实现
 
@@ -148,18 +146,17 @@ Overlap、gap 和 outside 仍计算并写入结果，但仅供诊断，不否决
 - 同一输入连续 5 次的结果、统计和日志确定性；
 - MicroPython 依赖检查、语法编译和 standalone 构建。
 
-本次相关专项集为 16 passed。按 fixture 所需目录分组运行的 root
-`legacy/test_final_check.py` 与 `legacy/test_puzzle_*.py` 测试为
-107 passed；从 repo root 直接执行时有 8 个用例因相对 fixture 路径
-失败，将这 8 个用例从 `legacy/` 工作目录重跑后全部通过。
+本次保留路径的专项测试共 52 passed：固定模板与 free-rect planning
+9 项、CanMV 原生碎片识别 13 项、最终 source-clear 判定 4 项、A4 与
+运行状态 26 项。其中包含 `border_blobs=1` 时固定模板仍绕过通用输入
+门限的回归用例。
 
 ## Standalone
 
 构建命令：
 
 ```bash
-python k230_realtime_a4/build_standalone.py \
-  --planner-backend simulator_free_rect
+python k230_realtime_a4/build_standalone.py
 ```
 
 生成文件：
@@ -168,17 +165,18 @@ python k230_realtime_a4/build_standalone.py \
 
 SHA-256：
 
-`3bc52ff358173c28af636ff531ce09db431698f2916b92b454923cc6babb4641`
+`009cdc7f25ab7d638e30198240a64eec3cbafec1dd4e6612f35bc953d4f29efb`
 
 生成文件已通过 Python 语法编译和 import AST 检查，不包含 NumPy、
-OpenCV 或 dataclasses 依赖。固定 standalone 未被覆盖，其 SHA-256
-保持不变。
+OpenCV 或 dataclasses 依赖。文件大小为 379132 bytes、11409 行；旧识别
+和 planning 入口的函数级审计计数均为 0。
 
 板端验证应在 CanMV IDE 中上传并运行新的 free standalone，不执行任何
 机械动作前先检查以下日志序列：
 
 ```text
 START_REALTIME_A4,...planner=simulator_free_rect,...
+PLANNING_INPUT_BYPASS,...reason=fixed_figure2_direct,border_blobs=...
 FREE_FIXED_TEMPLATE_CHECK,matched=1,layout=MIRROR_X,...
 FREE_FIXED_TEMPLATE_PIECE,role=...,piece_id=...,source_x=...,target_x=...,rotation_deg=...
 FREE_FIXED_TEMPLATE_BYPASS,enumeration=SKIPPED,safety_gates=SKIPPED,target_mm=100.0x60.0,...

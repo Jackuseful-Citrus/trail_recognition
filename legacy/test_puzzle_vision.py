@@ -6,19 +6,14 @@ import cv2
 import numpy as np
 
 import puzzle_config as cfg
-from puzzle_geometry import (
-    plan_outer_first_rectangle,
-    plan_rectangle_assembly,
-)
 from puzzle_vision import (
     _finalize_fitted_polygon,
     _ordered_contour_polygon,
     _ordered_contour_polygon_once,
+    _piece_center_contour_threshold,
     background_difference_threshold,
     detect_pieces_from_canmv_image,
-    detect_pieces_from_gray,
     estimate_background_gray,
-    polygon_white_coverage,
 )
 
 
@@ -143,6 +138,47 @@ class _FakeCanMVGrayImage:
 
 
 class VisionRegressionTests(unittest.TestCase):
+    def test_piece_center_gray_adapts_only_contour_threshold(self):
+        gray = np.full((15, 15), 30, dtype=np.uint8)
+        gray[5:10, 5:10] = 220
+        old_enabled = getattr(
+            cfg,
+            "PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED",
+            False,
+        )
+        cfg.PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED = True
+        try:
+            threshold, center_gray, mode = (
+                _piece_center_contour_threshold(
+                    gray,
+                    (7, 7),
+                    30.0,
+                    60,
+                    100,
+                )
+            )
+            self.assertEqual(center_gray, 220.0)
+            self.assertEqual(threshold, 110)
+            self.assertEqual(mode, "adaptive")
+
+            gray[5:10, 5:10] = 70
+            threshold, center_gray, mode = (
+                _piece_center_contour_threshold(
+                    gray,
+                    (7, 7),
+                    30.0,
+                    60,
+                    100,
+                )
+            )
+            self.assertEqual(center_gray, 70.0)
+            self.assertEqual(threshold, 100)
+            self.assertEqual(mode, "fallback_low_contrast")
+        finally:
+            cfg.PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED = (
+                old_enabled
+            )
+
     def test_overlapping_blob_boxes_keep_distinct_component_identity(self):
         width = cfg.CANMV_WORK_WIDTH
         height = cfg.CANMV_WORK_HEIGHT
@@ -291,6 +327,12 @@ class VisionRegressionTests(unittest.TestCase):
             divider_y_mm=divider_y_mm,
         )
         self.assertTrue(diagnostics["divider_detected"])
+        self.assertFalse(
+            diagnostics["divider_strip_detected"]
+        )
+        self.assertEqual(
+            diagnostics["divider_source"], "a4_hint"
+        )
         self.assertAlmostEqual(
             diagnostics["divider_y_mm"],
             divider_y_mm,
@@ -305,6 +347,91 @@ class VisionRegressionTests(unittest.TestCase):
             diagnostics["detection_end_row"],
             expected_end,
         )
+
+    def test_rectified_divider_is_detected_and_masked_before_blobs(self):
+        # Match the active K230 runtime's reduced native work image.
+        width = 240
+        height = 336
+        gray = np.full((height, width), 29, dtype=np.uint8)
+        gray[35:75, 45:90] = 220
+        pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
+        expected_y_mm = cfg.DIVIDER_Y_MM - 5.0
+        expected_y_px = expected_y_mm * pixels_per_mm_y
+        for x in range(12, width - 12):
+            center_y = int(
+                expected_y_px
+                + 2.0 * (x - 0.5 * (width - 1)) / (width - 1)
+                + 0.5
+            )
+            # Reproduce the board log: the physical grey strip is visible at
+            # the piece threshold near 59 but remains below the old hard 70.
+            gray[center_y - 1 : center_y + 2, x] = 60
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+
+        pieces, diagnostics = detect_pieces_from_canmv_image(
+            _FakeCanMVGrayImage(gray),
+            corners,
+            (width, height),
+        )
+
+        self.assertEqual(len(pieces), 1)
+        self.assertEqual(diagnostics["raw_contours"], 1)
+        self.assertTrue(diagnostics["divider_strip_detected"])
+        self.assertEqual(
+            diagnostics["divider_source"], "rectified_strip"
+        )
+        self.assertEqual(diagnostics["divider_reason"], "ok")
+        self.assertGreaterEqual(
+            diagnostics["divider_coverage"], 0.90
+        )
+        self.assertAlmostEqual(
+            diagnostics["divider_y_mm"], expected_y_mm, delta=1.0
+        )
+        self.assertGreater(
+            diagnostics["divider_masked_pixels"], 0
+        )
+        self.assertEqual(
+            int(gray[int(expected_y_px + 0.5), width // 2]), 0
+        )
+
+    def test_short_middle_strip_is_not_accepted_as_divider(self):
+        width = 240
+        height = 336
+        gray = np.full((height, width), 29, dtype=np.uint8)
+        pixels_per_mm_y = float(height - 1) / cfg.A4_HEIGHT_MM
+        line_y = int(
+            (cfg.DIVIDER_Y_MM - 5.0) * pixels_per_mm_y + 0.5
+        )
+        gray[
+            line_y - 1 : line_y + 2,
+            int(width * 0.32) : int(width * 0.68),
+        ] = 60
+        corners = [
+            (0, 0),
+            (width - 1, 0),
+            (width - 1, height - 1),
+            (0, height - 1),
+        ]
+
+        _, diagnostics = detect_pieces_from_canmv_image(
+            _FakeCanMVGrayImage(gray),
+            corners,
+            (width, height),
+        )
+
+        self.assertFalse(diagnostics["divider_strip_detected"])
+        self.assertEqual(
+            diagnostics["divider_source"], "nominal_fallback"
+        )
+        self.assertIn(
+            diagnostics["divider_reason"], ("coverage", "span")
+        )
+        self.assertEqual(diagnostics["divider_masked_pixels"], 0)
 
     def test_canmv_background_delta_detects_under_two_exposures(self):
         width = cfg.CANMV_WORK_WIDTH
@@ -625,7 +752,7 @@ class VisionRegressionTests(unittest.TestCase):
             diagnostics["polygon_fit_reverse_used"]
         )
 
-    def test_closed_contour_fit_keeps_valid_unrefined_polygon(self):
+    def test_closed_contour_fit_accepts_valid_refined_polygon(self):
         mask = np.zeros((160, 160), dtype=np.uint8)
         cv2.fillPoly(
             mask,
@@ -651,10 +778,10 @@ class VisionRegressionTests(unittest.TestCase):
             for item in contour
         ]
         tolerance = max(0.05, cfg.CONTOUR_DP_TOLERANCE_MM)
-        self.assertIsNone(
+        self.assertIsNotNone(
             _ordered_contour_polygon_once(points, tolerance)
         )
-        self.assertIsNone(
+        self.assertIsNotNone(
             _ordered_contour_polygon_once(
                 list(reversed(points)), tolerance
             )
@@ -666,12 +793,12 @@ class VisionRegressionTests(unittest.TestCase):
         self.assertIsNotNone(recovered)
         self.assertEqual(
             diagnostics["polygon_fit_method"],
-            "forward_unrefined",
+            "forward",
         )
         self.assertFalse(
             diagnostics["polygon_fit_reverse_used"]
         )
-        self.assertTrue(
+        self.assertFalse(
             diagnostics["polygon_fit_unrefined_used"]
         )
 
@@ -742,75 +869,6 @@ class VisionRegressionTests(unittest.TestCase):
             )
         )
 
-        target = [
-            (96, 196),
-            (151, 198),
-            (146, 239),
-            (101, 235),
-        ]
-        coverage = polygon_white_coverage(gray, target)
-        self.assertGreater(coverage, 0.90)
-
-    def test_supplied_photo_detects_four_pieces(self):
-        image = cv2.imread(cfg.OFFLINE_IMAGE, cv2.IMREAD_GRAYSCALE)
-        self.assertIsNotNone(image)
-        pieces, diagnostics = detect_pieces_from_gray(
-            image,
-            cfg.OFFLINE_A4_CORNERS_PX,
-            cv2,
-            np,
-        )
-        self.assertEqual(len(pieces), 4)
-        self.assertEqual(
-            [len(piece.polygon_mm) for piece in pieces],
-            [3, 4, 4, 4],
-        )
-        self.assertTrue(diagnostics["divider_detected"])
-        self.assertTrue(
-            all(3 <= len(piece.polygon_mm) <= 5 for piece in pieces)
-        )
-        self.assertTrue(
-            all(
-                piece.centroid_mm[1] < diagnostics["divider_y_mm"]
-                for piece in pieces
-            )
-        )
-        # Guards against the horizontal divider being accepted as a piece.
-        self.assertTrue(
-            all(piece.area_mm2 < cfg.MAX_PIECE_AREA_MM2 for piece in pieces)
-        )
-        for index, piece in enumerate(pieces):
-            piece.piece_id = "P{}".format(index + 1)
-        plan = plan_rectangle_assembly(pieces)
-        self.assertTrue(plan.valid, plan.reason)
-        self.assertEqual(plan.mode, "fixed_tolerant")
-        self.assertLessEqual(
-            plan.max_vertex_error_mm,
-            cfg.CORRESPONDING_VERTEX_TOLERANCE_MM,
-        )
-        unknown_plan = plan_outer_first_rectangle(pieces)
-        self.assertTrue(unknown_plan.valid, unknown_plan.reason)
-        self.assertEqual(
-            unknown_plan.mode, "corner_outer_strict"
-        )
-        target_width = (
-            unknown_plan.target_rect[2]
-            - unknown_plan.target_rect[0]
-        )
-        target_height = (
-            unknown_plan.target_rect[3]
-            - unknown_plan.target_rect[1]
-        )
-        self.assertEqual(
-            sorted(
-                (round(target_width, 1), round(target_height, 1))
-            ),
-            [60.0, 100.0],
-        )
-        self.assertLessEqual(
-            unknown_plan.search_nodes,
-            cfg.OUTER_FIRST_CORNER_MAX_SEARCH_NODES,
-        )
 
 
 if __name__ == "__main__":

@@ -95,13 +95,6 @@ def _free_edges(polygon):
     ]
 
 
-def _free_interpolate(a, b, fraction):
-    return (
-        a[0] + (b[0] - a[0]) * fraction,
-        a[1] + (b[1] - a[1]) * fraction,
-    )
-
-
 def _free_finite(value):
     value = float(value)
     return value == value and abs(value) < 1e300
@@ -367,6 +360,30 @@ def _free_figure2_match(pieces, source_area):
     return match, None
 
 
+def match_fixed_figure2_piece_set(pieces):
+    """Return the reusable fixed Figure 2 match evaluation."""
+    pieces = list(pieces)
+    if len(pieces) != 4:
+        return None, "piece_count_{}".format(len(pieces))
+    source_area = sum(
+        float(piece.area_mm2) for piece in pieces
+    )
+    if source_area <= EPS:
+        return None, "source_area_not_positive"
+    if any(
+        not _free_polygon_valid(piece.polygon_mm)
+        for piece in pieces
+    ):
+        return None, "invalid_source_polygon"
+    return _free_figure2_match(pieces, source_area)
+
+
+def is_fixed_figure2_piece_set(pieces):
+    """Return whether four observed polygons match the fixed Figure 2 cut."""
+    match, _reason = match_fixed_figure2_piece_set(pieces)
+    return match is not None
+
+
 def _free_figure2_direct_result(
     pieces,
     source_area,
@@ -531,6 +548,11 @@ def _free_figure2_direct_result(
             "template_fits": fit_records,
             "long_side_mm": FIGURE2_RECT_WIDTH_MM,
             "short_side_mm": FIGURE2_RECT_HEIGHT_MM,
+            "aspect_ratio": (
+                FIGURE2_RECT_WIDTH_MM / FIGURE2_RECT_HEIGHT_MM
+            ),
+            "aspect_preferred": True,
+            "aspect_range_penalty": 0.0,
             "actual_width_mm": FIGURE2_RECT_WIDTH_MM,
             "actual_height_mm": FIGURE2_RECT_HEIGHT_MM,
             "rect_area_mm2": FIGURE2_RECT_AREA_MM2,
@@ -1334,6 +1356,21 @@ def _free_complete_metrics(
     short_side = min(
         rectangle["width"], rectangle["height"]
     )
+    aspect_ratio = long_side / max(EPS, short_side)
+    aspect_minimum = float(
+        getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MIN", 1.33)
+    )
+    aspect_maximum = float(
+        getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MAX", 1.67)
+    )
+    if aspect_minimum > aspect_maximum:
+        aspect_minimum, aspect_maximum = (
+            aspect_maximum,
+            aspect_minimum,
+        )
+    aspect_range_penalty = _free_interval_penalty(
+        aspect_ratio, aspect_minimum, aspect_maximum
+    )
     dimension_penalty = _free_interval_penalty(
         long_side,
         float(
@@ -1375,6 +1412,9 @@ def _free_complete_metrics(
         ),
         "long_side_mm": long_side,
         "short_side_mm": short_side,
+        "aspect_ratio": aspect_ratio,
+        "aspect_preferred": aspect_range_penalty <= EPS,
+        "aspect_range_penalty": aspect_range_penalty,
         "dimension_range_penalty": dimension_penalty,
         "outer_piece_missing_count": missing_count,
         "outer_piece_missing_ratio": missing_ratio,
@@ -1633,6 +1673,11 @@ def _free_top_record(proposal):
         "target_fits": proposal["target"] is not None,
         "long_side_mm": metrics["long_side_mm"],
         "short_side_mm": metrics["short_side_mm"],
+        "aspect_ratio": metrics["aspect_ratio"],
+        "aspect_preferred": metrics["aspect_preferred"],
+        "aspect_range_penalty": metrics[
+            "aspect_range_penalty"
+        ],
         "rect_area_mm2": metrics["rect_area_mm2"],
         "overlap_mm2": metrics["overlap_mm2"],
         "overlap_ratio": metrics["overlap_ratio"],
@@ -1656,15 +1701,21 @@ def _free_top_record(proposal):
     }
 
 
+def _free_proposal_rank(proposal):
+    """Prefer the requested aspect band, then ordinary geometric quality."""
+    metrics = proposal["metrics"]
+    return (
+        0 if metrics["aspect_preferred"] else 1,
+        metrics["aspect_range_penalty"],
+        metrics["cost"],
+        proposal["topology"],
+        proposal["match_signature"],
+    )
+
+
 def _free_update_top(top, proposal):
     top.append(proposal)
-    top.sort(
-        key=lambda item: (
-            item["metrics"]["cost"],
-            item["topology"],
-            item["match_signature"],
-        )
-    )
+    top.sort(key=_free_proposal_rank)
     maximum = max(
         1, int(getattr(cfg, "FREE_RECT_TOP_K", 5))
     )
@@ -1689,14 +1740,20 @@ def _free_progress(state, force=False):
     ):
         return
     best_cost = state.get("best_cost")
+    best_aspect = state.get("best_aspect_ratio")
     print(
         "FREE_PLAN_PROGRESS,elapsed_ms={},complete_sets={},"
-        "best_cost={}".format(
+        "best_cost={},best_aspect={}".format(
             elapsed,
             state["complete_matching_set_count"],
             (
                 "{:.6f}".format(best_cost)
                 if best_cost is not None
+                else "na"
+            ),
+            (
+                "{:.3f}".format(best_aspect)
+                if best_aspect is not None
                 else "na"
             ),
         )
@@ -1826,10 +1883,13 @@ def _free_new_state(started_ms):
         "limit_hit": False,
         "stop": False,
         "best_cost": None,
+        "best_aspect_ratio": None,
     }
 
 
-def _plan_simulator_free_rectangle(pieces, validation):
+def _plan_simulator_free_rectangle(
+    pieces, validation, fixed_template_evaluation=None
+):
     started_ms = ticks_ms()
     state = _free_new_state(started_ms)
     pieces = list(pieces)
@@ -1897,9 +1957,14 @@ def _plan_simulator_free_rectangle(pieces, validation):
     del identity_transforms, initial_connected, input_span
 
     if len(pieces) == 4:
-        fixed_match, fixed_reason = _free_figure2_match(
-            pieces, source_area
-        )
+        if fixed_template_evaluation is None:
+            fixed_match, fixed_reason = (
+                match_fixed_figure2_piece_set(pieces)
+            )
+        else:
+            fixed_match, fixed_reason = (
+                fixed_template_evaluation
+            )
         if fixed_match is not None:
             print(
                 "FREE_FIXED_TEMPLATE_CHECK,matched=1,layout={},"
@@ -1935,12 +2000,28 @@ def _plan_simulator_free_rectangle(pieces, validation):
     )
     print(
         "FREE_PLAN_START,pieces={},source_area_mm2={:.1f},"
-        "candidates={},full={},partial={}".format(
+        "candidates={},full={},partial={},time_limit_ms={},"
+        "preferred_aspect={:.2f}|{:.2f}".format(
             len(pieces),
             source_area,
             len(candidates),
             full_count,
             len(candidates) - full_count,
+            int(
+                getattr(
+                    cfg, "FREE_RECT_MAX_PLAN_TIME_MS", 8000
+                )
+            ),
+            float(
+                getattr(
+                    cfg, "FREE_RECT_PREFERRED_ASPECT_MIN", 1.33
+                )
+            ),
+            float(
+                getattr(
+                    cfg, "FREE_RECT_PREFERRED_ASPECT_MAX", 1.67
+                )
+            ),
         )
     )
     if len(pieces) > 1 and not candidates:
@@ -2019,19 +2100,14 @@ def _plan_simulator_free_rectangle(pieces, validation):
         _free_update_top(top, proposal)
         if target is not None and (
             best is None
-            or (
-                proposal["metrics"]["cost"],
-                proposal["topology"],
-                proposal["match_signature"],
-            )
-            < (
-                best["metrics"]["cost"],
-                best["topology"],
-                best["match_signature"],
-            )
+            or _free_proposal_rank(proposal)
+            < _free_proposal_rank(best)
         ):
             best = proposal
             state["best_cost"] = proposal["metrics"]["cost"]
+            state["best_aspect_ratio"] = proposal["metrics"][
+                "aspect_ratio"
+            ]
             update_plan_debug(
                 stage="free_rect_complete",
                 best_score=state["best_cost"],
@@ -2081,6 +2157,8 @@ def _plan_simulator_free_rectangle(pieces, validation):
         warnings.append("hull_gap")
     if metrics["dimension_range_penalty"] > 0.0:
         warnings.append("dimension_range")
+    if not metrics["aspect_preferred"]:
+        warnings.append("aspect_range")
     if metrics["outer_piece_missing_ratio"] > 0.0:
         warnings.append("outer_piece")
     if state["timed_out"]:
@@ -2105,6 +2183,11 @@ def _plan_simulator_free_rectangle(pieces, validation):
             "best_cost": metrics["cost"],
             "long_side_mm": metrics["long_side_mm"],
             "short_side_mm": metrics["short_side_mm"],
+            "aspect_ratio": metrics["aspect_ratio"],
+            "aspect_preferred": metrics["aspect_preferred"],
+            "aspect_range_penalty": metrics[
+                "aspect_range_penalty"
+            ],
             "rect_area_mm2": metrics["rect_area_mm2"],
             "overlap_mm2": metrics["overlap_mm2"],
             "overlap_ratio": metrics["overlap_ratio"],
@@ -2149,6 +2232,7 @@ def _plan_simulator_free_rectangle(pieces, validation):
     print(
         "FREE_PLAN_RESULT,valid=1,timed_out={},complete_sets={},"
         "cost={:.6f},long_mm={:.2f},short_mm={:.2f},"
+        "aspect={:.3f},aspect_preferred={},"
         "rect_area_mm2={:.1f},overlap_mm2={:.1f},gap_mm2={:.1f},"
         "hull_gap_mm2={:.1f},area_error={:.6f},"
         "outer_missing={:.3f},selected_partial={}".format(
@@ -2157,6 +2241,8 @@ def _plan_simulator_free_rectangle(pieces, validation):
             metrics["cost"],
             metrics["long_side_mm"],
             metrics["short_side_mm"],
+            metrics["aspect_ratio"],
+            1 if metrics["aspect_preferred"] else 0,
             metrics["rect_area_mm2"],
             metrics["overlap_mm2"],
             metrics["fill_gap_mm2"],
@@ -2185,12 +2271,16 @@ def _plan_simulator_free_rectangle(pieces, validation):
 
 
 def plan_simulator_free_rectangle(
-    pieces, validation="publish_best"
+    pieces,
+    validation="publish_best",
+    fixed_template_evaluation=None,
 ):
     """Return the best complete rigid free-size rectangle proposal."""
     try:
         return _plan_simulator_free_rectangle(
-            pieces, validation
+            pieces,
+            validation,
+            fixed_template_evaluation=fixed_template_evaluation,
         )
     except Exception as exc:
         started_ms = ticks_ms()

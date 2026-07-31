@@ -8,6 +8,10 @@ from puzzle_config import *
 # physical A4 order: TL, TR, BR, BL; in the current landscape camera view these
 # labels appear as image BL, image TL, image TR, image BR.
 AUTO_CALIBRATE_A4 = True
+# The operator view and all recognition stages are grayscale. Ask VICAP for a
+# grayscale/luma frame directly instead of converting every RGB565 snapshot on
+# the CPU before A4 and piece processing.
+CAMERA_GRAYSCALE = True
 A4_CORNERS_PX = [
     (133.0, 441.0),
     (140.0, 78.0),
@@ -40,21 +44,16 @@ COMPLETION_LED_PIN = 35
 COMPLETION_LED_COLOR = (0, 255, 0)
 COMPLETION_LED_DURATION_MS = 3000
 
-# The simulator topology shown in the operator view has been confirmed against
-# the competition's valid assembly semantics. Always use the lowest-cost
-# connected upstream proposal; keep gap/overlap diagnostics in the log without
-# letting them suppress movement. Build with ``--simulator-validation local``
-# for strict fail-closed A/B.
-SIMULATOR_PLANNER_VALIDATION = "upstream"
-SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER = 2.0
-SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER = 5.0
-
-# A4 boundary detector uses a small aspect-preserving grayscale frame.
+# Restore the original lightweight A4 path. The full-resolution refine remains
+# available in the runtime but is disabled for this deployment.
 A4_DETECT_WIDTH = 320
 A4_DETECT_HEIGHT = 192
+A4_FULL_RES_REFINE_ENABLED = False
+A4_REFINE_WIDTH = 800
+A4_REFINE_HEIGHT = 480
 A4_RECT_EDGE_THRESHOLD = 7000
 
-# Candidate geometry in the 320x192 boundary image.
+# Candidate geometry in the original 320x192 boundary image.
 A4_MIN_FRAME_AREA_RATIO = 0.12
 A4_MAX_FRAME_AREA_RATIO = 0.94
 A4_MIN_WIDTH_HEIGHT_RATIO = 0.40
@@ -108,15 +107,15 @@ A4_STATUS_PRINT_EVERY_N_FRAMES = 15
 A4_TRACK_EVERY_N_FRAMES = 2
 PIECE_DETECT_EVERY_N_FRAMES = 3
 PIECE_COUNT_WINDOW_DETECTIONS = 12
-PIECE_COUNT_SETTLE_DETECTIONS = 8
+PIECE_COUNT_SETTLE_DETECTIONS = 4
 PIECE_COUNT_MIN_CONFIRMATIONS = 2
 PIECE_LOW_GRAY_THRESHOLD = 165
 PIECE_THRESHOLD_PROBE_EVERY_N_DETECTIONS = 4
 PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS = 5
-# First-stage board diagnosis for the rectified image consumed by find_blobs.
-# It does not change thresholds or the recognition path. The first detection
-# and then every fifth detection report native-image and shared-array health.
-ENABLE_GRAY_SANITY_DIAGNOSTICS = True
+# Full-array gray sanity scanning is diagnostic-only and expensive in
+# MicroPython. Keep it off in production; the recognition-debug profile turns
+# it back on explicitly.
+ENABLE_GRAY_SANITY_DIAGNOSTICS = False
 GRAY_SANITY_EVERY_N_DETECTIONS = 5
 # After A4 rectification, calibrate the dominant green/dark paper gray level
 # from the mostly empty lower half. The threshold follows global illumination
@@ -132,22 +131,41 @@ PIECE_BACKGROUND_MIN_SAMPLES = 96
 # Discover components at background+30 (about 51 in the current lighting),
 # then trace the white-paper boundary above the grey cast-shadow band.
 PIECE_CONTOUR_MIN_GRAY_THRESHOLD = 100
+# Adapt the identity-bound high-threshold contour independently for every
+# discovered piece. This does not alter find_blobs or create more candidates.
+PIECE_ADAPTIVE_CONTOUR_THRESHOLD_ENABLED = True
+PIECE_CONTOUR_CENTER_SAMPLE_RADIUS_PX = 2
+PIECE_CONTOUR_CENTER_MIN_CONTRAST_GRAY = 40
+PIECE_CONTOUR_ADAPTIVE_ALPHA = 0.42
+PIECE_CONTOUR_ADAPTIVE_MIN_GRAY = 85
+PIECE_CONTOUR_ADAPTIVE_MAX_GRAY = 140
 # Erase the perspective-interpolation fringe before native Blob discovery.
 # The 5-pixel band is also excluded from background calibration/search ROIs.
 PIECE_RECTIFIED_BORDER_BLACK_PX = 5
+# The A4-lock detector intentionally does not depend on an internal line in
+# this runtime profile.  Once the A4 is rectified, however, detect and erase a
+# thin separator near its midpoint before native piece Blob discovery.
+PIECE_DIVIDER_DETECTION_ENABLED = True
+PIECE_DIVIDER_MIN_GRAY = 50
+PIECE_DIVIDER_MIN_CONTRAST_GRAY = 20
 
 # This competition assembly always starts from four physical pieces. Do not
 # let a repeated incomplete three-piece observation become planner input.
 PLANNING_REQUIRED_PIECE_COUNT = 4
 
-# Lower-resolution real-time piece image. Roughly 1.14 px/mm is still adequate
-# for the hand-cut 20 mm+ edges and reduces pixel traversal by about 44%.
-REALTIME_PIECE_WORK_WIDTH = 240
-REALTIME_PIECE_WORK_HEIGHT = 336
+# Repeated acquisition/tracking stays at 320x448 so temporal stability does
+# not repeatedly pay for the final raster. Once the tracker is stable, one
+# 480x672 pass (about 2.27 px/mm) replaces the coarse observations before
+# planning. Planning still receives only simplified 3..5-vertex millimetre
+# polygons, so its search cost is independent of these raster dimensions.
+REALTIME_PIECE_WORK_WIDTH = 320
+REALTIME_PIECE_WORK_HEIGHT = 448
+REALTIME_PIECE_FINAL_WIDTH = 480
+REALTIME_PIECE_FINAL_HEIGHT = 672
 
 # Show the exact perspective-corrected grayscale image most recently consumed
-# by piece segmentation. Rendering scales that 240x336 image; it never runs a
-# second thumbnail-only rotation_corr path.
+# by piece segmentation. After stability this is the final 480x672 pass;
+# rendering never runs a second thumbnail-only rotation_corr path.
 SHOW_GRAY_WORK_THUMBNAIL = True
 GRAY_THUMBNAIL_MAX_WIDTH = 128
 GRAY_THUMBNAIL_MAX_HEIGHT = 180
@@ -172,16 +190,12 @@ ANGLE_STABLE_TOLERANCE_DEG = 8.0
 # leaves evidence of the active stage and search growth.
 ENABLE_PLAN_DEBUG = True
 PLAN_DEBUG_INTERVAL_MS = 2000
-# Fixed-size beam search performs more than 100k exact polygon intersections
-# for the current four-piece sample and takes tens of seconds on K230. The
-# candidate-graph outer-first planner returns the same desktop solution with
-# roughly 2.6k intersections and has explicit node/wall-clock limits.
-PREFER_OUTER_FIRST_PLANNER = True
-
-# At 240x336, a hand-cut corner can move by several pixels between perspective
-# corrections. Remove shallow raster corners more consistently before temporal
-# tracking; the contest still guarantees every real edge is at least 20 mm.
+# A hand-cut corner can still move by several pixels between perspective
+# corrections. Remove shallow raster corners consistently in both the
+# 320x448 tracking pass and the final 480x672 pass. Every real edge is longer
+# than 20 mm: merge sub-18 mm artefacts, and smooth interior angles >=150 deg.
 CONTOUR_DP_TOLERANCE_MM = 3.0
-VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG = 18.0
+VERTEX_MERGE_DISTANCE_MM = 18.0
+VERTEX_COLLINEAR_ANGLE_TOLERANCE_DEG = 30.0
 VERTEX_COLLINEAR_MAX_OFFSET_MM = 4.0
 VERTEX_CLEANUP_MAX_AREA_CHANGE_RATIO = 0.15
