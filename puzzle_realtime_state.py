@@ -18,11 +18,12 @@ def a4_detection_interval(
     if locked:
         return None
     if phase in (
+        "WAIT_FINAL_CHECK",
+        "FINAL_VERIFY",
         "WAIT_FOR_MOTION",
         "MOVING",
         "POST_MOTION_SETTLE",
         "VERIFY_PLACEMENT",
-        "FINAL_VERIFY",
         "PLACING",
     ):
         return None
@@ -165,6 +166,14 @@ def periodic_output_due(output_index, every_n_outputs):
 
 def placement_phase_actions(phase):
     """Declare which expensive actions are permitted in each frozen-plan phase."""
+    if phase in ("WAIT_FINAL_CHECK", "FINAL_VERIFY", "COMPLETE"):
+        return {
+            "motion_detection": phase != "COMPLETE",
+            "piece_detection": False,
+            "tracker_update": False,
+            "placement_check": phase == "FINAL_VERIFY",
+            "a4_update": False,
+        }
     verify = phase in ("VERIFY_PLACEMENT", "FINAL_VERIFY")
     return {
         "motion_detection": phase
@@ -184,6 +193,13 @@ def placement_phase_actions(phase):
 
 def operator_overlay_visibility(phase, motion_active=False):
     """Return the live operator-view layers allowed in the current phase."""
+    if phase in ("WAIT_FINAL_CHECK", "FINAL_VERIFY", "COMPLETE"):
+        return {
+            "a4": True,
+            "status": True,
+            "pieces": True,
+            "targets": True,
+        }
     moving = bool(motion_active) or phase == "MOVING"
     return {
         "a4": True,
@@ -207,6 +223,8 @@ def operator_status_line(
     """Build one short line for the narrow strip below the camera-view A4."""
     if error:
         return "{} | ERROR".format(phase)
+    if phase == "WAIT_FINAL_CHECK":
+        return "WAIT FINAL CHECK"
     if phase == "MOVING":
         return "MOVING | OVERLAYS PAUSED"
     if phase == "POST_MOTION_SETTLE":
@@ -216,9 +234,7 @@ def operator_status_line(
     if phase == "FINAL_VERIFY":
         return "FINAL VERIFY"
     if phase == "COMPLETE":
-        return "COMPLETE | DONE:{}/{}".format(
-            completed_count, total_count
-        )
+        return "COMPLETE | PASS"
     if phase == "WAIT_FOR_MOTION":
         return "WAIT MOVE | NEXT:{} | DONE:{}/{}".format(
             next_piece_id or "-",
@@ -498,6 +514,91 @@ class MotionDetector:
             "sample_count": len(current),
         }
         return dict(self.last_metrics)
+
+
+class FinalCheckState:
+    """Complete after the source half stays clear and still."""
+
+    __slots__ = (
+        "stable_frames_required",
+        "upper_ratio_max",
+        "phase",
+        "stable_frames",
+        "upper_remaining_ratio",
+        "lower_area_ratio",
+    )
+
+    def __init__(
+        self,
+        stable_frames_required,
+        upper_ratio_max,
+    ):
+        self.stable_frames_required = max(
+            1, int(stable_frames_required)
+        )
+        self.upper_ratio_max = float(upper_ratio_max)
+        self.phase = "WAIT_FINAL_CHECK"
+        self.stable_frames = 0
+        self.upper_remaining_ratio = None
+        self.lower_area_ratio = None
+
+    def update(
+        self,
+        motion,
+        upper_remaining_ratio,
+        lower_area_ratio,
+    ):
+        """Consume one source-clear sample without changing frozen references."""
+        self.upper_remaining_ratio = float(
+            upper_remaining_ratio
+        )
+        self.lower_area_ratio = float(lower_area_ratio)
+        source_clear = (
+            self.upper_remaining_ratio <= self.upper_ratio_max
+        )
+        trigger_complete = False
+        if self.phase == "WAIT_FINAL_CHECK":
+            if motion or not source_clear:
+                self.stable_frames = 0
+            else:
+                self.stable_frames += 1
+            if (
+                self.stable_frames
+                >= self.stable_frames_required
+            ):
+                self.phase = "COMPLETE"
+                trigger_complete = True
+        return {
+            "phase": self.phase,
+            "trigger_complete": trigger_complete,
+            "source_clear": source_clear,
+            "stable_frames": self.stable_frames,
+            "stable_frames_required": (
+                self.stable_frames_required
+            ),
+            "upper_remaining_ratio": (
+                self.upper_remaining_ratio
+            ),
+            "lower_area_ratio": self.lower_area_ratio,
+        }
+
+    def state(self):
+        return {
+            "phase": self.phase,
+            "source_clear": (
+                self.upper_remaining_ratio is not None
+                and self.upper_remaining_ratio
+                <= self.upper_ratio_max
+            ),
+            "stable_frames": self.stable_frames,
+            "stable_frames_required": (
+                self.stable_frames_required
+            ),
+            "upper_remaining_ratio": (
+                self.upper_remaining_ratio
+            ),
+            "lower_area_ratio": self.lower_area_ratio,
+        }
 
 
 class PlacementMotionState:

@@ -493,6 +493,96 @@ def foreground_mask_from_gray(gray_array, threshold):
     return result
 
 
+def final_foreground_mask_from_gray(
+    gray_array,
+    threshold,
+    border_px=0,
+    divider_y_mm=None,
+    divider_margin_mm=0.0,
+):
+    """Build the final-scene mask while excluding fixed non-piece borders."""
+    height = int(gray_array.shape[0])
+    width = int(gray_array.shape[1])
+    border = max(0, int(border_px))
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
+    divider_margin = max(0.0, float(divider_margin_mm))
+    result = bytearray(width * height)
+    index = 0
+    for y in range(height):
+        point_y = (y + 0.5) * cfg.A4_HEIGHT_MM / height
+        excluded_row = (
+            y < border
+            or y >= height - border
+            or abs(point_y - divider) <= divider_margin
+        )
+        row = gray_array[y]
+        for x in range(width):
+            result[index] = (
+                1
+                if (
+                    not excluded_row
+                    and x >= border
+                    and x < width - border
+                    and int(row[x]) >= int(threshold)
+                )
+                else 0
+            )
+            index += 1
+    return result
+
+
+def final_region_white_metrics(
+    foreground_mask,
+    width,
+    height,
+    initial_total_piece_area,
+    divider_y_mm=None,
+):
+    """Return upper/lower white areas relative to the frozen initial area."""
+    width = int(width)
+    height = int(height)
+    if len(foreground_mask) != width * height:
+        raise ValueError("final scene mask dimensions differ")
+    divider = (
+        cfg.DIVIDER_Y_MM
+        if divider_y_mm is None
+        else float(divider_y_mm)
+    )
+    upper_count = 0
+    lower_count = 0
+    for y in range(height):
+        point_y = (y + 0.5) * cfg.A4_HEIGHT_MM / height
+        row_start = y * width
+        row_count = 0
+        for x in range(width):
+            if foreground_mask[row_start + x]:
+                row_count += 1
+        if point_y < divider:
+            upper_count += row_count
+        else:
+            lower_count += row_count
+    pixel_area = (
+        cfg.A4_WIDTH_MM
+        * cfg.A4_HEIGHT_MM
+        / float(width * height)
+    )
+    initial_area = max(1e-9, float(initial_total_piece_area))
+    upper_area = upper_count * pixel_area
+    lower_area = lower_count * pixel_area
+    return {
+        "upper_white_area_mm2": upper_area,
+        "lower_white_area_mm2": lower_area,
+        "upper_remaining_ratio": upper_area / initial_area,
+        "lower_area_ratio": lower_area / initial_area,
+        "upper_foreground_count": upper_count,
+        "lower_foreground_count": lower_count,
+    }
+
+
 def _point_in_polygon(point, polygon):
     inside = False
     previous = polygon[-1]
@@ -694,9 +784,17 @@ def final_rectangle_metrics(
         detected_height = (
             max_y - min_y + 1
         ) * cfg.A4_HEIGHT_MM / height
+        detected_center_x = (
+            min_x + max_x + 1
+        ) * 0.5 * cfg.A4_WIDTH_MM / width
+        detected_center_y = (
+            min_y + max_y + 1
+        ) * 0.5 * cfg.A4_HEIGHT_MM / height
     else:
         detected_width = 0.0
         detected_height = 0.0
+        detected_center_x = 0.0
+        detected_center_y = 0.0
 
     x0, y0, x1, y1 = [float(value) for value in target_rect]
     target_width = x1 - x0
@@ -744,11 +842,16 @@ def final_rectangle_metrics(
     else:
         width_error, height_error = direct_errors
         dimensions_swapped = False
+    center_error = math.sqrt(
+        (detected_center_x - center_x) ** 2
+        + (detected_center_y - center_y) ** 2
+    )
     valid = (
         best_rect["fill_ratio"] >= cfg.FINAL_RECT_FILL_MIN
         and cfg.FINAL_AREA_RATIO_MIN
         <= final_area_ratio
         <= cfg.FINAL_AREA_RATIO_MAX
+        and center_error <= cfg.FINAL_CENTER_TOLERANCE_MM
         and width_error <= cfg.FINAL_RECT_DIM_TOLERANCE_MM
         and height_error <= cfg.FINAL_RECT_DIM_TOLERANCE_MM
         and best_rect["spill_ratio"] <= cfg.FINAL_RECT_SPILL_MAX
@@ -758,6 +861,11 @@ def final_rectangle_metrics(
         "final_area_ratio": final_area_ratio,
         "detected_width_mm": detected_width,
         "detected_height_mm": detected_height,
+        "detected_center_mm": (
+            detected_center_x,
+            detected_center_y,
+        ),
+        "center_error_mm": center_error,
         "width_error_mm": width_error,
         "height_error_mm": height_error,
         "dimensions_swapped": dimensions_swapped,
@@ -767,6 +875,27 @@ def final_rectangle_metrics(
         "lower_foreground_count": lower_foreground,
         "valid": valid,
     }
+
+
+def final_frame_pass(metrics, upper_remaining_ratio):
+    """Apply the single-frame final gate, including the frozen upper area."""
+    return (
+        float(upper_remaining_ratio)
+        <= cfg.FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX
+        and float(metrics["center_error_mm"])
+        <= cfg.FINAL_CENTER_TOLERANCE_MM
+        and float(metrics["width_error_mm"])
+        <= cfg.FINAL_RECT_DIM_TOLERANCE_MM
+        and float(metrics["height_error_mm"])
+        <= cfg.FINAL_RECT_DIM_TOLERANCE_MM
+        and cfg.FINAL_AREA_RATIO_MIN
+        <= float(metrics["final_area_ratio"])
+        <= cfg.FINAL_AREA_RATIO_MAX
+        and float(metrics["fill_ratio"])
+        >= cfg.FINAL_RECT_FILL_MIN
+        and float(metrics["spill_ratio"])
+        <= cfg.FINAL_RECT_SPILL_MAX
+    )
 
 
 def final_rectangle_consensus(scene_metrics):
@@ -791,9 +920,12 @@ def final_rectangle_consensus(scene_metrics):
         "final_area_ratio",
         "detected_width_mm",
         "detected_height_mm",
+        "center_error_mm",
         "width_error_mm",
         "height_error_mm",
         "spill_ratio",
+        "upper_remaining_ratio",
+        "lower_area_ratio",
     ):
         values = sorted(
             float(metrics[name])

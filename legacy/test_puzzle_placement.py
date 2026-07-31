@@ -460,7 +460,7 @@ class PlacementMonitorTests(unittest.TestCase):
             cfg.FINAL_AREA_RATIO_MIN,
         )
         self.assertFalse(hole_metrics["valid"])
-        self.assertLess(
+        self.assertLessEqual(
             hole_metrics["fill_ratio"], cfg.FINAL_RECT_FILL_MIN
         )
 

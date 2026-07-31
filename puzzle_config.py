@@ -201,40 +201,20 @@ OUTER_FIRST_CORNER_CANDIDATES_PER_PIECE = 32
 PLANNER_BACKEND = "outer_first"
 SIMULATOR_PLANNER_CUT_MODE = "auto"
 SIMULATOR_PLANNER_VALIDATION = "local"
-# Even simulator-compatible "upstream" proposals must not command an
-# obviously broken physical placement. Upstream mode may exceed local gates
-# only up to this multiplier; larger errors are rejected fail-closed.
+# Upstream mode always publishes the lowest-cost connected proposal. These
+# multipliers retain the former safety thresholds as diagnostic warnings only;
+# local validation remains the fail-closed A/B path.
 SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER = 2.0
-# T-junctions fitted from raster contours can report a small overlap at their
-# shared endpoint even when the visible topology is correct. Keep the hard
-# overlap safety limit looser than the outside/gap limits.
+# T-junctions fitted from raster contours can report overlap at their shared
+# endpoint even when the visible topology is correct.
 SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER = 5.0
 SIMULATOR_MATCH_REL_TOLERANCE = 0.12
 SIMULATOR_PARTIAL_MIN_RATIO = 0.22
 SIMULATOR_PARTIAL_MAX_RATIO = 0.88
 SIMULATOR_PARTIAL_MATCH_PENALTY = 0.15
 SIMULATOR_MAX_CANDIDATES = 80
-# Preserve both match classes in the shortlist; geometric scoring then fills
-# the remaining slots globally.
-SIMULATOR_MIN_FULL_SHORTLIST = 24
-SIMULATOR_MIN_PARTIAL_SHORTLIST = 40
-SIMULATOR_CANDIDATE_ENDPOINT_WEIGHT = 0.08
-SIMULATOR_CANDIDATE_OUTSIDE_WEIGHT = 2.0
-SIMULATOR_CANDIDATE_OVERLAP_WEIGHT = 3.0
-SIMULATOR_CANDIDATE_DIMENSION_WEIGHT = 1.0
-SIMULATOR_CANDIDATE_GAP_WEIGHT = 1.0
 SIMULATOR_MAX_MATCHING_SETS = 4000
 SIMULATOR_POSE_OPTIMIZATION_STEPS = 20
-# Progressive four-piece prefix gates. Early two/three-piece prefixes receive
-# 2x/1.5x these limits; the completed spanning tree uses the listed values.
-SIMULATOR_PREFIX_DIMENSION_EXCESS_MAX_MM = 30.0
-SIMULATOR_PREFIX_OUTSIDE_MAX_MM2 = 500.0
-SIMULATOR_PREFIX_OVERLAP_MAX_MM2 = 150.0
-SIMULATOR_PREFIX_GAP_MAX_MM2 = 440.0
-SIMULATOR_MATCHING_ROOT_BRANCH_LIMIT = 14
-SIMULATOR_MATCHING_BRANCH_LIMIT = 6
-SIMULATOR_PREFIXES_PER_TOPOLOGY_MAX = 600
-SIMULATOR_PREFIX_CACHE_MAX = 512
 OUTER_FIRST_MAX_SEARCH_NODES = 1200
 OUTER_FIRST_BRANCH_LIMIT = 48
 MAX_RECTANGLE_HYPOTHESES = 12
@@ -351,13 +331,20 @@ POST_MOTION_STABLE_FRAMES = 4
 POST_MOTION_VERIFY_SAMPLES = 3
 MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 
-# Final whole-rectangle validation. Linear values are millimetres.
-FINAL_RECT_FILL_MIN = 0.75
+# Runtime completion uses only the source half: after its white area remains at
+# or below 3% of the frozen initial piece area for ten motion-free frames, all
+# four source pieces are considered removed and the run completes. The lower
+# target-half and rectangle metrics below remain available for offline
+# diagnostics, but never veto runtime completion.
+FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX = 0.03
+FINAL_TRIGGER_LOWER_AREA_RATIO_MIN = 0.70
+FINAL_TRIGGER_STABLE_FRAMES = 10
+FINAL_RECT_FILL_MIN = 0.70
 FINAL_AREA_RATIO_MIN = 0.75
 FINAL_AREA_RATIO_MAX = 1.25
-FINAL_RECT_DIM_TOLERANCE_MM = 20.0
+FINAL_RECT_DIM_TOLERANCE_MM = 15.0
 FINAL_RECT_ENVELOPE_MM = 20.0
-FINAL_RECT_SPILL_MAX = 0.10
+FINAL_RECT_SPILL_MAX = 0.15
 FINAL_VERIFY_SAMPLE_COUNT = 3
 FINAL_VERIFY_REQUIRED_PASSES = 2
 

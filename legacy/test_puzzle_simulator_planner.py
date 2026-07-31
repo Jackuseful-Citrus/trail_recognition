@@ -4,12 +4,8 @@ import math
 import unittest
 
 from puzzle_geometry import PieceObservation
-from puzzle_geometry import polygon_centroid
-from puzzle_perf import ticks_ms
 from puzzle_simulator_planner import (
     UPSTREAM_REVISION,
-    _sim_matching_sets,
-    _sim_new_search_state,
     plan_simulator_rectangle,
     simulator_candidate_matchings,
 )
@@ -76,102 +72,13 @@ class SimulatorCompatiblePlannerTests(unittest.TestCase):
         self.assertTrue(partial)
         self.assertTrue(
             any(
-                (
+                abs(match[0] - 0.15) < 1e-9
+                and (
                     abs(match[6] - 0.4) < 1e-9
                     or abs(match[8] - 0.4) < 1e-9
                 )
                 for match in partial
             )
-        )
-        # Partial candidates are no longer tied at a fixed 0.15 penalty.
-        self.assertGreater(
-            len(set(round(match[0], 6) for match in partial)),
-            1,
-        )
-
-    def test_four_piece_auto_search_covers_every_partial_mix(self):
-        polygons = [
-            [
-                (0.0, 0.0),
-                (0.0, 60.0),
-                (25.0, 60.0),
-                (25.0, 0.0),
-            ]
-            for _ in range(4)
-        ]
-        candidates = []
-        for index in range(3):
-            candidates.append(
-                (
-                    0.01,
-                    index,
-                    2,
-                    index + 1,
-                    0,
-                    0.0,
-                    1.0,
-                    0.0,
-                    1.0,
-                )
-            )
-            candidates.append(
-                (
-                    0.20,
-                    index,
-                    2,
-                    index + 1,
-                    0,
-                    0.0,
-                    1.0,
-                    0.0,
-                    0.99,
-                )
-            )
-        candidates.sort()
-        state = _sim_new_search_state(ticks_ms())
-        results = list(
-            _sim_matching_sets(
-                candidates,
-                4,
-                "auto",
-                state,
-                polygons=polygons,
-                target=(100.0, 60.0),
-            )
-        )
-        self.assertTrue(results)
-        self.assertEqual(
-            set(state["matching_topology_counts"]),
-            {
-                "3_full",
-                "2_full_1_partial",
-                "1_full_2_partial",
-                "3_partial",
-            },
-        )
-
-    def test_known_area_normalization_precedes_candidates(self):
-        scaled = []
-        for polygon in _upstream_fixture("boundary_fan"):
-            center = polygon_centroid(polygon)
-            scaled.append(
-                [
-                    (
-                        center[0] + (point[0] - center[0]) * 1.028,
-                        center[1] + (point[1] - center[1]) * 1.028,
-                    )
-                    for point in polygon
-                ]
-            )
-        plan = plan_simulator_rectangle(
-            _scatter(scaled),
-            validation="local",
-        )
-        self.assertTrue(plan.valid, plan.reason)
-        self.assertAlmostEqual(
-            plan.plan_stats["target_area_scale"],
-            1.0 / 1.028,
-            places=6,
         )
 
     def test_all_upstream_cut_families_reassemble(self):
@@ -208,7 +115,7 @@ class SimulatorCompatiblePlannerTests(unittest.TestCase):
                         1,
                     )
 
-    def test_upstream_validation_rejects_catastrophic_proposal(self):
+    def test_upstream_reports_safety_warning_without_rejecting_best(self):
         pieces = _scatter(
             [
                 [(0.0, 0.0), (45.0, 0.0), (45.0, 60.0), (0.0, 60.0)],
@@ -223,12 +130,60 @@ class SimulatorCompatiblePlannerTests(unittest.TestCase):
         )
         self.assertFalse(local.valid)
         self.assertIn("local gates", local.reason)
-        self.assertFalse(proposal.valid)
-        self.assertIn("physical safety gates", proposal.reason)
+        self.assertTrue(proposal.valid)
+        self.assertIn("best-score proposal", proposal.reason)
+        self.assertIn("safety warnings", proposal.reason)
         self.assertTrue(proposal.plan_stats["local_gate_failures"])
         self.assertTrue(proposal.plan_stats["safety_gate_failures"])
 
-    def test_upstream_validation_normalizes_bounded_area_bias(self):
+    def test_board_overlap_warning_still_publishes_best_plan(self):
+        # Board log 2026-07-31: recognition was correct and the selected
+        # topology was operator-confirmed, but the raster polygons reported
+        # about 182 mm2 overlap against the former 150 mm2 safety threshold.
+        polygons = [
+            [
+                (137.95, 104.61),
+                (192.43, 119.69),
+                (160.79, 23.94),
+            ],
+            [
+                (29.87, 45.21),
+                (37.78, 74.47),
+                (104.56, 42.56),
+                (128.25, 14.67),
+            ],
+            [
+                (49.21, 97.52),
+                (49.21, 106.39),
+                (88.74, 108.16),
+                (119.50, 70.93),
+            ],
+            [
+                (30.75, 132.99),
+                (48.33, 140.08),
+                (68.54, 133.87),
+                (36.03, 114.37),
+            ],
+        ]
+        pieces = [
+            PieceObservation(
+                "P{}".format(index + 1),
+                [],
+                polygon,
+                confidence=1.0,
+            )
+            for index, polygon in enumerate(polygons)
+        ]
+        plan = plan_simulator_rectangle(
+            pieces, validation="upstream"
+        )
+        self.assertTrue(plan.valid, plan.reason)
+        self.assertEqual(len(plan.operations), 4)
+        self.assertGreater(plan.overlap_mm2, 150.0)
+        self.assertIn("safety warnings", plan.reason)
+        self.assertTrue(plan.plan_stats["safety_gate_failures"])
+
+    def test_upstream_validation_allows_bounded_local_warning(self):
         pieces = _scatter(
             [
                 [(0.0, 0.0), (47.0, 0.0), (47.0, 60.0), (0.0, 60.0)],
@@ -239,12 +194,8 @@ class SimulatorCompatiblePlannerTests(unittest.TestCase):
             pieces, validation="upstream"
         )
         self.assertTrue(proposal.valid, proposal.reason)
-        self.assertAlmostEqual(
-            proposal.plan_stats["target_area_scale"],
-            math.sqrt(6000.0 / 5640.0),
-            places=6,
-        )
-        self.assertFalse(proposal.plan_stats["local_gate_failures"])
+        self.assertIn("local warnings", proposal.reason)
+        self.assertTrue(proposal.plan_stats["local_gate_failures"])
         self.assertFalse(
             proposal.plan_stats["safety_gate_failures"]
         )
@@ -297,21 +248,6 @@ class SimulatorCompatiblePlannerTests(unittest.TestCase):
         self.assertLess(plan.overlap_mm2, 100.0)
         self.assertIn("local warnings", plan.reason)
         self.assertFalse(plan.plan_stats["safety_gate_failures"])
-        self.assertGreater(
-            plan.plan_stats["matching_prefixes_evaluated"],
-            plan.plan_stats["matching_sets_evaluated"],
-        )
-        self.assertLess(
-            plan.plan_stats["matching_prefixes_evaluated"],
-            2000,
-        )
-        for name in (
-            "matching_pruned_dimension",
-            "matching_pruned_outside",
-            "matching_pruned_overlap",
-            "matching_pruned_gap",
-        ):
-            self.assertGreater(plan.plan_stats[name], 0)
 
     def test_module_has_no_desktop_numeric_dependency(self):
         with open("puzzle_simulator_planner.py", encoding="utf-8") as source:

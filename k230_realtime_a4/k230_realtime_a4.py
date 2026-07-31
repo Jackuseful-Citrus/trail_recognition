@@ -39,25 +39,22 @@ from puzzle_geometry import (
     polygon_overlap_area,
 )
 from puzzle_simulator_planner import plan_simulator_rectangle
-from puzzle_placement import PlacementMonitor
 from puzzle_placement import (
-    final_rectangle_consensus,
-    final_rectangle_metrics,
-    foreground_mask_from_gray,
-    placement_delta_metrics,
+    clone_piece,
+    final_foreground_mask_from_gray,
+    final_region_white_metrics,
 )
 from puzzle_perf import PERF_STATS
 from puzzle_realtime_state import (
+    FinalCheckState,
     MotionDetector,
     PieceCountConsensus,
-    PlacementMotionState,
     a4_detection_interval,
     phase_allows_vision,
     operator_overlay_visibility,
     operator_status_line,
     plan_frozen_pieces,
     planning_input_integrity,
-    placement_ui_key,
     periodic_output_due,
     should_render_ui,
     status_ui_key,
@@ -65,9 +62,7 @@ from puzzle_realtime_state import (
 )
 from puzzle_vision import (
     background_difference_threshold,
-    build_polygon_scanlines,
     detect_pieces_from_canmv_image,
-    polygon_white_coverage_scanlines,
 )
 from puzzle_a4_boundary import (
     A4BoundaryTracker,
@@ -76,12 +71,8 @@ from puzzle_a4_boundary import (
 )
 
 
-PLACEMENT_PHASES = (
-    "WAIT_FOR_MOTION",
-    "MOVING",
-    "POST_MOTION_SETTLE",
-    "VERIFY_PLACEMENT",
-    "FINAL_VERIFY",
+FINAL_PHASES = (
+    "WAIT_FINAL_CHECK",
     "COMPLETE",
 )
 
@@ -125,7 +116,9 @@ def _a4_mm_to_frame(point_mm, corners):
     return projected
 
 
-def _draw_piece_overlay(frame, pieces, corners):
+def _draw_piece_overlay(
+    frame, pieces, corners, label_prefix=""
+):
     if corners is None:
         return
     for index, piece in enumerate(pieces):
@@ -147,7 +140,9 @@ def _draw_piece_overlay(frame, pieces, corners):
             frame,
             int(center[0]) + 5,
             int(center[1]) - 15,
-            piece.piece_id or "P?",
+            "{}{}".format(
+                label_prefix, piece.piece_id or "P?"
+            ),
             color,
         )
 
@@ -183,7 +178,6 @@ def _draw_plan_target_overlay(
     frame,
     plan,
     corners,
-    placement_state=None,
 ):
     if (
         plan is None
@@ -192,30 +186,13 @@ def _draw_plan_target_overlay(
         or not plan.target_polygons
     ):
         return
-    completed = set(
-        placement_state.get("completed", ())
-        if placement_state is not None
-        else ()
-    )
-    next_piece_id = (
-        placement_state.get("next_piece_id")
-        if placement_state is not None
-        else None
-    )
     for operation in plan.operations:
         piece_id = operation["piece_id"]
         polygon = plan.target_polygons.get(piece_id)
         if not polygon:
             continue
-        if piece_id in completed:
-            color = GREEN
-            thickness = 4
-        elif piece_id == next_piece_id:
-            color = YELLOW
-            thickness = 4
-        else:
-            color = YELLOW
-            thickness = 2
+        color = YELLOW
+        thickness = 2
         points = [
             _a4_mm_to_frame(point, corners)
             for point in polygon
@@ -233,6 +210,13 @@ def _draw_plan_target_overlay(
             "T:{}".format(piece_id),
             color,
         )
+        _draw_text(
+            frame,
+            int(center[0]) + 4,
+            int(center[1]) + 2,
+            "R:{:+.1f}".format(operation["rotation_deg"]),
+            color,
+        )
 
 
 def _operator_status_color(
@@ -240,7 +224,7 @@ def _operator_status_color(
 ):
     if error:
         return RED
-    if motion_active or phase == "MOVING":
+    if motion_active:
         return YELLOW
     if phase == "COMPLETE":
         return GREEN
@@ -282,7 +266,7 @@ def _render_live_operator_view(
     pieces,
     a4_state,
     plan,
-    placement_state,
+    final_state,
     phase,
     stable,
     motion_active,
@@ -343,39 +327,21 @@ def _render_live_operator_view(
             "targets": True,
         }
     if visibility["pieces"]:
-        visible_pieces = (
-            placement_state.get("visible_pieces", ())
-            if placement_state is not None
-            else pieces
-        )
         _draw_piece_overlay(
             canvas,
-            visible_pieces,
+            pieces,
             corners,
+            label_prefix=(
+                "S:" if phase in FINAL_PHASES else ""
+            ),
         )
     if visibility["targets"]:
         _draw_plan_target_overlay(
             canvas,
             plan,
             corners,
-            placement_state,
         )
 
-    completed_count = (
-        placement_state.get("completed_count", 0)
-        if placement_state is not None
-        else 0
-    )
-    total_count = (
-        placement_state.get("total_count", len(pieces))
-        if placement_state is not None
-        else len(pieces)
-    )
-    next_piece_id = (
-        placement_state.get("next_piece_id")
-        if placement_state is not None
-        else None
-    )
     status = operator_status_line(
         phase,
         len(pieces),
@@ -386,11 +352,27 @@ def _render_live_operator_view(
         plan_valid=(
             plan is not None and plan.valid
         ),
-        next_piece_id=next_piece_id,
-        completed_count=completed_count,
-        total_count=total_count,
         error=error or base_error,
     )
+    if (
+        phase == "WAIT_FINAL_CHECK"
+        and final_state is not None
+    ):
+        upper_ratio = final_state.get(
+            "upper_remaining_ratio"
+        )
+        status = "WAIT CLEAR | LEFT:{} S:{}/{}".format(
+            (
+                "{:.0f}%".format(100.0 * upper_ratio)
+                if upper_ratio is not None
+                else "-"
+            ),
+            final_state.get("stable_frames", 0),
+            final_state.get(
+                "stable_frames_required",
+                cfg.FINAL_TRIGGER_STABLE_FRAMES,
+            ),
+        )
     _draw_operator_status_line(
         canvas,
         corners,
@@ -612,7 +594,7 @@ def _preserve_corner_labels(candidate, previous_corners):
     return candidate
 
 
-def _placement_screen_point(point_mm):
+def _final_screen_point(point_mm):
     scale = 1.28
     return (
         int(18 + point_mm[0] * scale),
@@ -634,43 +616,25 @@ def _operation_for_piece(plan, piece_id):
     return None
 
 
-def _placement_phase_label(phase):
+def _final_phase_label(phase):
     return {
-        "WAIT_FOR_MOTION": "WAITING FOR MOVE",
-        "MOVING": "MOVING - VISION PAUSED",
-        "POST_MOTION_SETTLE": "WAITING FOR STABLE IMAGE",
-        "VERIFY_PLACEMENT": "VERIFYING PLACEMENT",
-        "FINAL_VERIFY": "FINAL VERIFY",
-        "COMPLETE": "COMPLETE",
+        "WAIT_FINAL_CHECK": "WAITING FOR LEFT CLEAR",
+        "COMPLETE": "LEFT CLEAR - COMPLETE",
     }.get(phase, phase)
 
 
-def _placement_display_label(phase, placement_state):
-    if phase != "WAIT_FOR_MOTION":
-        return _placement_phase_label(phase)
-    metrics = placement_state.get("metrics", {})
-    if not metrics:
-        return _placement_phase_label(phase)
-    piece_id = next(iter(metrics))
-    item = metrics[piece_id]
-    if item.get("placed") and piece_id in placement_state["completed"]:
-        return "PIECE ACCEPTED"
-    return "PIECE NOT CONFIRMED"
-
-
-def _render_placement_status(
+def _render_final_status(
     canvas,
     reference_pieces,
     plan,
-    placement_state,
+    final_state,
     phase,
     frame_index,
     fps,
-    next_check_ms,
     error,
     divider_y_mm=None,
 ):
-    """Render current and target contours on one full-A4 schematic."""
+    """Render every frozen S/T/R operation and whole-scene final state."""
     divider = (
         cfg.DIVIDER_Y_MM
         if divider_y_mm is None
@@ -688,8 +652,8 @@ def _render_placement_status(
         GRAY,
     )
 
-    a4_top_left = _placement_screen_point((0.0, 0.0))
-    a4_bottom_right = _placement_screen_point(
+    a4_top_left = _final_screen_point((0.0, 0.0))
+    a4_bottom_right = _final_screen_point(
         (cfg.A4_WIDTH_MM, cfg.A4_HEIGHT_MM)
     )
     _draw_box(
@@ -701,10 +665,10 @@ def _render_placement_status(
         GRAY,
         thickness=2,
     )
-    divider_a = _placement_screen_point(
+    divider_a = _final_screen_point(
         (0.0, divider)
     )
-    divider_b = _placement_screen_point(
+    divider_b = _final_screen_point(
         (cfg.A4_WIDTH_MM, divider)
     )
     canvas.draw_line(
@@ -717,55 +681,47 @@ def _render_placement_status(
     )
     _draw_text(canvas, 20, 431, "A4 / mm", GRAY)
 
-    completed = placement_state["completed"]
-    next_piece_id = placement_state["next_piece_id"]
-
-    # Draw desired lower-half poses first. Frozen/last verified observations
-    # remain visible while the event-driven motion gate pauses recognition.
     for piece in reference_pieces:
         piece_id = piece.piece_id
         target = plan.target_polygons.get(piece_id)
         if not target:
             continue
-        if piece_id in completed:
-            color = GREEN
-            thickness = 3
-        elif piece_id == next_piece_id:
-            color = YELLOW
-            thickness = 3
-        else:
-            color = GRAY
-            thickness = 2
         points = [
-            _placement_screen_point(point) for point in target
+            _final_screen_point(point) for point in target
         ]
         _draw_polyline(
-            canvas, points, color, thickness=thickness
+            canvas, points, YELLOW, thickness=2
         )
         operation = _operation_for_piece(plan, piece_id)
         if operation is not None:
-            center = _placement_screen_point(
+            center = _final_screen_point(
                 operation["target_center_mm"]
             )
             _draw_text(
                 canvas,
                 center[0] + 3,
                 center[1] - 12,
-                "{}{}".format(
-                    piece_id,
-                    " OK" if piece_id in completed else "",
+                "T:{}".format(piece_id),
+                YELLOW,
+            )
+            _draw_text(
+                canvas,
+                center[0] + 3,
+                center[1] + 2,
+                "R:{:+.1f}".format(
+                    operation["rotation_deg"]
                 ),
-                color,
+                YELLOW,
             )
 
-    for piece in placement_state["visible_pieces"]:
+    for piece in reference_pieces:
         color = _piece_color(piece.piece_id, reference_pieces)
         points = [
-            _placement_screen_point(point)
+            _final_screen_point(point)
             for point in piece.polygon_mm
         ]
         _draw_polyline(canvas, points, color, thickness=2)
-        center = _placement_screen_point(piece.centroid_mm)
+        center = _final_screen_point(piece.centroid_mm)
         canvas.draw_cross(
             center[0],
             center[1],
@@ -777,7 +733,7 @@ def _render_placement_status(
             canvas,
             center[0] + 4,
             center[1] - 12,
-            piece.piece_id,
+            "S:{}".format(piece.piece_id),
             color,
         )
 
@@ -787,91 +743,78 @@ def _render_placement_status(
         canvas,
         panel_x,
         55,
-        _placement_display_label(phase, placement_state),
+        _final_phase_label(phase),
         status_color,
         2,
+    )
+    upper_ratio = final_state.get(
+        "upper_remaining_ratio"
     )
     _draw_text(
         canvas,
         panel_x,
         83,
-        "DONE:{}/{}".format(
-            placement_state["completed_count"],
-            placement_state["total_count"],
+        "LEFT SOURCE:{}".format(
+            (
+                "{:.1f}%".format(100.0 * upper_ratio)
+                if upper_ratio is not None
+                else "-"
+            ),
         ),
         WHITE,
-        2,
     )
     if phase == "COMPLETE":
         _draw_text(
-            canvas, panel_x, 115, "PUZZLE COMPLETE", GREEN, 2
+            canvas, panel_x, 115, "SOURCE CLEARED - PASS", GREEN, 2
         )
     else:
         _draw_text(
             canvas,
             panel_x,
             115,
-            "NEXT:{}".format(next_piece_id or "-"),
+            "STABLE:{}/{}".format(
+                final_state.get("stable_frames", 0),
+                final_state.get(
+                    "stable_frames_required",
+                    cfg.FINAL_TRIGGER_STABLE_FRAMES,
+                ),
+            ),
             YELLOW,
             2,
         )
-        _draw_text(
-            canvas,
-            panel_x,
-            145,
-            "MOTION-TRIGGERED VERIFY",
-            GRAY,
-        )
-    _draw_text(
-        canvas,
-        panel_x,
-        171,
-        "OBS:{} MATCH:{}".format(
-            placement_state["observed_count"],
-            placement_state["matched_count"],
-        ),
-        GRAY,
-    )
     if error:
         _draw_text(
-            canvas, panel_x, 198, str(error)[:48], RED
+            canvas, panel_x, 178, str(error)[:48], RED
         )
 
-    row_y = 225
+    row_y = 210
     for piece in reference_pieces:
         piece_id = piece.piece_id
         operation = _operation_for_piece(plan, piece_id)
         if operation is None:
             continue
-        if piece_id in completed:
-            state_text = "DONE"
-            color = GREEN
-        elif piece_id == next_piece_id:
-            state_text = "MOVE"
-            color = YELLOW
-        else:
-            state_text = "WAIT"
-            color = GRAY
         _draw_text(
             canvas,
             panel_x,
             row_y,
-            "{} {}".format(piece_id, state_text),
-            color,
-            2,
+            piece_id,
+            _piece_color(piece_id, reference_pieces),
+            1,
         )
         _draw_text(
             canvas,
-            panel_x + 110,
-            row_y + 3,
-            "T:{:.1f},{:.1f} R:{:+.1f}".format(
+            panel_x + 42,
+            row_y,
+            "S:{:.1f},{:.1f} T:{:.1f},{:.1f} R:{:+.1f}".format(
+                operation["source_center_mm"][0],
+                operation["source_center_mm"][1],
                 operation["target_center_mm"][0],
                 operation["target_center_mm"][1],
                 operation["rotation_deg"],
             ),
             WHITE,
         )
-        row_y += 48
+        row_y += 35
 
 
 def _render_planning_status(canvas, pieces, frame_index):
@@ -893,88 +836,6 @@ def _render_planning_status(canvas, pieces, frame_index):
         250,
         "FRAME:{}".format(frame_index),
         GRAY,
-    )
-
-
-def _print_placement_check(frame_index, result):
-    metrics_map = result.get("metrics", {})
-    for piece_id, metrics in metrics_map.items():
-        print(
-            "VERIFY_RESULT,frame={},id={},method={},"
-            "center_error_mm={},pose_bound_mm={},"
-            "area_ratio={},contour_rms_mm={},"
-            "contour_p90_mm={},contour_p95_mm={},"
-            "coverage={},spill_ratio={},placed={}".format(
-                frame_index,
-                piece_id,
-                metrics.get("method", "unknown"),
-                "{:.1f}".format(
-                    metrics["center_error_mm"]
-                )
-                if metrics.get("center_error_mm") is not None
-                else "na",
-                (
-                    "{:.2f}".format(
-                        metrics["pose_error_bound_mm"]
-                    )
-                    if metrics.get("pose_error_bound_mm")
-                    is not None
-                    else "na"
-                ),
-                (
-                    "{:.3f}".format(metrics["area_ratio"])
-                    if metrics.get("area_ratio") is not None
-                    else "na"
-                ),
-                (
-                    "{:.2f}".format(metrics["contour_rms_mm"])
-                    if metrics.get("contour_rms_mm") is not None
-                    else "na"
-                ),
-                (
-                    "{:.2f}".format(metrics["contour_p90_mm"])
-                    if metrics.get("contour_p90_mm") is not None
-                    else "na"
-                ),
-                (
-                    "{:.2f}".format(metrics["contour_p95_mm"])
-                    if metrics.get("contour_p95_mm") is not None
-                    else "na"
-                ),
-                (
-                    "{:.3f}".format(metrics["target_coverage"])
-                    if metrics.get("target_coverage") is not None
-                    else "na"
-                ),
-                (
-                    "{:.3f}".format(metrics["spill_ratio"])
-                    if metrics.get("spill_ratio") is not None
-                    else "na"
-                ),
-                int(bool(metrics.get("placed"))),
-            )
-        )
-        accepted = piece_id in result["newly_completed"]
-        print(
-            "{},frame={},id={},reason={},method={}".format(
-                "PIECE_ACCEPTED" if accepted else "PIECE_REJECTED",
-                frame_index,
-                piece_id,
-                metrics.get("reason", "unknown"),
-                metrics.get("method", "none"),
-            )
-        )
-    print(
-        "PLACEMENT_CHECK,frame={},check={},observed={},matched={},"
-        "completed={}/{},next={}".format(
-            frame_index,
-            result["check_index"],
-            result["observed_count"],
-            result["matched_count"],
-            result["completed_count"],
-            result["total_count"],
-            result["next_piece_id"] or "none",
-        )
     )
 
 
@@ -1062,12 +923,54 @@ def _new_motion_detector(divider_y_mm=None):
     )
 
 
-def _new_placement_flow():
-    return PlacementMotionState(
-        cfg.MOTION_START_CONFIRM_FRAMES,
-        cfg.MOTION_END_CONFIRM_FRAMES,
-        cfg.POST_MOTION_STABLE_FRAMES,
+def _new_final_check_flow():
+    return FinalCheckState(
+        cfg.FINAL_TRIGGER_STABLE_FRAMES,
+        cfg.FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX,
     )
+
+
+def _final_scene_mask(
+    gray_image,
+    threshold,
+    divider_y_mm,
+):
+    width = int(gray_image.width())
+    border_px = max(
+        1,
+        int(
+            cfg.PIECE_RECTIFIED_BORDER_BLACK_PX
+            * width
+            / float(cfg.REALTIME_PIECE_WORK_WIDTH)
+            + 0.5
+        ),
+    )
+    return final_foreground_mask_from_gray(
+        gray_image.to_numpy_ref(),
+        threshold,
+        border_px=border_px,
+        divider_y_mm=divider_y_mm,
+        divider_margin_mm=cfg.MOTION_DIVIDER_IGNORE_MM,
+    )
+
+
+def _print_all_plan_operations(plan):
+    """Emit the complete machine operation list once after a valid plan."""
+    for operation in plan.operations:
+        source = operation["source_center_mm"]
+        target = operation["target_center_mm"]
+        print(
+            "OPERATION,piece_id={},source_x={:.2f},"
+            "source_y={:.2f},target_x={:.2f},"
+            "target_y={:.2f},rotation_deg={:.2f}".format(
+                operation["piece_id"],
+                source[0],
+                source[1],
+                target[0],
+                target[1],
+                operation["rotation_deg"],
+            )
+        )
 
 
 def _count_map_text(values):
@@ -1311,9 +1214,127 @@ def _report_performance(frame_index):
     PERF_STATS.window_snapshot(reset=True)
 
 
+class _CompletionLight:
+    """One-shot completion indicator using the onboard WS2812 RGB LED."""
+
+    def __init__(self):
+        self.pixel = None
+        self.ready = False
+        self.activated = False
+        self.is_on = False
+        self.turned_on_ms = None
+
+    def prepare(self):
+        if not bool(
+            getattr(cfg, "COMPLETION_LED_ENABLED", False)
+        ):
+            print("COMPLETION_LED_READY,status=DISABLED")
+            return
+        try:
+            from machine import Pin
+            import neopixel
+
+            self.pixel = neopixel.NeoPixel(
+                Pin(cfg.COMPLETION_LED_PIN), 1
+            )
+            self.pixel[0] = (0, 0, 0)
+            self.pixel.write()
+            self.ready = True
+            print(
+                "COMPLETION_LED_READY,status=READY,pin={},"
+                "type=ws2812".format(cfg.COMPLETION_LED_PIN)
+            )
+        except Exception as exc:
+            self.pixel = None
+            self.ready = False
+            print(
+                "COMPLETION_LED_READY,status=UNAVAILABLE,"
+                "reason={}".format(
+                    str(exc).replace(",", ";")
+                )
+            )
+
+    def show_complete(self, frame_index):
+        if self.activated:
+            return
+        self.activated = True
+        if not self.ready:
+            print(
+                "COMPLETION_LED,status=SKIPPED,frame={},"
+                "reason=not_ready".format(frame_index)
+            )
+            return
+        try:
+            self.pixel[0] = tuple(cfg.COMPLETION_LED_COLOR)
+            self.pixel.write()
+            self.is_on = True
+            self.turned_on_ms = _ms_now()
+            print(
+                "COMPLETION_LED,status=ON,frame={},"
+                "color={}|{}|{},duration_ms={}".format(
+                    frame_index,
+                    cfg.COMPLETION_LED_COLOR[0],
+                    cfg.COMPLETION_LED_COLOR[1],
+                    cfg.COMPLETION_LED_COLOR[2],
+                    cfg.COMPLETION_LED_DURATION_MS,
+                )
+            )
+        except Exception as exc:
+            print(
+                "COMPLETION_LED,status=ERROR,frame={},"
+                "reason={}".format(
+                    frame_index,
+                    str(exc).replace(",", ";"),
+                )
+            )
+
+    def update(self, frame_index):
+        if (
+            not self.is_on
+            or self.turned_on_ms is None
+            or _ms_delta(_ms_now(), self.turned_on_ms)
+            < cfg.COMPLETION_LED_DURATION_MS
+        ):
+            return
+        try:
+            self.pixel[0] = (0, 0, 0)
+            self.pixel.write()
+            print(
+                "COMPLETION_LED,status=OFF,frame={},"
+                "reason=duration_elapsed".format(frame_index)
+            )
+        except Exception as exc:
+            print(
+                "COMPLETION_LED,status=ERROR,frame={},"
+                "reason={}".format(
+                    frame_index,
+                    str(exc).replace(",", ";"),
+                )
+            )
+        self.is_on = False
+        self.turned_on_ms = None
+
+    def close(self):
+        if self.pixel is not None:
+            try:
+                self.pixel[0] = (0, 0, 0)
+                self.pixel.write()
+            except Exception as exc:
+                print(
+                    "CLEANUP_WARNING,completion_led={}".format(
+                        str(exc).replace(",", ";")
+                    )
+                )
+        self.pixel = None
+        self.ready = False
+        self.is_on = False
+        self.turned_on_ms = None
+
+
 def main():
     sensor = None
     canvases = []
+    completion_light = _CompletionLight()
     _audit_runtime_api()
     auto_calibrate_a4 = bool(cfg.AUTO_CALIBRATE_A4)
     boundary_tracker = (
@@ -1340,15 +1361,10 @@ def main():
     canvas_index = 0
     a4_lock_frame = None
     phase = "ACQUIRE"
-    placement_monitor = None
     reference_pieces = []
     initial_total_piece_area = 0.0
-    placement_started_ms = 0
-    last_placement_check_ms = 0
-    placement_complete_logged = False
-    target_scanlines = {}
     motion_detector = None
-    placement_flow = None
+    final_check_flow = None
     motion_metrics = {
         "mean_abs_diff": 0.0,
         "changed_ratio": 0.0,
@@ -1357,10 +1373,6 @@ def main():
         "scene_changed_ratio": 0.0,
         "scene_change": False,
     }
-    before_foreground_mask = None
-    verify_samples = []
-    verify_started_frame = None
-    last_motion_diagnostic_frame = -1000000
     last_rendered_state = None
     complete_displayed = False
     piece_count_consensus = PieceCountConsensus(
@@ -1395,6 +1407,7 @@ def main():
 
     try:
         sensor = _init_hardware()
+        completion_light.prepare()
         # The automatic acquisition preview transitions to this status canvas
         # after lock, so both canvases are prepared even when camera preview is
         # initially visible.
@@ -1414,7 +1427,7 @@ def main():
             "START_REALTIME_A4,frame={}x{},boundary={}x{},"
             "piece_work={}x{},a4_every={},piece_every={},"
             "debug_camera={},planner={},"
-            "placement_check_ms={},a4_hold_misses={},"
+            "source_clear={:.2f}|{},a4_hold_misses={},"
             "piece_segment={},piece_deltas={}|{},"
             "fixed_fallbacks={}|{},count_window={},"
             "count_settle={},gray_thumbnail={},gray_sanity={},"
@@ -1432,7 +1445,8 @@ def main():
                 cfg.PIECE_DETECT_EVERY_N_FRAMES,
                 int(cfg.DEBUG_SHOW_CAMERA),
                 _planner_selection()[0],
-                cfg.PLACING_VERIFICATION_INTERVAL_MS,
+                cfg.FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX,
+                cfg.FINAL_TRIGGER_STABLE_FRAMES,
                 cfg.A4_HOLD_MISSED_FRAMES,
                 cfg.PIECE_SEGMENTATION_MODE,
                 cfg.PIECE_BACKGROUND_DELTA_GRAY,
@@ -1490,6 +1504,7 @@ def main():
             ):
                 # Preserve the final canvas without snapshot, A4 tracking,
                 # segmentation, coverage scans, or display writes.
+                completion_light.update(frame_index)
                 _sleep_ms(50)
                 continue
             PERF_STATS.begin_frame(frame_index)
@@ -1551,7 +1566,7 @@ def main():
                         last_boundary_diagnostics = (
                             boundary_diagnostics
                         )
-                        if phase in PLACEMENT_PHASES:
+                        if phase in FINAL_PHASES:
                             candidate = _preserve_corner_labels(
                                 candidate,
                                 a4_state["corners_px"],
@@ -1847,12 +1862,21 @@ def main():
                         stable = last_piece_stable
                 elif (
                     a4_state["locked"]
-                    and phase in PLACEMENT_PHASES
-                    and placement_monitor is not None
+                    and phase in FINAL_PHASES
+                    and final_check_flow is not None
                 ):
-                    pieces = placement_monitor.visible_pieces()
+                    pieces = reference_pieces
                     stable = True
                     if phase != "COMPLETE":
+                        divider_y_mm = a4_state.get(
+                            "divider_y_mm", cfg.DIVIDER_Y_MM
+                        )
+                        final_threshold = int(
+                            last_piece_contour_threshold
+                            if last_piece_contour_threshold
+                            is not None
+                            else cfg.PIECE_CONTOUR_MIN_GRAY_THRESHOLD
+                        )
                         motion_gray = _rectified_gray(
                             frame,
                             a4_state["corners_px"],
@@ -1862,429 +1886,59 @@ def main():
                         motion_metrics = motion_detector.update(
                             motion_gray.to_numpy_ref()
                         )
-                        if phase == "VERIFY_PLACEMENT":
-                            if motion_metrics["motion"]:
-                                phase = (
-                                    placement_flow.verification_interrupted()
-                                )
-                                verify_samples = []
-                                verify_started_frame = None
-                                print(
-                                    "MOTION_ACTIVE,frame={},"
-                                    "mean_diff={:.2f},"
-                                    "changed_ratio={:.3f},"
-                                    "reason=verify_interrupted".format(
-                                        frame_index,
-                                        motion_metrics[
-                                            "mean_abs_diff"
-                                        ],
-                                        motion_metrics[
-                                            "changed_ratio"
-                                        ],
-                                    )
-                                )
-                        else:
-                            motion_signal = motion_metrics["motion"]
-                            motion_source = "adjacent"
-                            if (
-                                phase == "WAIT_FOR_MOTION"
-                                and motion_metrics.get(
-                                    "scene_change", False
-                                )
-                            ):
-                                motion_signal = True
-                                if not motion_metrics["motion"]:
-                                    motion_source = "scene"
-                            motion_state = placement_flow.update(
-                                motion_signal,
-                                frame_index,
+                        # The thumbnail is the exact A4 grayscale image used
+                        # by the final trigger, never a display-only warp.
+                        last_piece_gray = motion_gray
+                        last_piece_gray_frame = frame_index
+                        last_piece_gray_threshold = final_threshold
+                        last_piece_contour_threshold = final_threshold
+                        trigger_mask = _final_scene_mask(
+                            motion_gray,
+                            final_threshold,
+                            divider_y_mm,
+                        )
+                        trigger_regions = final_region_white_metrics(
+                            trigger_mask,
+                            cfg.MOTION_SAMPLE_WIDTH,
+                            cfg.MOTION_SAMPLE_HEIGHT,
+                            initial_total_piece_area,
+                            divider_y_mm=divider_y_mm,
+                        )
+                        if phase == "WAIT_FINAL_CHECK":
+                            final_state = final_check_flow.update(
+                                motion_metrics["motion"],
+                                trigger_regions[
+                                    "upper_remaining_ratio"
+                                ],
+                                trigger_regions["lower_area_ratio"],
                             )
-                            phase = motion_state["phase"]
-                            event = motion_state["event"]
-                            if event == "MOTION_START":
+                            phase = final_state["phase"]
+                            if final_state["trigger_complete"]:
                                 print(
-                                    "MOTION_START,frame={},"
-                                    "mean_diff={:.2f},"
-                                    "changed_ratio={:.3f},"
-                                    "scene_mean_diff={:.2f},"
-                                    "scene_changed_ratio={:.3f},"
-                                    "source={}".format(
-                                        motion_state[
-                                            "motion_start_frame"
-                                        ],
-                                        motion_metrics[
-                                            "mean_abs_diff"
-                                        ],
-                                        motion_metrics[
-                                            "changed_ratio"
-                                        ],
-                                        motion_metrics.get(
-                                            "scene_mean_abs_diff",
-                                            0.0,
-                                        ),
-                                        motion_metrics.get(
-                                            "scene_changed_ratio",
-                                            0.0,
-                                        ),
-                                        motion_source,
-                                    )
-                                )
-                            if motion_state["motion_ended"]:
-                                print(
-                                    "MOTION_END,frame={},"
-                                    "stable_frames={}".format(
-                                        frame_index,
-                                        motion_state[
-                                            "stable_after_motion_count"
-                                        ],
-                                    )
-                                )
-                            if event == "POST_MOTION_STABLE":
-                                print(
-                                    "POST_MOTION_STABLE,frame={},"
-                                    "stable_frames={}".format(
-                                        frame_index,
-                                        motion_state[
-                                            "stable_after_motion_count"
-                                        ],
-                                    )
-                                )
-                            if (
-                                phase == "MOVING"
-                                and frame_index
-                                - last_motion_diagnostic_frame
-                                >= cfg.A4_STATUS_PRINT_EVERY_N_FRAMES
-                            ):
-                                print(
-                                    "MOTION_ACTIVE,frame={},"
+                                    "FINAL_RESULT,status=PASS,frame={},"
+                                    "reason=source_clear,"
+                                    "upper_remaining_ratio={:.3f},"
+                                    "lower_area_ratio={:.3f},"
+                                    "stable_frames={}/{},"
                                     "mean_diff={:.2f},"
                                     "changed_ratio={:.3f}".format(
                                         frame_index,
-                                        motion_metrics[
-                                            "mean_abs_diff"
+                                        final_state[
+                                            "upper_remaining_ratio"
                                         ],
-                                        motion_metrics[
-                                            "changed_ratio"
+                                        final_state[
+                                            "lower_area_ratio"
                                         ],
+                                        final_state["stable_frames"],
+                                        final_state[
+                                            "stable_frames_required"
+                                        ],
+                                        motion_metrics["mean_abs_diff"],
+                                        motion_metrics["changed_ratio"],
                                     )
                                 )
-                                last_motion_diagnostic_frame = frame_index
-                            if (
-                                phase == "WAIT_FOR_MOTION"
-                                and frame_index
-                                - last_motion_diagnostic_frame
-                                >= getattr(
-                                    cfg,
-                                    "MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES",
-                                    60,
-                                )
-                            ):
-                                print(
-                                    "MOTION_WAIT,frame={},"
-                                    "mean_diff={:.2f},"
-                                    "changed_ratio={:.3f},"
-                                    "scene_mean_diff={:.2f},"
-                                    "scene_changed_ratio={:.3f}".format(
-                                        frame_index,
-                                        motion_metrics[
-                                            "mean_abs_diff"
-                                        ],
-                                        motion_metrics[
-                                            "changed_ratio"
-                                        ],
-                                        motion_metrics.get(
-                                            "scene_mean_abs_diff",
-                                            0.0,
-                                        ),
-                                        motion_metrics.get(
-                                            "scene_changed_ratio",
-                                            0.0,
-                                        ),
-                                    )
-                                )
-                                last_motion_diagnostic_frame = frame_index
-                            watchdog_due = (
-                                phase == "WAIT_FOR_MOTION"
-                                and cfg.ENABLE_PLACEMENT_WATCHDOG
-                                and _ms_delta(
-                                    _ms_now(),
-                                    last_placement_check_ms,
-                                )
-                                >= cfg.PLACING_VERIFICATION_INTERVAL_MS
-                            )
-                            if watchdog_due:
-                                phase = "VERIFY_PLACEMENT"
-                                placement_flow.phase = phase
-                                verify_started_frame = frame_index
-                                verify_samples = []
-                                print(
-                                    "VERIFY_START,frame={},"
-                                    "trigger=watchdog".format(
-                                        frame_index
-                                    )
-                                )
-                    if phase == "VERIFY_PLACEMENT":
-                        if verify_started_frame is None:
-                            verify_started_frame = frame_index
-                            verify_samples = []
-                            print(
-                                "VERIFY_START,frame={},trigger=motion,"
-                                "id={}".format(
-                                    frame_index,
-                                    placement_monitor.next_piece_id()
-                                    or "none",
-                                )
-                            )
-                        observations, placement_diagnostics = (
-                            _detect_frame_pieces(
-                                frame,
-                                a4_state["corners_px"],
-                                "full",
-                                None,
-                                (
-                                    a4_state["divider_y_mm"]
-                                    if a4_state.get(
-                                        "divider_detected",
-                                        False,
-                                    )
-                                    else None
-                                ),
-                            )
-                        )
-                        last_piece_gray = (
-                            placement_diagnostics.get("rectified")
-                        )
-                        last_piece_gray_frame = frame_index
-                        last_piece_gray_threshold = int(
-                            placement_diagnostics.get(
-                                "threshold",
-                                cfg.WHITE_GRAY_THRESHOLD,
-                            )
-                        )
-                        last_piece_contour_threshold = int(
-                            placement_diagnostics.get(
-                                "contour_threshold",
-                                last_piece_gray_threshold,
-                            )
-                        )
-                        gray_array = placement_diagnostics[
-                            "rectified"
-                        ].to_numpy_ref()
-                        after_mask = foreground_mask_from_gray(
-                            gray_array, last_piece_gray_threshold
-                        )
-                        next_piece_id = (
-                            placement_monitor.next_piece_id()
-                        )
-                        delta = None
-                        if (
-                            next_piece_id is not None
-                            and before_foreground_mask is not None
-                        ):
-                            reference = (
-                                placement_monitor.reference_by_id[
-                                    next_piece_id
-                                ]
-                            )
-                            delta = placement_delta_metrics(
-                                before_foreground_mask,
-                                after_mask,
-                                cfg.REALTIME_PIECE_WORK_WIDTH,
-                                cfg.REALTIME_PIECE_WORK_HEIGHT,
-                                active_plan.target_polygons[
-                                    next_piece_id
-                                ],
-                                reference.polygon_mm,
-                                reference.area_mm2,
-                            )
-                        final_candidate = (
-                            next_piece_id is None
-                            or len(placement_monitor.completed) + 1
-                            >= len(placement_monitor.order)
-                        )
-                        verify_sample_goal = (
-                            max(
-                                cfg.POST_MOTION_VERIFY_SAMPLES,
-                                cfg.FINAL_VERIFY_SAMPLE_COUNT,
-                            )
-                            if final_candidate
-                            else cfg.POST_MOTION_VERIFY_SAMPLES
-                        )
-                        final_metrics = None
-                        if final_candidate:
-                            final_metrics = final_rectangle_metrics(
-                                after_mask,
-                                cfg.REALTIME_PIECE_WORK_WIDTH,
-                                cfg.REALTIME_PIECE_WORK_HEIGHT,
-                                active_plan.target_rect,
-                                initial_total_piece_area,
-                            )
-                        verify_samples.append(
-                            {
-                                "observations": observations,
-                                "delta_metrics": delta,
-                                "foreground_mask": after_mask,
-                                "final_scene_metrics": final_metrics,
-                            }
-                        )
-                        print(
-                            "VERIFY_SAMPLE,frame={},sample={}/{},"
-                            "id={},observed={},delta_coverage={},"
-                            "delta_area_ratio={},delta_spill={}".format(
-                                frame_index,
-                                len(verify_samples),
-                                verify_sample_goal,
-                                next_piece_id or "none",
-                                len(observations),
-                                (
-                                    "{:.3f}".format(
-                                        delta[
-                                            "added_target_coverage"
-                                        ]
-                                    )
-                                    if delta is not None
-                                    else "na"
-                                ),
-                                (
-                                    "{:.3f}".format(
-                                        delta["added_area_ratio"]
-                                    )
-                                    if delta is not None
-                                    else "na"
-                                ),
-                                (
-                                    "{:.3f}".format(
-                                        delta[
-                                            "added_spill_ratio"
-                                        ]
-                                    )
-                                    if delta is not None
-                                    else "na"
-                                ),
-                            )
-                        )
-                        if (
-                            len(verify_samples)
-                            >= verify_sample_goal
-                        ):
-                            placement_result = (
-                                placement_monitor.check_samples(
-                                    verify_samples
-                                )
-                            )
-                            before_foreground_mask = verify_samples[
-                                -1
-                            ]["foreground_mask"]
-                            last_placement_check_ms = _ms_now()
-                            pieces = (
-                                placement_monitor.visible_pieces()
-                            )
-                            _print_placement_check(
-                                frame_index, placement_result
-                            )
-                            if placement_result["done"]:
-                                phase = "FINAL_VERIFY"
-                                placement_flow.phase = phase
-                                final_result = (
-                                    final_rectangle_consensus(
-                                        [
-                                            sample[
-                                                "final_scene_metrics"
-                                            ]
-                                            for sample in verify_samples
-                                            if sample[
-                                                "final_scene_metrics"
-                                            ]
-                                            is not None
-                                        ]
-                                    )
-                                )
-                                print(
-                                    "FINAL_SCENE_METRICS,frame={},"
-                                    "fill_ratio={:.3f},"
-                                    "area_ratio={:.3f},"
-                                    "bbox_mm={:.1f}x{:.1f},"
-                                    "width_error_mm={:.1f},"
-                                    "height_error_mm={:.1f},"
-                                    "spill_ratio={:.3f},passes={}/{},"
-                                    "valid={}".format(
-                                        frame_index,
-                                        final_result["fill_ratio"],
-                                        final_result[
-                                            "final_area_ratio"
-                                        ],
-                                        final_result[
-                                            "detected_width_mm"
-                                        ],
-                                        final_result[
-                                            "detected_height_mm"
-                                        ],
-                                        final_result[
-                                            "width_error_mm"
-                                        ],
-                                        final_result[
-                                            "height_error_mm"
-                                        ],
-                                        final_result["spill_ratio"],
-                                        final_result["pass_count"],
-                                        final_result[
-                                            "required_passes"
-                                        ],
-                                        int(final_result["valid"]),
-                                    )
-                                )
-                                if final_result["valid"]:
-                                    phase = "COMPLETE"
-                                    placement_flow.verification_finished(
-                                        complete=True
-                                    )
-                                    print(
-                                        "FINAL_ACCEPTED,frame={},"
-                                        "passes={}/{}".format(
-                                            frame_index,
-                                            final_result["pass_count"],
-                                            final_result[
-                                                "required_passes"
-                                            ],
-                                        )
-                                    )
-                                else:
-                                    phase = (
-                                        placement_flow.verification_finished()
-                                    )
-                                    print(
-                                        "FINAL_REJECTED,frame={},"
-                                        "passes={}/{}".format(
-                                            frame_index,
-                                            final_result["pass_count"],
-                                            final_result[
-                                                "required_passes"
-                                            ],
-                                        )
-                                    )
-                            else:
-                                phase = (
-                                    placement_flow.verification_finished()
-                                )
-                            if phase == "WAIT_FOR_MOTION":
-                                motion_detector.accept_current_as_reference()
-                            verify_samples = []
-                            verify_started_frame = None
-                        if phase == "COMPLETE":
-                            if not placement_complete_logged:
-                                placement_complete_logged = True
-                                print(
-                                    "PLACEMENT_COMPLETE,frame={},"
-                                    "elapsed_ms={},count={}".format(
-                                        frame_index,
-                                        _ms_delta(
-                                            _ms_now(),
-                                            placement_started_ms,
-                                        ),
-                                        placement_result[
-                                            "total_count"
-                                        ],
-                                    )
+                                completion_light.show_complete(
+                                    frame_index
                                 )
                 elif phase == "ACQUIRE":
                     pieces = []
@@ -2295,10 +1949,9 @@ def main():
                     last_piece_gray_frame = -1
                     last_piece_gray_threshold = None
                     last_piece_contour_threshold = None
-                elif placement_monitor is not None:
-                    # Keep the frozen plan and most recent contour-only state
-                    # while A4 tracking is temporarily lost.
-                    pieces = placement_monitor.visible_pieces()
+                elif final_check_flow is not None:
+                    # A frozen plan never returns to piece detection.
+                    pieces = reference_pieces
                     stable = True
             except Exception as exc:
                 if "IDE interrupt" in str(exc):
@@ -2307,10 +1960,10 @@ def main():
                 if auto_calibrate_a4:
                     a4_state = boundary_tracker.state()
                 if (
-                    phase in PLACEMENT_PHASES
-                    and placement_monitor is not None
+                    phase in FINAL_PHASES
+                    and final_check_flow is not None
                 ):
-                    pieces = placement_monitor.visible_pieces()
+                    pieces = reference_pieces
                     stable = True
                 else:
                     pieces = last_pieces
@@ -2614,69 +2267,36 @@ def main():
                         )
                         if active_plan.valid:
                             last_failed_plan_key = None
-                            placement_monitor = PlacementMonitor(
-                                pieces, active_plan
-                            )
-                            reference_pieces = (
-                                placement_monitor.references
-                            )
+                            reference_pieces = [
+                                clone_piece(piece) for piece in pieces
+                            ]
                             initial_total_piece_area = sum(
                                 piece.area_mm2
                                 for piece in reference_pieces
                             )
-                            phase = "WAIT_FOR_MOTION"
+                            _print_all_plan_operations(active_plan)
+                            phase = "WAIT_FINAL_CHECK"
                             motion_detector = _new_motion_detector(
                                 a4_state.get(
                                     "divider_y_mm",
                                     cfg.DIVIDER_Y_MM,
                                 )
                             )
-                            placement_flow = _new_placement_flow()
-                            verify_samples = []
-                            verify_started_frame = None
-                            placement_started_ms = _ms_now()
-                            last_placement_check_ms = (
-                                placement_started_ms
+                            final_check_flow = (
+                                _new_final_check_flow()
                             )
-                            target_scanlines = {}
-                            for (
-                                piece_id,
-                                target_polygon,
-                            ) in active_plan.target_polygons.items():
-                                target_scanlines[piece_id] = (
-                                    build_polygon_scanlines(
-                                        target_polygon,
-                                        cfg.REALTIME_PIECE_WORK_WIDTH,
-                                        cfg.REALTIME_PIECE_WORK_HEIGHT,
-                                        sample_stride=(
-                                            cfg.PLACEMENT_COVERAGE_SAMPLE_STRIDE
-                                        ),
-                                    )
-                                )
-                            before_foreground_mask = None
-                            if (
-                                last_piece_gray is not None
-                                and last_piece_gray_threshold
-                                is not None
-                            ):
-                                before_foreground_mask = (
-                                    foreground_mask_from_gray(
-                                        last_piece_gray.to_numpy_ref(),
-                                        last_piece_gray_threshold,
-                                    )
-                                )
-                            pieces = (
-                                placement_monitor.visible_pieces()
-                            )
+                            pieces = reference_pieces
                             stable = True
                             print(
-                                "PLACEMENT_START,frame={},count={},"
-                                "trigger=motion,next={},"
-                                "verify_samples={}".format(
+                                "FINAL_CHECK_START,frame={},count={},"
+                                "initial_area_mm2={:.1f},"
+                                "source_clear_max={:.2f},"
+                                "stable_frames={}".format(
                                     frame_index,
                                     len(reference_pieces),
-                                    placement_monitor.next_piece_id(),
-                                    cfg.POST_MOTION_VERIFY_SAMPLES,
+                                    initial_total_piece_area,
+                                    cfg.FINAL_TRIGGER_UPPER_REMAINING_RATIO_MAX,
+                                    cfg.FINAL_TRIGGER_STABLE_FRAMES,
                                 )
                             )
                         else:
@@ -2782,23 +2402,32 @@ def main():
                     )
                 )
             )
-            next_check_ms = 0
-            placement_state = None
+            final_state = None
             if (
-                phase in PLACEMENT_PHASES
-                and placement_monitor is not None
+                phase in FINAL_PHASES
+                and final_check_flow is not None
             ):
-                next_check_ms = 0
-                placement_state = placement_monitor.state()
+                final_state = final_check_flow.state()
                 current_render_state = (
                     "placement",
-                ) + placement_ui_key(
                     phase,
-                    placement_state,
-                    next_check_ms,
-                    cfg.UI_COUNTDOWN_REFRESH_INTERVAL_MS,
-                    error,
-                ) + (last_piece_gray_frame,)
+                    final_state["stable_frames"],
+                    int(
+                        1000.0
+                        * (
+                            final_state[
+                                "upper_remaining_ratio"
+                            ]
+                            if final_state[
+                                "upper_remaining_ratio"
+                            ]
+                            is not None
+                            else -1.0
+                        )
+                    ),
+                    str(error or ""),
+                    last_piece_gray_frame,
+                )
             else:
                 current_render_state = (
                     "camera",
@@ -2872,7 +2501,7 @@ def main():
                         pieces,
                         a4_state,
                         active_plan,
-                        placement_state,
+                        final_state,
                         phase,
                         stable,
                         bool(motion_metrics.get("motion")),
@@ -3002,18 +2631,17 @@ def main():
                     canvas = canvases[canvas_index]
                     canvas_index = 1 - canvas_index
                     if (
-                        phase in PLACEMENT_PHASES
-                        and placement_monitor is not None
+                        phase in FINAL_PHASES
+                        and final_check_flow is not None
                     ):
-                        _render_placement_status(
+                        _render_final_status(
                             canvas,
                             reference_pieces,
                             active_plan,
-                            placement_state,
+                            final_state,
                             phase,
                             frame_index,
                             fps,
-                            next_check_ms,
                             error,
                             a4_state.get(
                                 "divider_y_mm",
@@ -3141,6 +2769,7 @@ def main():
             _sleep_ms(100)
         except Exception:
             pass
+        completion_light.close()
         try:
             MediaManager.deinit()
         except Exception as exc:

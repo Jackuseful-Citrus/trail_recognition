@@ -32,10 +32,19 @@ A4_LOCK_PREVIEW_HOLD_FRAMES = 20
 LIVE_GRAYSCALE_OPERATOR_VIEW = True
 OPERATOR_HIDE_OVERLAYS_DURING_MOTION = True
 
+# CanMV-K230 V3.0 onboard programmable status light: one WS2812B-mini RGB
+# pixel (D4) driven by GPIO35. Keep it off during acquisition/planning, then
+# show a low-brightness green continuously after completion.
+COMPLETION_LED_ENABLED = True
+COMPLETION_LED_PIN = 35
+COMPLETION_LED_COLOR = (0, 255, 0)
+COMPLETION_LED_DURATION_MS = 3000
+
 # The simulator topology shown in the operator view has been confirmed against
-# the competition's valid assembly semantics. Keep its local gap/overlap
-# diagnostics in the log, but allow that proposal to enter the manual placement
-# state machine. Build with ``--simulator-validation local`` for strict A/B.
+# the competition's valid assembly semantics. Always use the lowest-cost
+# connected upstream proposal; keep gap/overlap diagnostics in the log without
+# letting them suppress movement. Build with ``--simulator-validation local``
+# for strict fail-closed A/B.
 SIMULATOR_PLANNER_VALIDATION = "upstream"
 SIMULATOR_UPSTREAM_SAFETY_GATE_MULTIPLIER = 2.0
 SIMULATOR_UPSTREAM_OVERLAP_SAFETY_GATE_MULTIPLIER = 5.0
@@ -130,13 +139,6 @@ PIECE_RECTIFIED_BORDER_BLACK_PX = 5
 # This competition assembly always starts from four physical pieces. Do not
 # let a repeated incomplete three-piece observation become planner input.
 PLANNING_REQUIRED_PIECE_COUNT = 4
-
-# A slow hand/gantry move can be invisible to adjacent-frame differencing.
-# Cumulative reference-scene motion handles that path; the watchdog guarantees
-# a placement check even if no transition frame is observed.
-ENABLE_PLACEMENT_WATCHDOG = True
-PLACING_VERIFICATION_INTERVAL_MS = 8000
-MOTION_WAIT_DIAGNOSTIC_INTERVAL_FRAMES = 60
 
 # Lower-resolution real-time piece image. Roughly 1.14 px/mm is still adequate
 # for the hand-cut 20 mm+ edges and reduces pixel traversal by about 44%.
