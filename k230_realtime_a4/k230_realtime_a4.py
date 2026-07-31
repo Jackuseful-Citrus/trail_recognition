@@ -39,6 +39,9 @@ from puzzle_geometry import (
     polygon_overlap_area,
 )
 from puzzle_simulator_planner import plan_simulator_rectangle
+from puzzle_simulator_free_rect_planner import (
+    plan_simulator_free_rectangle,
+)
 from puzzle_placement import (
     clone_piece,
     final_foreground_mask_from_gray,
@@ -79,6 +82,12 @@ FINAL_PHASES = (
 
 def _planner_selection():
     backend = getattr(cfg, "PLANNER_BACKEND", "outer_first")
+    if backend == "simulator_free_rect":
+        return (
+            "simulator_free_rect",
+            plan_simulator_free_rectangle,
+            True,
+        )
     if backend == "simulator":
         return "simulator", plan_simulator_rectangle, True
     prefer_unknown = (
