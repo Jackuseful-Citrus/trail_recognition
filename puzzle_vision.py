@@ -318,9 +318,16 @@ def _ordered_contour_polygon_once(
     )
 
 
-def _ordered_contour_polygon(points_mm, fit_diagnostics=None):
+def _ordered_contour_polygon(
+    points_mm, fit_diagnostics=None, tolerance_mm=None
+):
     """Fit a validated 3..5 vertex polygon from an ordered outer contour."""
-    tolerance = max(0.05, cfg.CONTOUR_DP_TOLERANCE_MM)
+    tolerance = max(
+        0.05,
+        cfg.CONTOUR_DP_TOLERANCE_MM
+        if tolerance_mm is None
+        else float(tolerance_mm),
+    )
     polygon = _ordered_contour_polygon_once(
         points_mm, tolerance
     )

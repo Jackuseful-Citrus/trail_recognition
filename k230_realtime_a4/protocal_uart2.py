@@ -242,8 +242,8 @@ class K230Uart2Link:
 
     def __init__(
         self,
-        tx_pin=11,
-        rx_pin=12,
+        tx_pin=5,
+        rx_pin=6,
         baudrate=115200,
         initial_sequence=0,
         status_timeout_ms=20000,

@@ -24,6 +24,10 @@ SOURCE_PROJECTIVE_NO_UART_OUTPUT = (
     HERE
     / "k230_realtime_a4_simulator_free_rect_source_projective_no_uart_standalone.py"
 )
+SOURCE_PROJECTIVE_OPTIMIZED_NO_UART_OUTPUT = (
+    HERE
+    / "k230_realtime_a4_simulator_free_rect_source_projective_optimized_no_uart_standalone.py"
+)
 LOCAL_MODULES = {
     "puzzle_config",
     "puzzle_perf",
@@ -38,6 +42,7 @@ LOCAL_MODULES = {
     "realtime_a4_free_rect_config",
     "realtime_a4_recognition_debug_config",
     "realtime_free_rect_source_projective_no_uart_config",
+    "realtime_free_rect_source_projective_optimized_no_uart_config",
     "puzzle_a4_boundary",
     "a4_projective_mapper",
     "source_divider_detector",
@@ -99,6 +104,110 @@ def print(*values, **options):
         **options
     )
 '''
+
+
+DIRECT_UART2_PLAN_OUTPUT_BLOCK = '''\
+_UART2_PLAN_OUTPUT = None
+_UART2_PLAN_FPIOA = None
+_UART2_PLAN_TX_PIN = 5
+_UART2_PLAN_RX_PIN = 6
+_UART2_PLAN_BAUDRATE = 115200
+
+
+def _open_uart2_plan_output():
+    """Lazily open the standalone-only four-line UART2 output."""
+    global _UART2_PLAN_OUTPUT, _UART2_PLAN_FPIOA
+    if _UART2_PLAN_OUTPUT is not None:
+        return _UART2_PLAN_OUTPUT
+    try:
+        from machine import FPIOA, UART
+
+        _UART2_PLAN_FPIOA = FPIOA()
+        _UART2_PLAN_FPIOA.set_function(
+            _UART2_PLAN_TX_PIN, FPIOA.UART2_TXD
+        )
+        _UART2_PLAN_FPIOA.set_function(
+            _UART2_PLAN_RX_PIN, FPIOA.UART2_RXD
+        )
+        _UART2_PLAN_OUTPUT = UART(
+            UART.UART2,
+            baudrate=_UART2_PLAN_BAUDRATE,
+            bits=UART.EIGHTBITS,
+            parity=UART.PARITY_NONE,
+            stop=UART.STOPBITS_ONE,
+            timeout=0,
+        )
+        print(
+            "UART2_PLAN_READY,tx_pin={},rx_pin={},baudrate={}".format(
+                _UART2_PLAN_TX_PIN,
+                _UART2_PLAN_RX_PIN,
+                _UART2_PLAN_BAUDRATE,
+            )
+        )
+        return _UART2_PLAN_OUTPUT
+    except Exception as exc:
+        _UART2_PLAN_OUTPUT = None
+        print(
+            "UART2_PLAN_ERROR,stage=open,reason={}".format(
+                str(exc).replace(",", ";")
+            )
+        )
+        return None
+
+
+def _write_plan_operations_uart2(plan):
+    """Write exactly four source/target/rotation records after Planning."""
+    operations = list(getattr(plan, "operations", ()))
+    if not getattr(plan, "valid", False) or len(operations) != 4:
+        print(
+            "UART2_PLAN_SKIPPED,valid={},operations={}".format(
+                int(bool(getattr(plan, "valid", False))),
+                len(operations),
+            )
+        )
+        return False
+    uart = _open_uart2_plan_output()
+    if uart is None:
+        return False
+    try:
+        for operation in operations:
+            source = operation["source_center_mm"]
+            target = operation["target_center_mm"]
+            line = (
+                "UART2_PLAN,piece_id={},source_x={:.2f},source_y={:.2f},"
+                "target_x={:.2f},target_y={:.2f},rot={:.2f}\\r\\n"
+            ).format(
+                operation["piece_id"],
+                source[0],
+                source[1],
+                target[0],
+                target[1],
+                operation["rotation_deg"],
+            )
+            uart.write(line.encode("ascii"))
+        print("UART2_PLAN_SENT,records=4")
+        return True
+    except Exception as exc:
+        print(
+            "UART2_PLAN_ERROR,stage=write,reason={}".format(
+                str(exc).replace(",", ";")
+            )
+        )
+        return False
+'''
+
+
+def _inject_direct_uart2_plan_call(runtime_source):
+    marker = "                            _print_all_plan_operations(active_plan)\n"
+    replacement = (
+        marker
+        + "                            _write_plan_operations_uart2(active_plan)\n"
+    )
+    if runtime_source.count(marker) != 1:
+        raise ValueError(
+            "expected exactly one plan-operation output marker"
+        )
+    return runtime_source.replace(marker, replacement, 1)
 
 
 def _assigned_names(source):
@@ -244,6 +353,14 @@ def main(argv=None):
             "with UART execution disabled"
         ),
     )
+    parser.add_argument(
+        "--source-projective-optimized-no-uart",
+        action="store_true",
+        help=(
+            "build the isolated staged source-projective FreeRect "
+            "profile with UART execution disabled"
+        ),
+    )
     args = parser.parse_args(argv)
     selected_profiles = sum(
         int(value)
@@ -251,16 +368,20 @@ def main(argv=None):
             args.recognition_debug,
             args.no_uart,
             args.source_projective_no_uart,
+            args.source_projective_optimized_no_uart,
         )
     )
     if selected_profiles > 1:
         parser.error(
             "--recognition-debug, --no-uart, and "
-            "--source-projective-no-uart are mutually exclusive"
+            "--source-projective-no-uart, and "
+            "--source-projective-optimized-no-uart are mutually exclusive"
         )
     output = args.output or (
         DEBUG_OUTPUT
         if args.recognition_debug
+        else SOURCE_PROJECTIVE_OPTIMIZED_NO_UART_OUTPUT
+        if args.source_projective_optimized_no_uart
         else SOURCE_PROJECTIVE_NO_UART_OUTPUT
         if args.source_projective_no_uart
         else NO_UART_OUTPUT
@@ -270,6 +391,13 @@ def main(argv=None):
     if args.recognition_debug:
         extra_override_paths = [
             HERE / "realtime_a4_recognition_debug_config.py"
+        ]
+    elif args.source_projective_optimized_no_uart:
+        extra_override_paths = [
+            HERE
+            / "realtime_free_rect_source_projective_no_uart_config.py",
+            HERE
+            / "realtime_free_rect_source_projective_optimized_no_uart_config.py",
         ]
     elif args.source_projective_no_uart:
         extra_override_paths = [
@@ -293,6 +421,11 @@ def main(argv=None):
             ROOT / "puzzle_simulator_free_rect_planner.py"
         )
     )
+    runtime_source = _filtered_source(HERE / "k230_realtime_a4.py")
+    if args.source_projective_optimized_no_uart:
+        runtime_source = _inject_direct_uart2_plan_call(
+            runtime_source
+        )
     sections.extend([
         _filtered_source(ROOT / "puzzle_placement.py"),
         _filtered_source(ROOT / "puzzle_realtime_state.py"),
@@ -309,10 +442,19 @@ def main(argv=None):
         (
             "# Test-build invariant: never import or execute UART support.\n"
             "UART_COMMUNICATION_ENABLED = False"
-            if args.no_uart or args.source_projective_no_uart
+            if (
+                args.no_uart
+                or args.source_projective_no_uart
+                or args.source_projective_optimized_no_uart
+            )
             else ""
         ),
-        _filtered_source(HERE / "k230_realtime_a4.py"),
+        (
+            DIRECT_UART2_PLAN_OUTPUT_BLOCK
+            if args.source_projective_optimized_no_uart
+            else ""
+        ),
+        runtime_source,
     ])
     bundled_source = "\n\n".join(sections) + "\n"
     _validate_flat_namespace(bundled_source)

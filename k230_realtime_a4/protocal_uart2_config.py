@@ -12,8 +12,8 @@ after measuring the real mechanism.
 PROTOCAL_EXECUTION_ENABLED = False
 
 # CanMV-K230 V3.0 UART2 pins.  They are connected to the DM-MC-Board02 UART7.
-PROTOCAL_UART2_TX_PIN = 11
-PROTOCAL_UART2_RX_PIN = 12
+PROTOCAL_UART2_TX_PIN = 5
+PROTOCAL_UART2_RX_PIN = 6
 PROTOCAL_UART_BAUDRATE = 115200
 
 # The first transmitted action uses sequence 1.  A new action increments the

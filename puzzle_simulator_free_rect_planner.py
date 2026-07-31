@@ -3,8 +3,9 @@
 This module is intentionally isolated from ``puzzle_simulator_planner``.  It
 reuses that backend's edge-match representation and rigid pose optimizer, but
 owns its candidate shortlist, connected-tree search, time budget, scoring, and
-publish-best result semantics.  In particular, overlap, gap, outside area, and
-rectangle dimensions are never prefix hard gates.
+fail-closed physical publication gates.  Overlap, gap, outside area, and
+rectangle dimensions are never prefix hard gates; they are checked only on
+exact complete proposals.
 """
 
 import math
@@ -22,8 +23,11 @@ from puzzle_geometry import (
     normalize_angle_deg,
     plan_debug_heartbeat,
     polygon_area,
+    polygon_aabb,
     polygon_centroid,
+    polygon_is_convex,
     polygon_overlap_area,
+    triangulate_simple_polygon,
     transform_point,
     transform_polygon,
     update_plan_debug,
@@ -31,6 +35,7 @@ from puzzle_geometry import (
 from puzzle_perf import PERF_STATS, ticks_diff, ticks_ms
 from puzzle_simulator_planner import (
     _sim_align_edge,
+    _sim_align_segment_midpoint,
     _sim_is_full_match,
     _sim_match_segments,
     _sim_optimize_pose_graph,
@@ -116,6 +121,91 @@ def _free_area_equivalent_perimeter(area_mm2, aspect_ratio):
     )
 
 
+def _free_dimension_ranges():
+    return (
+        float(getattr(cfg, "FREE_RECT_LONG_SIDE_MIN_MM", 90.0)),
+        float(getattr(cfg, "FREE_RECT_LONG_SIDE_MAX_MM", 120.0)),
+        float(getattr(cfg, "FREE_RECT_SHORT_SIDE_MIN_MM", 50.0)),
+        float(getattr(cfg, "FREE_RECT_SHORT_SIDE_MAX_MM", 90.0)),
+    )
+
+
+def _free_feasible_perimeter_range(source_area_mm2):
+    long_min, long_max, short_min, short_max = (
+        _free_dimension_ranges()
+    )
+    area = max(EPS, float(source_area_mm2))
+    feasible_short_min = max(short_min, area / max(EPS, long_max))
+    feasible_short_max = min(short_max, area / max(EPS, long_min))
+    if feasible_short_min <= feasible_short_max:
+        candidates = [feasible_short_min, feasible_short_max]
+        square_root = math.sqrt(area)
+        candidates.append(
+            max(
+                feasible_short_min,
+                min(feasible_short_max, square_root),
+            )
+        )
+        perimeters = [
+            2.0 * (short_side + area / short_side)
+            for short_side in candidates
+        ]
+        return min(perimeters), max(perimeters)
+    # The measured total area itself is outside the legal size envelope.  The
+    # nearest range corners still provide a stable soft perimeter reference.
+    perimeters = [
+        2.0 * (long_side + short_side)
+        for long_side in (long_min, long_max)
+        for short_side in (short_min, short_max)
+    ]
+    return min(perimeters), max(perimeters)
+
+
+def _free_dimension_prior(
+    source_area_mm2, long_side, short_side
+):
+    long_min, long_max, short_min, short_max = (
+        _free_dimension_ranges()
+    )
+    area = max(EPS, float(source_area_mm2))
+    area_error = abs(long_side * short_side - area) / area
+    range_penalty = _free_interval_penalty(
+        long_side, long_min, long_max
+    ) + _free_interval_penalty(
+        short_side, short_min, short_max
+    )
+    feasible_short_min = max(short_min, area / max(EPS, long_max))
+    feasible_short_max = min(short_max, area / max(EPS, long_min))
+    nearest_penalty = 0.0
+    if feasible_short_min <= feasible_short_max:
+        candidate_shorts = (
+            feasible_short_min,
+            feasible_short_max,
+            max(
+                feasible_short_min,
+                min(feasible_short_max, short_side),
+            ),
+        )
+        nearest_penalty = min(
+            (
+                (long_side - area / candidate_short)
+                / max(EPS, long_max)
+            ) ** 2
+            + (
+                (short_side - candidate_short)
+                / max(EPS, short_max)
+            ) ** 2
+            for candidate_short in candidate_shorts
+        )
+    else:
+        nearest_penalty = range_penalty + area_error * area_error
+    return {
+        "area_prior_error": area_error,
+        "dimension_range_penalty": range_penalty + nearest_penalty,
+        "nearest_feasible_dimension_penalty": nearest_penalty,
+    }
+
+
 def _free_perimeter_context(polygons, source_area_mm2):
     """Cache source-edge facts reused by every assembly perimeter check."""
     edge_lengths = []
@@ -134,34 +224,9 @@ def _free_perimeter_context(polygons, source_area_mm2):
             else -1.0
         )
 
-    aspect_minimum = max(
-        1.0,
-        float(
-            getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MIN", 1.33)
-        ),
+    expected_minimum, expected_maximum = (
+        _free_feasible_perimeter_range(source_area_mm2)
     )
-    aspect_maximum = max(
-        1.0,
-        float(
-            getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MAX", 1.67)
-        ),
-    )
-    if aspect_minimum > aspect_maximum:
-        aspect_minimum, aspect_maximum = (
-            aspect_maximum,
-            aspect_minimum,
-        )
-    expected_minimum = _free_area_equivalent_perimeter(
-        source_area_mm2, aspect_minimum
-    )
-    expected_maximum = _free_area_equivalent_perimeter(
-        source_area_mm2, aspect_maximum
-    )
-    if expected_minimum > expected_maximum:
-        expected_minimum, expected_maximum = (
-            expected_maximum,
-            expected_minimum,
-        )
     return {
         "edge_lengths": edge_lengths,
         "winding_signs": winding_signs,
@@ -1196,8 +1261,14 @@ def _free_figure2_direct_result(
     )
 
 
-def _free_raw_candidate_matchings(pieces):
-    """Generate the simulator match tuples before any global shortlist."""
+def _free_raw_candidate_matchings(
+    pieces,
+    full_rel_tolerance=None,
+    partial_enabled=True,
+    partial_min=None,
+    partial_max=None,
+):
+    """Generate compatible match tuples for one staged-search pass."""
     polygons = [
         piece.polygon_mm if hasattr(piece, "polygon_mm") else piece
         for piece in pieces
@@ -1209,12 +1280,18 @@ def _free_raw_candidate_matchings(pieces):
 
     relative_tolerance = float(
         getattr(cfg, "FREE_RECT_MATCH_REL_TOLERANCE", 0.12)
+        if full_rel_tolerance is None
+        else full_rel_tolerance
     )
     partial_min = float(
         getattr(cfg, "FREE_RECT_PARTIAL_MIN_RATIO", 0.22)
+        if partial_min is None
+        else partial_min
     )
     partial_max = float(
         getattr(cfg, "FREE_RECT_PARTIAL_MAX_RATIO", 0.88)
+        if partial_max is None
+        else partial_max
     )
     partial_penalty = float(
         getattr(cfg, "FREE_RECT_PARTIAL_MATCH_PENALTY", 0.15)
@@ -1249,6 +1326,8 @@ def _free_raw_candidate_matchings(pieces):
                         1.0,
                     )
                 )
+            if not partial_enabled:
+                continue
             ratio = min(length_a, length_b) / max(
                 length_a, length_b
             )
@@ -1312,77 +1391,598 @@ def _free_raw_candidate_matchings(pieces):
     return candidates
 
 
-def _free_candidate_shortlist(candidates):
-    """Reserve both full and partial matches, then fill by original cost."""
-    maximum = max(
-        1, int(getattr(cfg, "FREE_RECT_MAX_CANDIDATES", 80))
+def _free_candidate_pair_key(candidate):
+    return tuple(sorted((int(candidate[1]), int(candidate[3]))))
+
+
+def _free_candidate_ranking_score(polygons, candidate):
+    """Return an ordering score without changing the match tuple format."""
+    _score, i, edge_i, j, edge_j = candidate[:5]
+    edge_a = _free_edges(polygons[i])[edge_i]
+    edge_b = _free_edges(polygons[j])[edge_j]
+    length_a = _free_distance(edge_a[0], edge_a[1])
+    length_b = _free_distance(edge_b[0], edge_b[1])
+    relative_error = abs(length_a - length_b) / max(
+        EPS, length_a, length_b
     )
-    candidates = sorted(candidates)
-    if len(candidates) <= maximum:
-        return candidates
-    full = [
-        candidate
-        for candidate in candidates
-        if _sim_is_full_match(candidate)
-    ]
-    partial = [
-        candidate
-        for candidate in candidates
-        if not _sim_is_full_match(candidate)
-    ]
-    full_reserve = min(
-        len(full),
-        max(
-            0,
-            int(
+    endpoint_error = _free_endpoint_angle_error(
+        polygons, candidate
+    )
+    direction_penalty = 1.0 / max(1.0, length_a, length_b)
+    if _sim_is_full_match(candidate):
+        score = (
+            relative_error
+            + 0.35 * endpoint_error
+            + 0.20 * direction_penalty
+        )
+    else:
+        ratio = min(length_a, length_b) / max(
+            EPS, length_a, length_b
+        )
+        ratio_quality = abs(ratio - 0.55)
+        score = (
+            float(
                 getattr(
-                    cfg, "FREE_RECT_MIN_FULL_SHORTLIST", 24
+                    cfg, "FREE_RECT_PARTIAL_MATCH_PENALTY", 0.15
                 )
-            ),
-        ),
-        maximum,
+            )
+            + 0.20 * ratio_quality
+            + 0.45 * endpoint_error
+            + 0.20 * direction_penalty
+        )
+    return (
+        score,
+        relative_error,
+        endpoint_error,
+        candidate,
     )
-    partial_reserve = min(
-        len(partial),
-        max(
-            0,
-            int(
-                getattr(
-                    cfg, "FREE_RECT_MIN_PARTIAL_SHORTLIST", 40
-                )
-            ),
-        ),
-        maximum - full_reserve,
+
+
+def _free_candidate_metadata(polygons, candidate, ranking=None):
+    """Cache candidate facts without changing the public tuple format."""
+    _score, i, edge_i, j, edge_j = candidate[:5]
+    segment_a0, segment_a1, segment_b0, segment_b1 = (
+        _sim_match_segments(polygons, candidate)
     )
-    selected = full[:full_reserve] + partial[:partial_reserve]
-    selected_set = set(selected)
+    length_a = _free_distance(segment_a0, segment_a1)
+    length_b = _free_distance(segment_b0, segment_b1)
+    return {
+        "pair": _free_candidate_pair_key(candidate),
+        "piece_a": i,
+        "edge_a": edge_i,
+        "piece_b": j,
+        "edge_b": edge_j,
+        "segment_a": (segment_a0, segment_a1),
+        "segment_b": (segment_b0, segment_b1),
+        "matched_length_mm": min(length_a, length_b),
+        "full": bool(_sim_is_full_match(candidate)),
+        "intervals": _free_candidate_edge_intervals(candidate),
+        "relative_length_error": abs(length_a - length_b)
+        / max(EPS, length_a, length_b),
+        "endpoint_angle_error": _free_endpoint_angle_error(
+            polygons, candidate
+        ),
+        "ranking": (
+            _free_candidate_ranking_score(polygons, candidate)
+            if ranking is None
+            else ranking
+        ),
+    }
+
+
+def _free_candidate_shortlist(
+    candidates, polygons=None, return_details=False
+):
+    """Keep a deterministic full/partial reserve independently per pair."""
+    candidates = list(candidates)
+    if polygons is None:
+        polygons = []
+
+    ranking_cache = {}
+
+    def ranking(candidate):
+        if candidate not in ranking_cache:
+            ranking_cache[candidate] = (
+                _free_candidate_ranking_score(polygons, candidate)
+                if polygons
+                else (candidate[0], candidate)
+            )
+        return ranking_cache[candidate]
+
+    grouped = {}
     for candidate in candidates:
-        if len(selected) >= maximum:
-            break
-        if candidate in selected_set:
-            continue
-        selected.append(candidate)
-        selected_set.add(candidate)
-    selected.sort()
-    return selected
+        grouped.setdefault(
+            _free_candidate_pair_key(candidate), []
+        ).append(candidate)
+    maximum_full = max(
+        0, int(getattr(cfg, "FREE_RECT_PAIR_MAX_FULL", 8))
+    )
+    maximum_partial = max(
+        0, int(getattr(cfg, "FREE_RECT_PAIR_MAX_PARTIAL", 4))
+    )
+    selected = []
+    pair_counts = {}
+    for pair in sorted(grouped):
+        full = sorted(
+            (
+                item
+                for item in grouped[pair]
+                if _sim_is_full_match(item)
+            ),
+            key=ranking,
+        )[:maximum_full]
+        partial_groups = {}
+        for item in grouped[pair]:
+            if _sim_is_full_match(item):
+                continue
+            # A partial seam can align to either end of the longer edge.
+            # Treat those two placements as one edge-pair hypothesis; keeping
+            # only the marginally better endpoint made the shortlist flip
+            # under sub-millimetre vision noise.
+            partial_groups.setdefault(
+                (item[1], item[2], item[3], item[4]), []
+            ).append(item)
+        ranked_partial_groups = []
+        for edge_pair, values in partial_groups.items():
+            values.sort(key=ranking)
+            balanced_rank = ranking(
+                values[1] if len(values) > 1 else values[0]
+            )
+            ranked_partial_groups.append(
+                (
+                    0 if len(values) > 1 else 1,
+                    balanced_rank,
+                    ranking(values[0]),
+                    edge_pair,
+                    values,
+                )
+            )
+        ranked_partial_groups.sort(key=lambda item: item[:-1])
+        partial = []
+        for _paired, _balanced, _best, _edge_pair, values in (
+            ranked_partial_groups
+        ):
+            remaining = maximum_partial - len(partial)
+            if remaining <= 0:
+                break
+            partial.extend(values[:remaining])
+        partial.sort(key=ranking)
+        pair_counts[pair] = (len(full), len(partial))
+        selected.extend(full)
+        selected.extend(partial)
+    safety_cap = max(
+        1,
+        int(
+            getattr(
+                cfg,
+                "FREE_RECT_GLOBAL_CANDIDATE_SAFETY_CAP",
+                96,
+            )
+        ),
+    )
+    selected.sort(
+        key=lambda candidate: (
+            _free_candidate_pair_key(candidate),
+            0 if _sim_is_full_match(candidate) else 1,
+            ranking(candidate),
+            candidate,
+        )
+    )
+    if len(selected) > safety_cap:
+        selected = sorted(selected, key=ranking)[:safety_cap]
+        selected.sort(
+            key=lambda candidate: (
+                _free_candidate_pair_key(candidate),
+                0 if _sim_is_full_match(candidate) else 1,
+                ranking(candidate),
+                candidate,
+            )
+        )
+        selected_set = set(selected)
+        pair_counts = {}
+        for pair in sorted(grouped):
+            full = sum(
+                1
+                for item in grouped[pair]
+                if item in selected_set and _sim_is_full_match(item)
+            )
+            partial = sum(
+                1
+                for item in grouped[pair]
+                if item in selected_set
+                and not _sim_is_full_match(item)
+            )
+            pair_counts[pair] = (full, partial)
+    details = {
+        "raw_count": len(candidates),
+        "shortlisted_count": len(selected),
+        "pair_counts": pair_counts,
+        "candidate_pair_group_count": len(grouped),
+        "candidate_cache": {
+            candidate: _free_candidate_metadata(
+                polygons, candidate, ranking(candidate)
+            )
+            for candidate in selected
+        } if polygons else {},
+    }
+    return (selected, details) if return_details else selected
 
 
-def _free_rect_candidate_matchings(pieces):
-    """Reuse the fixed candidate semantics with a free-only class reserve."""
-    simulator_shortlist = simulator_candidate_matchings(pieces)
-    raw_candidates = _free_raw_candidate_matchings(pieces)
-    # When the current simulator function did not truncate anything, use its
-    # result verbatim. Complex inputs use the independent free-only shortlist
-    # so a prolific class cannot remove the other class.
-    if (
-        len(raw_candidates)
-        <= int(getattr(cfg, "SIMULATOR_MAX_CANDIDATES", 80))
-        and simulator_shortlist == raw_candidates
-        and len(raw_candidates)
-        <= int(getattr(cfg, "FREE_RECT_MAX_CANDIDATES", 80))
+def _free_rect_candidate_matchings(
+    pieces,
+    full_rel_tolerance=None,
+    partial_enabled=True,
+    partial_min=None,
+    partial_max=None,
+    return_details=False,
+):
+    polygons = [
+        piece.polygon_mm if hasattr(piece, "polygon_mm") else piece
+        for piece in pieces
+    ]
+    raw_candidates = _free_raw_candidate_matchings(
+        pieces,
+        full_rel_tolerance=full_rel_tolerance,
+        partial_enabled=partial_enabled,
+        partial_min=partial_min,
+        partial_max=partial_max,
+    )
+    return _free_candidate_shortlist(
+        raw_candidates,
+        polygons=polygons,
+        return_details=return_details,
+    )
+
+
+def _free_labeled_spanning_trees(piece_count):
+    """Return deterministic labelled trees using Prüfer sequences."""
+    count = max(0, int(piece_count))
+    if count <= 1:
+        return [()]
+    if count == 2:
+        return [((0, 1),)]
+    sequence_length = count - 2
+    sequence_count = count ** sequence_length
+    trees = []
+    seen = set()
+    for encoded in range(sequence_count):
+        value = encoded
+        sequence = []
+        for _index in range(sequence_length):
+            sequence.append(value % count)
+            value //= count
+        degree = [1] * count
+        for node in sequence:
+            degree[node] += 1
+        edges = []
+        for node in sequence:
+            leaf = min(
+                index
+                for index in range(count)
+                if degree[index] == 1
+            )
+            edges.append(tuple(sorted((leaf, node))))
+            degree[leaf] -= 1
+            degree[node] -= 1
+        leaves = [
+            index for index in range(count) if degree[index] == 1
+        ]
+        edges.append(tuple(sorted((leaves[0], leaves[1]))))
+        tree = tuple(sorted(edges))
+        if tree not in seen:
+            seen.add(tree)
+            trees.append(tree)
+    trees.sort()
+    return trees
+
+
+def _free_candidates_by_pair(candidates):
+    grouped = {}
+    for candidate in candidates:
+        grouped.setdefault(
+            _free_candidate_pair_key(candidate), []
+        ).append(candidate)
+
+    def diversity_order(values):
+        ordered = []
+        left = 0
+        right = len(values) - 1
+        take_left = True
+        while left <= right:
+            if take_left:
+                ordered.append(values[left])
+                left += 1
+            else:
+                ordered.append(values[right])
+                right -= 1
+            take_left = not take_left
+        return ordered
+
+    for pair in grouped:
+        full = [
+            candidate
+            for candidate in grouped[pair]
+            if _sim_is_full_match(candidate)
+        ]
+        partial = [
+            candidate
+            for candidate in grouped[pair]
+            if not _sim_is_full_match(candidate)
+        ]
+        partial_by_edges = {}
+        partial_edge_order = []
+        for candidate in partial:
+            edge_pair = (
+                candidate[1],
+                candidate[2],
+                candidate[3],
+                candidate[4],
+            )
+            if edge_pair not in partial_by_edges:
+                partial_by_edges[edge_pair] = []
+                partial_edge_order.append(edge_pair)
+            partial_by_edges[edge_pair].append(candidate)
+        partial = []
+        for edge_pair in partial_edge_order:
+            partial.extend(
+                diversity_order(partial_by_edges[edge_pair])
+            )
+        grouped[pair] = (
+            diversity_order(full) + partial
+        )
+    return grouped
+
+
+def _free_candidate_edge_intervals(candidate):
+    _score, i, edge_i, j, edge_j, ia0, ia1, ja0, ja1 = candidate
+    return (
+        ((i, edge_i), (min(ia0, ia1), max(ia0, ia1))),
+        ((j, edge_j), (min(ja0, ja1), max(ja0, ja1))),
+    )
+
+
+def _free_add_candidate_intervals(used_intervals, candidate):
+    tolerance = max(
+        0.0,
+        float(
+            getattr(
+                cfg,
+                "FREE_RECT_EDGE_INTERVAL_OVERLAP_TOLERANCE",
+                0.03,
+            )
+        ),
+    )
+    next_intervals = {
+        key: list(values) for key, values in used_intervals.items()
+    }
+    for key, interval in _free_candidate_edge_intervals(candidate):
+        for existing in next_intervals.get(key, ()):
+            overlap = min(interval[1], existing[1]) - max(
+                interval[0], existing[0]
+            )
+            if overlap > tolerance:
+                return None
+        next_intervals.setdefault(key, []).append(interval)
+        next_intervals[key].sort()
+    return next_intervals
+
+
+def _free_deadline_reached(deadline_ms):
+    if isinstance(deadline_ms, (tuple, list)):
+        return ticks_diff(ticks_ms(), deadline_ms[0]) >= int(
+            deadline_ms[1]
+        )
+    return ticks_diff(ticks_ms(), deadline_ms) >= 0
+
+
+def _free_one_tree_matching_sets(
+    groups,
+    allowed_partial_counts,
+    state,
+    deadline_ms,
+):
+    """Yield combinations for one tree; scheduling is handled by the caller."""
+    minimum_allowed = min(allowed_partial_counts)
+    maximum_allowed = max(allowed_partial_counts)
+
+    def visit(
+        group_index,
+        selected,
+        used_candidates,
+        used_intervals,
+        partial_count,
     ):
-        return simulator_shortlist
-    return _free_candidate_shortlist(raw_candidates)
+        if _free_deadline_reached(deadline_ms):
+            return
+        state["max_depth"] = max(
+            state["max_depth"], group_index
+        )
+        if group_index >= len(groups):
+            if partial_count in allowed_partial_counts:
+                yield tuple(selected)
+            return
+        remaining = len(groups) - group_index - 1
+        for candidate in groups[group_index][1]:
+            if _free_deadline_reached(deadline_ms):
+                return
+            state["prefix_count"] += 1
+            if candidate in used_candidates:
+                state["prefix_pruned_candidate_reuse"] += 1
+                continue
+            next_partial = partial_count + (
+                0 if _sim_is_full_match(candidate) else 1
+            )
+            if (
+                next_partial > maximum_allowed
+                or next_partial + remaining < minimum_allowed
+            ):
+                state["prefix_pruned_topology"] += 1
+                continue
+            next_intervals = _free_add_candidate_intervals(
+                used_intervals, candidate
+            )
+            if next_intervals is None:
+                state["interval_reuse_reject_count"] += 1
+                continue
+            selected.append(candidate)
+            next_used = set(used_candidates)
+            next_used.add(candidate)
+            for result in visit(
+                group_index + 1,
+                selected,
+                next_used,
+                next_intervals,
+                next_partial,
+            ):
+                yield result
+            selected.pop()
+
+    for matches in visit(0, [], set(), {}, 0):
+        yield matches
+
+
+def _free_partial_patterns(group_count, allowed_partial_counts):
+    """Return deterministic full/partial placements for one labelled tree."""
+    patterns = []
+    for encoded in range(1 << max(0, int(group_count))):
+        pattern = tuple(
+            bool(encoded & (1 << index))
+            for index in range(group_count)
+        )
+        if sum(
+            1 for partial in pattern if partial
+        ) in allowed_partial_counts:
+            patterns.append(pattern)
+    patterns.sort(
+        key=lambda pattern: (
+            sum(1 for partial in pattern if partial),
+            pattern,
+        )
+    )
+    return patterns
+
+
+def _free_tree_matching_sets(
+    candidates_by_pair,
+    piece_count,
+    allowed_partial_counts,
+    state,
+    deadline_ms,
+    candidate_cache=None,
+):
+    """Round-robin labelled trees so an early tree cannot consume a pass."""
+    candidate_cache = candidate_cache or {}
+
+    def schedule_candidate_score(candidate):
+        metadata = candidate_cache.get(candidate)
+        if metadata is not None:
+            ranking = metadata.get("ranking")
+            if ranking:
+                return float(ranking[0])
+        return float(candidate[0])
+
+    active = []
+    for tree in _free_labeled_spanning_trees(piece_count):
+        if _free_deadline_reached(deadline_ms):
+            return
+        state["trees_considered"] += 1
+        groups = []
+        for pair in tree:
+            values = candidates_by_pair.get(pair, ())
+            if not values:
+                groups = []
+                break
+            groups.append((pair, values))
+        if not groups and tree:
+            continue
+        groups.sort(key=lambda item: (len(item[1]), item[0]))
+        for partial_pattern in _free_partial_patterns(
+            len(groups), allowed_partial_counts
+        ):
+            scheduled_groups = []
+            for group_index, group in enumerate(groups):
+                values = [
+                    candidate
+                    for candidate in group[1]
+                    if (
+                        not _sim_is_full_match(candidate)
+                    ) == partial_pattern[group_index]
+                ]
+                if not values:
+                    scheduled_groups = []
+                    break
+                scheduled_groups.append((group[0], values))
+            if not scheduled_groups and groups:
+                continue
+            partial_count = sum(
+                1 for partial in partial_pattern if partial
+            )
+            combination_count = 1
+            for scheduled_group in scheduled_groups:
+                combination_count *= len(scheduled_group[1])
+            schedule_priority = (
+                0 if partial_count > 0 else 1,
+                sum(
+                    min(
+                        schedule_candidate_score(candidate)
+                        for candidate in group[1]
+                    )
+                    for group in scheduled_groups
+                ),
+                combination_count,
+                tree,
+                partial_pattern,
+            )
+            active.append(
+                (
+                    schedule_priority,
+                    tree,
+                    partial_pattern,
+                    _free_one_tree_matching_sets(
+                        scheduled_groups,
+                        {partial_count},
+                        state,
+                        deadline_ms,
+                    ),
+                )
+            )
+            state["tree_schedule_count"] += 1
+
+    quota = max(
+        1,
+        int(
+            getattr(
+                cfg, "FREE_RECT_TREE_ROUND_ROBIN_QUOTA", 16
+            )
+        ),
+    )
+    coverage_round = True
+    while active and not _free_deadline_reached(deadline_ms):
+        state["tree_round_robin_rounds"] += 1
+        next_active = []
+        round_quota = 1 if coverage_round else quota
+        for priority, tree, partial_pattern, generator in active:
+            if _free_deadline_reached(deadline_ms):
+                return
+            exhausted = False
+            produced = 0
+            while produced < round_quota:
+                if _free_deadline_reached(deadline_ms):
+                    return
+                try:
+                    matches = next(generator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                produced += 1
+                yield matches
+            if not exhausted:
+                next_active.append(
+                    (priority, tree, partial_pattern, generator)
+                )
+        next_active.sort(key=lambda item: item[0])
+        active = next_active
+        coverage_round = False
 
 
 def _free_time_expired(state):
@@ -1634,7 +2234,9 @@ def _free_rect_matching_sets(candidates, polygons, state):
         generators = active
 
 
-def _free_initial_transforms(polygons, matches):
+def _free_initial_transforms(
+    polygons, matches, alignment="midpoint"
+):
     adjacency = [[] for _ in polygons]
     for match in matches:
         _, i, _, j, _ = match[:5]
@@ -1655,7 +2257,12 @@ def _free_initial_transforms(polygons, matches):
                 ia, ib, ja, jb = ja, jb, ia, ib
             world_a = transform_point(ia, transforms[current])
             world_b = transform_point(ib, transforms[current])
-            transforms[neighbor] = _sim_align_edge(
+            align = (
+                _sim_align_edge
+                if alignment == "endpoint"
+                else _sim_align_segment_midpoint
+            )
+            transforms[neighbor] = align(
                 ja, jb, world_b, world_a
             )
             stack.append(neighbor)
@@ -1842,7 +2449,264 @@ def _free_interval_penalty(value, lower, upper):
     return 0.0
 
 
-def _free_outer_piece_evidence(assembled, rectangle):
+def _free_build_piece_cache(pieces):
+    cache = []
+    for index, piece in enumerate(pieces):
+        polygon = list(piece.polygon_mm)
+        edges = _free_edges(polygon)
+        cached_lengths = getattr(piece, "edge_lengths_mm", None)
+        lengths = (
+            list(cached_lengths)
+            if cached_lengths is not None
+            and len(cached_lengths) == len(edges)
+            else [
+                _free_distance(edge[0], edge[1]) for edge in edges
+            ]
+        )
+        try:
+            cached_triangles = getattr(piece, "triangles_mm", None)
+            triangles = (
+                [list(triangle) for triangle in cached_triangles]
+                if cached_triangles
+                else triangulate_simple_polygon(polygon)
+            )
+        except Exception:
+            return None
+        cache.append(
+            {
+                "piece_index": index,
+                "polygon": polygon,
+                "edges": edges,
+                "edge_lengths": lengths,
+                "vertex_angles": [
+                    _free_vertex_angle(polygon, vertex)
+                    for vertex in range(len(polygon))
+                ],
+                "centroid": (
+                    piece.centroid_mm
+                    if hasattr(piece, "centroid_mm")
+                    else polygon_centroid(polygon)
+                ),
+                "area": float(
+                    piece.area_mm2
+                    if hasattr(piece, "area_mm2")
+                    else polygon_area(polygon)
+                ),
+                "aabb": (
+                    piece.aabb_mm
+                    if hasattr(piece, "aabb_mm")
+                    else polygon_aabb(polygon)
+                ),
+                "convex": bool(
+                    piece.is_convex
+                    if hasattr(piece, "is_convex")
+                    else polygon_is_convex(polygon)
+                ),
+                "triangles": triangles,
+                "source_perimeter": sum(lengths),
+            }
+        )
+    return cache
+
+
+def _free_selected_shared_length(
+    polygons, matches, candidate_cache=None
+):
+    total = 0.0
+    for match in matches:
+        if candidate_cache is not None and match in candidate_cache:
+            total += candidate_cache[match]["matched_length_mm"]
+            continue
+        a0, a1, b0, b1 = _sim_match_segments(polygons, match)
+        total += min(
+            _free_distance(a0, a1),
+            _free_distance(b0, b1),
+        )
+    return total
+
+
+def _free_aabb_overlap_ratio(polygons, source_area):
+    overlap = 0.0
+    boxes = [polygon_aabb(polygon) for polygon in polygons]
+    for right in range(len(boxes)):
+        for left in range(right):
+            width = max(
+                0.0,
+                min(boxes[left][2], boxes[right][2])
+                - max(boxes[left][0], boxes[right][0]),
+            )
+            height = max(
+                0.0,
+                min(boxes[left][3], boxes[right][3])
+                - max(boxes[left][1], boxes[right][1]),
+            )
+            overlap += width * height
+    return overlap / max(EPS, source_area)
+
+
+def _free_cheap_complete_metrics(
+    polygons,
+    matches,
+    transforms,
+    source_area,
+    perimeter_context,
+    candidate_cache=None,
+):
+    assembled = [
+        transform_polygon(polygon, transform)
+        for polygon, transform in zip(polygons, transforms)
+    ]
+    if any(not _free_polygon_valid(polygon) for polygon in assembled):
+        return None
+    points = [point for polygon in assembled for point in polygon]
+    rectangle = minimum_area_rectangle(points)
+    if rectangle is None or rectangle["area"] <= EPS:
+        return None
+    long_side = max(rectangle["width"], rectangle["height"])
+    short_side = min(rectangle["width"], rectangle["height"])
+    dimension = _free_dimension_prior(
+        source_area, long_side, short_side
+    )
+    hull_area = polygon_area(convex_hull(points))
+    hull_gap_ratio = max(
+        0.0, rectangle["area"] - hull_area
+    ) / max(EPS, source_area)
+    selected_shared = _free_selected_shared_length(
+        polygons, matches, candidate_cache=candidate_cache
+    )
+    cheap_exposed = max(
+        0.0,
+        perimeter_context["source_perimeter_mm"]
+        - 2.0 * selected_shared,
+    )
+    expected_minimum = perimeter_context[
+        "expected_perimeter_min_mm"
+    ]
+    expected_maximum = perimeter_context[
+        "expected_perimeter_max_mm"
+    ]
+    perimeter_error = (
+        max(0.0, expected_minimum - cheap_exposed)
+        / max(EPS, expected_minimum)
+        + max(0.0, cheap_exposed - expected_maximum)
+        / max(EPS, expected_maximum)
+    )
+    _evidence, missing_count, missing_ratio = (
+        _free_outer_piece_evidence(
+            assembled,
+            rectangle,
+            distance_tolerance=1.5
+            * float(
+                getattr(
+                    cfg, "FREE_RECT_OUTER_EDGE_DISTANCE_MM", 6.0
+                )
+            ),
+            angle_tolerance=1.5
+            * float(
+                getattr(
+                    cfg, "FREE_RECT_OUTER_EDGE_ANGLE_DEG", 12.0
+                )
+            ),
+            minimum_edge_mm=0.80
+            * float(
+                getattr(
+                    cfg, "FREE_RECT_MIN_OBSERVED_EDGE_MM", 17.5
+                )
+            ),
+        )
+    )
+    seam = _free_seam_metrics(polygons, matches, transforms)
+    aabb_overlap = _free_aabb_overlap_ratio(
+        assembled, source_area
+    )
+    cheap_score = (
+        5.0 * dimension["area_prior_error"]
+        + 4.0 * dimension["dimension_range_penalty"]
+        + 3.0 * hull_gap_ratio
+        + 2.0 * perimeter_error
+        + 1.5 * missing_ratio
+        + 1.0 * seam["seam_cost"]
+        + 1.0 * aabb_overlap
+    )
+    return {
+        "rectangle": rectangle,
+        "long_side_mm": long_side,
+        "short_side_mm": short_side,
+        "area_prior_error": dimension["area_prior_error"],
+        "dimension_range_penalty": dimension[
+            "dimension_range_penalty"
+        ],
+        "hull_gap_ratio": hull_gap_ratio,
+        "cheap_exposed_perimeter_mm": cheap_exposed,
+        "cheap_perimeter_error": perimeter_error,
+        "outer_piece_missing_approx": missing_count,
+        "outer_piece_missing_ratio_approx": missing_ratio,
+        "seam_cost": seam["seam_cost"],
+        "aabb_overlap_ratio": aabb_overlap,
+        "cheap_score": cheap_score,
+    }
+
+
+def _free_cheap_rank(item):
+    metrics = item["cheap_metrics"]
+    return (
+        metrics["cheap_score"],
+        metrics["area_prior_error"],
+        metrics["hull_gap_ratio"],
+        item["topology"],
+        item["match_signature"],
+    )
+
+
+def _free_beam_limit_for_topology(partial_count):
+    if partial_count == 1:
+        return max(
+            1,
+            int(
+                getattr(
+                    cfg, "FREE_RECT_CHEAP_BEAM_ONE_PARTIAL", 24
+                )
+            ),
+        )
+    return max(
+        1,
+        int(
+            getattr(
+                cfg, "FREE_RECT_CHEAP_BEAM_PER_TOPOLOGY", 16
+            )
+        ),
+    )
+
+
+def _free_add_to_cheap_beam(beams, item):
+    topology = item["topology"]
+    beam = beams.setdefault(topology, [])
+    beam.append(item)
+    beam.sort(key=_free_cheap_rank)
+    del beam[
+        _free_beam_limit_for_topology(item["partial_count"]) :
+    ]
+
+
+def _free_merge_cheap_beams(beams):
+    merged = []
+    for topology in sorted(beams):
+        merged.extend(beams[topology])
+    merged.sort(key=_free_cheap_rank)
+    maximum = max(
+        1,
+        int(getattr(cfg, "FREE_RECT_EXACT_BEAM_SIZE", 48)),
+    )
+    return merged[:maximum]
+
+
+def _free_outer_piece_evidence(
+    assembled,
+    rectangle,
+    distance_tolerance=None,
+    angle_tolerance=None,
+    minimum_edge_mm=None,
+):
     angle = math.radians(-rectangle["angle_deg"])
     rotation = (
         math.cos(angle),
@@ -1859,35 +2723,55 @@ def _free_outer_piece_evidence(assembled, rectangle):
         "bounds_rotated"
     ]
     tolerance = float(
-        getattr(
-            cfg, "FREE_RECT_OUTER_EDGE_TOLERANCE_MM", 5.0
-        )
+        getattr(cfg, "FREE_RECT_OUTER_EDGE_DISTANCE_MM", 6.0)
+        if distance_tolerance is None
+        else distance_tolerance
     )
+    angle_tolerance = float(
+        getattr(cfg, "FREE_RECT_OUTER_EDGE_ANGLE_DEG", 12.0)
+        if angle_tolerance is None
+        else angle_tolerance
+    )
+    minimum_edge_mm = float(
+        getattr(cfg, "FREE_RECT_MIN_OBSERVED_EDGE_MM", 17.5)
+        if minimum_edge_mm is None
+        else minimum_edge_mm
+    )
+    parallel_cosine = math.cos(math.radians(angle_tolerance))
     evidence = []
     missing = 0
     for piece_index, polygon in enumerate(oriented):
         boundary_edges = []
         for edge_index, edge in enumerate(_free_edges(polygon)):
             a, b = edge
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            length = math.sqrt(dx * dx + dy * dy)
+            if length + EPS < minimum_edge_mm:
+                continue
             side = None
             if (
                 abs(a[0] - min_x) <= tolerance
                 and abs(b[0] - min_x) <= tolerance
+                and abs(dy) / max(EPS, length) >= parallel_cosine
             ):
                 side = "left"
             elif (
                 abs(a[0] - max_x) <= tolerance
                 and abs(b[0] - max_x) <= tolerance
+                and abs(dy) / max(EPS, length) >= parallel_cosine
             ):
                 side = "right"
             elif (
                 abs(a[1] - min_y) <= tolerance
                 and abs(b[1] - min_y) <= tolerance
+                and abs(dx) / max(EPS, length) >= parallel_cosine
             ):
                 side = "top"
             elif (
                 abs(a[1] - max_y) <= tolerance
                 and abs(b[1] - max_y) <= tolerance
+                and abs(dx) / max(EPS, length) >= parallel_cosine
             ):
                 side = "bottom"
             if side is not None:
@@ -1895,6 +2779,7 @@ def _free_outer_piece_evidence(assembled, rectangle):
                     {
                         "edge_index": edge_index,
                         "side": side,
+                        "length_mm": length,
                     }
                 )
         present = bool(boundary_edges)
@@ -1920,6 +2805,7 @@ def _free_complete_metrics(
     transforms,
     source_area_mm2,
     perimeter=None,
+    piece_cache=None,
 ):
     assembled = [
         transform_polygon(polygon, transform)
@@ -1937,11 +2823,31 @@ def _free_complete_metrics(
         or not _free_finite(rectangle["area"])
     ):
         return None
+    transformed_triangles = None
+    if piece_cache is not None:
+        transformed_triangles = [
+            [
+                transform_polygon(triangle, transforms[index])
+                for triangle in piece_cache[index]["triangles"]
+            ]
+            for index in range(len(polygons))
+        ]
     overlap_area = 0.0
     for index, polygon in enumerate(assembled):
         for earlier in range(index):
             overlap_area += polygon_overlap_area(
-                polygon, assembled[earlier]
+                polygon,
+                assembled[earlier],
+                (
+                    transformed_triangles[index]
+                    if transformed_triangles is not None
+                    else None
+                ),
+                (
+                    transformed_triangles[earlier]
+                    if transformed_triangles is not None
+                    else None
+                ),
             )
     union_area_approx = max(
         0.0, source_area_mm2 - overlap_area
@@ -1957,36 +2863,8 @@ def _free_complete_metrics(
         rectangle["width"], rectangle["height"]
     )
     aspect_ratio = long_side / max(EPS, short_side)
-    aspect_minimum = float(
-        getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MIN", 1.33)
-    )
-    aspect_maximum = float(
-        getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MAX", 1.67)
-    )
-    if aspect_minimum > aspect_maximum:
-        aspect_minimum, aspect_maximum = (
-            aspect_maximum,
-            aspect_minimum,
-        )
-    aspect_range_penalty = _free_interval_penalty(
-        aspect_ratio, aspect_minimum, aspect_maximum
-    )
-    dimension_penalty = _free_interval_penalty(
-        long_side,
-        float(
-            getattr(cfg, "FREE_RECT_LONG_SIDE_MIN_MM", 90.0)
-        ),
-        float(
-            getattr(cfg, "FREE_RECT_LONG_SIDE_MAX_MM", 120.0)
-        ),
-    ) + _free_interval_penalty(
-        short_side,
-        float(
-            getattr(cfg, "FREE_RECT_SHORT_SIDE_MIN_MM", 50.0)
-        ),
-        float(
-            getattr(cfg, "FREE_RECT_SHORT_SIDE_MAX_MM", 90.0)
-        ),
+    dimension_prior = _free_dimension_prior(
+        source_area_mm2, long_side, short_side
     )
     outer_evidence, missing_count, missing_ratio = (
         _free_outer_piece_evidence(assembled, rectangle)
@@ -2013,16 +2891,20 @@ def _free_complete_metrics(
         "hull_area_mm2": hull_area,
         "hull_gap_mm2": hull_gap,
         "hull_gap_ratio": hull_gap / source_area,
-        "area_prior_error": (
-            abs(rectangle_area - source_area_mm2)
-            / source_area
-        ),
+        "area_prior_error": dimension_prior["area_prior_error"],
         "long_side_mm": long_side,
         "short_side_mm": short_side,
         "aspect_ratio": aspect_ratio,
-        "aspect_preferred": aspect_range_penalty <= EPS,
-        "aspect_range_penalty": aspect_range_penalty,
-        "dimension_range_penalty": dimension_penalty,
+        "aspect_preferred": (
+            dimension_prior["dimension_range_penalty"] <= EPS
+        ),
+        "aspect_range_penalty": 0.0,
+        "dimension_range_penalty": dimension_prior[
+            "dimension_range_penalty"
+        ],
+        "nearest_feasible_dimension_penalty": dimension_prior[
+            "nearest_feasible_dimension_penalty"
+        ],
         "outer_piece_missing_count": missing_count,
         "outer_piece_missing_ratio": missing_ratio,
         "outer_piece_evidence": outer_evidence,
@@ -2118,6 +3000,64 @@ def _free_complete_metrics(
         "seams": seam["records"],
         "max_length_error_mm": seam["max_length_error_mm"],
     }
+
+
+def _free_physical_validity(metrics, target):
+    failures = []
+    if not (
+        float(
+            getattr(cfg, "FREE_RECT_PUBLISH_LONG_MIN_MM", 85.0)
+        )
+        <= metrics["long_side_mm"]
+        <= float(
+            getattr(cfg, "FREE_RECT_PUBLISH_LONG_MAX_MM", 125.0)
+        )
+    ):
+        failures.append("long_side")
+    if not (
+        float(
+            getattr(cfg, "FREE_RECT_PUBLISH_SHORT_MIN_MM", 45.0)
+        )
+        <= metrics["short_side_mm"]
+        <= float(
+            getattr(cfg, "FREE_RECT_PUBLISH_SHORT_MAX_MM", 95.0)
+        )
+    ):
+        failures.append("short_side")
+    if metrics["area_prior_error"] > float(
+        getattr(cfg, "FREE_RECT_PUBLISH_AREA_ERROR_MAX", 0.15)
+    ):
+        failures.append("area_error")
+    if metrics["overlap_ratio"] > float(
+        getattr(
+            cfg, "FREE_RECT_PUBLISH_OVERLAP_RATIO_MAX", 0.05
+        )
+    ):
+        failures.append("overlap")
+    if metrics["fill_gap_ratio"] > float(
+        getattr(
+            cfg, "FREE_RECT_PUBLISH_FILL_GAP_RATIO_MAX", 0.20
+        )
+    ):
+        failures.append("fill_gap")
+    if metrics["outer_piece_missing_count"] > int(
+        getattr(cfg, "FREE_RECT_PUBLISH_OUTER_MISSING_MAX", 0)
+    ):
+        failures.append("outer_piece")
+    if target is None:
+        failures.append("target_fit")
+    return not failures, tuple(failures)
+
+
+def _free_is_strong_solution(proposal):
+    metrics = proposal["metrics"]
+    return bool(
+        proposal.get("physical_valid", False)
+        and metrics["area_prior_error"] <= 0.08
+        and metrics["overlap_ratio"] <= 0.025
+        and metrics["fill_gap_ratio"] <= 0.12
+        and metrics["outer_piece_missing_count"] == 0
+    )
 
 
 def _free_target_candidate(
@@ -2301,14 +3241,16 @@ def _free_select_target(
 
 def _free_match_signature(matches):
     return tuple(
-        (
-            match[1],
-            match[2],
-            match[3],
-            match[4],
-            tuple(match[5:]),
+        sorted(
+            (
+                match[1],
+                match[2],
+                match[3],
+                match[4],
+                tuple(match[5:]),
+            )
+            for match in matches
         )
-        for match in matches
     )
 
 
@@ -2316,6 +3258,12 @@ def _free_top_record(proposal):
     metrics = proposal["metrics"]
     return {
         "cost": metrics["cost"],
+        "physical_valid": bool(
+            proposal.get("physical_valid", False)
+        ),
+        "physical_failures": proposal.get(
+            "physical_failures", ()
+        ),
         "topology": proposal["topology"],
         "target_fits": proposal["target"] is not None,
         "long_side_mm": metrics["long_side_mm"],
@@ -2367,12 +3315,14 @@ def _free_top_record(proposal):
 
 
 def _free_proposal_rank(proposal):
-    """Prefer the requested aspect band, then ordinary geometric quality."""
+    """Physical validity precedes geometric cost; aspect is never privileged."""
     metrics = proposal["metrics"]
     return (
-        0 if metrics["aspect_preferred"] else 1,
-        metrics["aspect_range_penalty"],
+        0 if proposal.get("physical_valid", False) else 1,
         metrics["cost"],
+        metrics["area_prior_error"],
+        metrics["fill_gap_ratio"],
+        metrics["overlap_ratio"],
         proposal["topology"],
         proposal["match_signature"],
     )
@@ -2440,6 +3390,695 @@ def _free_progress(state, force=False):
     plan_debug_heartbeat()
 
 
+def _free_pass_definitions(edge_count):
+    definitions = [
+        {
+            "name": "strict_full",
+            "full_rel_tolerance": 0.12,
+            "partial_enabled": False,
+            "partial_min": 0.22,
+            "partial_max": 0.88,
+            "allowed_partial_counts": (0,),
+            "budget_ms": int(
+                getattr(cfg, "FREE_RECT_PASS_STRICT_FULL_MS", 1500)
+            ),
+        },
+        {
+            "name": "standard_t",
+            "full_rel_tolerance": 0.12,
+            "partial_enabled": True,
+            "partial_min": 0.22,
+            "partial_max": 0.88,
+            "allowed_partial_counts": tuple(
+                value for value in (0, 1) if value <= edge_count
+            ),
+            "budget_ms": int(
+                getattr(cfg, "FREE_RECT_PASS_STANDARD_T_MS", 2500)
+            ),
+        },
+        {
+            "name": "relaxed_geometry",
+            "full_rel_tolerance": 0.16,
+            "partial_enabled": True,
+            "partial_min": 0.18,
+            "partial_max": 0.90,
+            "allowed_partial_counts": tuple(
+                value for value in (0, 1) if value <= edge_count
+            ),
+            "budget_ms": int(
+                getattr(
+                    cfg, "FREE_RECT_PASS_RELAXED_GEOMETRY_MS", 3000
+                )
+            ),
+        },
+        {
+            "name": "multi_partial_fallback",
+            "full_rel_tolerance": 0.20,
+            "partial_enabled": True,
+            "partial_min": 0.15,
+            "partial_max": 0.92,
+            "allowed_partial_counts": tuple(
+                value
+                for value in range(2, edge_count + 1)
+            ),
+            "budget_ms": int(
+                getattr(
+                    cfg, "FREE_RECT_PASS_MULTI_PARTIAL_MS", 3000
+                )
+            ),
+        },
+    ]
+    return [
+        definition
+        for definition in definitions
+        if definition["allowed_partial_counts"]
+        and definition["budget_ms"] > 0
+    ]
+
+
+def _free_pair_counts_text(pair_counts):
+    return "|".join(
+        "P{}-P{}:{}/{}".format(
+            pair[0] + 1,
+            pair[1] + 1,
+            pair_counts[pair][0],
+            pair_counts[pair][1],
+        )
+        for pair in sorted(pair_counts)
+    ) or "none"
+
+
+def _free_pass_progress(
+    pass_name,
+    pass_started_ms,
+    local,
+    best=None,
+    force=False,
+):
+    now = ticks_ms()
+    interval = max(
+        1,
+        int(
+            getattr(
+                cfg, "FREE_RECT_PROGRESS_INTERVAL_MS", 1000
+            )
+        ),
+    )
+    if (
+        not force
+        and ticks_diff(now, local["last_progress_ms"]) < interval
+    ):
+        return
+    print(
+        "FREE_PASS_PROGRESS,name={},elapsed_ms={},trees={},"
+        "tree_rounds={},cheap_complete={},beam_size={},exact_evaluated={},"
+        "physical_valid={},best_cost={}".format(
+            pass_name,
+            max(0, ticks_diff(now, pass_started_ms)),
+            local["trees"],
+            local["tree_rounds"],
+            local["cheap_complete"],
+            local["beam_size"],
+            local["exact_evaluated"],
+            local["physical_valid"],
+            (
+                "{:.6f}".format(best["metrics"]["cost"])
+                if best is not None
+                else "na"
+            ),
+        )
+    )
+    local["last_progress_ms"] = now
+    exitpoint = getattr(os, "exitpoint", None)
+    if exitpoint is not None:
+        exitpoint()
+    plan_debug_heartbeat()
+
+
+def _free_exact_proposal(
+    item,
+    pieces,
+    polygons,
+    piece_cache,
+    source_area,
+    perimeter_context,
+    state,
+):
+    matches = item["matches"]
+    transforms = item["transforms"]
+    if len(matches) >= len(polygons):
+        try:
+            transforms = _sim_optimize_pose_graph(
+                polygons, matches, transforms
+            )
+        except Exception:
+            transforms = None
+        state["pose_optimization_count"] += 1
+        state["closed_graph_pose_optimizer_count"] += 1
+    else:
+        state["tree_pose_optimizer_skipped_count"] += 1
+    if (
+        transforms is None
+        or any(
+            not _free_transform_valid(transform)
+            for transform in transforms
+        )
+    ):
+        return None
+    perimeter = _free_exposed_perimeter_metrics(
+        polygons,
+        matches,
+        transforms,
+        source_area,
+        context=perimeter_context,
+    )
+    completed = _free_complete_metrics(
+        polygons,
+        matches,
+        transforms,
+        source_area,
+        perimeter=perimeter,
+        piece_cache=piece_cache,
+    )
+    if completed is None:
+        return None
+    state["geometrically_valid_complete_count"] += 1
+    target, direction_candidates = _free_select_target(
+        pieces,
+        polygons,
+        transforms,
+        completed["rectangle"],
+    )
+    if target is not None:
+        state["target_fit_complete_count"] += 1
+    full_count = sum(
+        1 for match in matches if _sim_is_full_match(match)
+    )
+    physical_valid, physical_failures = (
+        _free_physical_validity(completed["metrics"], target)
+    )
+    proposal = {
+        "matches": matches,
+        "match_signature": item["match_signature"],
+        "full_count": full_count,
+        "partial_count": len(matches) - full_count,
+        "topology": item["topology"],
+        "optimized_transforms": transforms,
+        "metrics": completed["metrics"],
+        "seams": completed["seams"],
+        "max_length_error_mm": completed[
+            "max_length_error_mm"
+        ],
+        "target": target,
+        "direction_candidates": direction_candidates,
+        "physical_valid": physical_valid,
+        "physical_failures": physical_failures,
+        "pass_name": item["pass_name"],
+    }
+    proposal["strong"] = _free_is_strong_solution(proposal)
+    return proposal
+
+
+def _free_finalize_physical_result(
+    best,
+    state,
+    source_area,
+    candidates,
+):
+    elapsed_ms = max(
+        0, ticks_diff(ticks_ms(), state["started_ms"])
+    )
+    metrics = best["metrics"]
+    target = best["target"]
+    state["selected_pass"] = best["pass_name"]
+    stats = _free_base_stats(state, source_area, candidates)
+    stats.update(
+        {
+            "plan_ms": elapsed_ms,
+            "best_cost": metrics["cost"],
+            "long_side_mm": metrics["long_side_mm"],
+            "short_side_mm": metrics["short_side_mm"],
+            "rect_area_mm2": metrics["rect_area_mm2"],
+            "overlap_mm2": metrics["overlap_mm2"],
+            "overlap_ratio": metrics["overlap_ratio"],
+            "fill_gap_mm2": metrics["fill_gap_mm2"],
+            "fill_gap_ratio": metrics["fill_gap_ratio"],
+            "hull_gap_mm2": metrics["hull_gap_mm2"],
+            "hull_gap_ratio": metrics["hull_gap_ratio"],
+            "area_prior_error": metrics["area_prior_error"],
+            "dimension_range_penalty": metrics[
+                "dimension_range_penalty"
+            ],
+            "outer_piece_missing_count": metrics[
+                "outer_piece_missing_count"
+            ],
+            "outer_piece_missing_ratio": metrics[
+                "outer_piece_missing_ratio"
+            ],
+            "outer_piece_evidence": metrics[
+                "outer_piece_evidence"
+            ],
+            "perimeter_error_ratio": metrics[
+                "perimeter_error_ratio"
+            ],
+            "exposed_perimeter_mm": metrics[
+                "exposed_perimeter_mm"
+            ],
+            "selected_match_count": len(best["matches"]),
+            "selected_full_match_count": best["full_count"],
+            "selected_partial_match_count": best[
+                "partial_count"
+            ],
+            "selected_topology": best["topology"],
+            "selected_seams": best["seams"],
+            "selected_quarter_turn_deg": target[
+                "quarter_turn_deg"
+            ],
+            "selected_motion_cost": target["motion_cost"],
+            "physical_valid": True,
+            "strong": bool(best.get("strong", False)),
+            "top_k": [_free_top_record(best)],
+        }
+    )
+    PERF_STATS.add_stage("plan_ms", elapsed_ms=elapsed_ms)
+    print(
+        "FREE_PLAN_RESULT,valid=1,elapsed_ms={},pass={},strong={},"
+        "timed_out={},raw_candidates={},shortlisted_candidates={},"
+        "trees_considered={},cheap_complete={},exact_evaluated={},"
+        "pose_optimizations={},cost={:.6f},long_mm={:.2f},"
+        "short_mm={:.2f},area_error={:.4f},overlap_ratio={:.4f},"
+        "gap_ratio={:.4f},outer_missing={},perimeter_error={:.4f}".format(
+            elapsed_ms,
+            best["pass_name"],
+            int(bool(best.get("strong", False))),
+            int(bool(state["timed_out"])),
+            state["raw_candidate_count"],
+            state["shortlisted_candidate_count"],
+            state["trees_considered"],
+            state["cheap_complete_count"],
+            state["exact_evaluated_count"],
+            state["pose_optimization_count"],
+            metrics["cost"],
+            metrics["long_side_mm"],
+            metrics["short_side_mm"],
+            metrics["area_prior_error"],
+            metrics["overlap_ratio"],
+            metrics["fill_gap_ratio"],
+            metrics["outer_piece_missing_count"],
+            metrics["perimeter_error_ratio"],
+        )
+    )
+    return PlanResult(
+        valid=True,
+        reason="physical rectangle candidate",
+        score=metrics["cost"],
+        operations=target["operations"],
+        target_polygons=target["target_polygons"],
+        target_rect=target["target_rect"],
+        search_nodes=state["cheap_complete_count"],
+        mode=MODE,
+        max_vertex_error_mm=best["max_length_error_mm"],
+        fill_gap_mm2=metrics["fill_gap_mm2"],
+        overlap_mm2=metrics["overlap_mm2"],
+        outside_mm2=0.0,
+        seams=best["seams"],
+        plan_stats=stats,
+    )
+
+
+def _free_plan_staged_generic(
+    pieces,
+    polygons,
+    source_area,
+    state,
+):
+    piece_cache = _free_build_piece_cache(pieces)
+    if piece_cache is None:
+        return _free_invalid_result(
+            "invalid source polygon triangulation",
+            state,
+            source_area,
+            [],
+        )
+    edge_count = max(0, len(polygons) - 1)
+    perimeter_context = _free_perimeter_context(
+        polygons, source_area
+    )
+    total_budget = max(
+        1,
+        int(getattr(cfg, "FREE_RECT_TOTAL_PLAN_TIME_MS", 10000)),
+    )
+    exact_cache = {}
+    combination_cache = {}
+    all_candidates = {}
+    top = []
+    best_physical = None
+    best_invalid = None
+    strong_found_ms = None
+    strong_initial_cost = None
+
+    for pass_definition in _free_pass_definitions(edge_count):
+        total_elapsed = max(
+            0, ticks_diff(ticks_ms(), state["started_ms"])
+        )
+        remaining = total_budget - total_elapsed
+        if remaining <= 0:
+            state["timed_out"] = True
+            break
+        pass_budget = min(
+            remaining, max(1, pass_definition["budget_ms"])
+        )
+        pass_started = ticks_ms()
+        candidates, details = _free_rect_candidate_matchings(
+            pieces,
+            full_rel_tolerance=pass_definition[
+                "full_rel_tolerance"
+            ],
+            partial_enabled=pass_definition["partial_enabled"],
+            partial_min=pass_definition["partial_min"],
+            partial_max=pass_definition["partial_max"],
+            return_details=True,
+        )
+        for candidate in candidates:
+            all_candidates[candidate] = True
+        state["raw_candidate_count"] += details["raw_count"]
+        state["shortlisted_candidate_count"] += details[
+            "shortlisted_count"
+        ]
+        state["candidate_pair_group_count"] = max(
+            state["candidate_pair_group_count"],
+            details["candidate_pair_group_count"],
+        )
+        full_count = sum(
+            1 for candidate in candidates if _sim_is_full_match(candidate)
+        )
+        print(
+            "FREE_CANDIDATES,pass={},raw={},shortlisted={},full={},"
+            "partial={},pairs={},short_edge_repaired=source_stage".format(
+                pass_definition["name"],
+                details["raw_count"],
+                details["shortlisted_count"],
+                full_count,
+                len(candidates) - full_count,
+                _free_pair_counts_text(details["pair_counts"]),
+            )
+        )
+        print(
+            "FREE_PASS_START,name={},budget_ms={},candidate_count={},"
+            "allowed_partial={},tree_round_robin_quota={}".format(
+                pass_definition["name"],
+                pass_budget,
+                len(candidates),
+                "|".join(
+                    str(value)
+                    for value in pass_definition[
+                        "allowed_partial_counts"
+                    ]
+                ),
+                int(
+                    getattr(
+                        cfg,
+                        "FREE_RECT_TREE_ROUND_ROBIN_QUOTA",
+                        16,
+                    )
+                ),
+            )
+        )
+        local = {
+            "trees": 0,
+            "tree_rounds": 0,
+            "cheap_complete": 0,
+            "beam_size": 0,
+            "exact_evaluated": 0,
+            "physical_valid": 0,
+            "last_progress_ms": pass_started,
+        }
+        tree_before = state["trees_considered"]
+        rounds_before = state["tree_round_robin_rounds"]
+        beams = {}
+        cheap_seen = set()
+        cheap_budget = max(1, int(pass_budget * 0.60))
+        candidates_by_pair = _free_candidates_by_pair(candidates)
+        candidate_cache = details.get("candidate_cache", {})
+        for matches in _free_tree_matching_sets(
+            candidates_by_pair,
+            len(polygons),
+            set(pass_definition["allowed_partial_counts"]),
+            state,
+            (pass_started, cheap_budget),
+            candidate_cache=candidate_cache,
+        ):
+            signature = _free_match_signature(matches)
+            if signature in cheap_seen:
+                state["prefix_pruned_duplicate"] += 1
+                continue
+            cheap_seen.add(signature)
+            cached = combination_cache.get(signature)
+            if cached is None:
+                transforms = _free_initial_transforms(
+                    polygons, matches, alignment="midpoint"
+                )
+                if transforms is None:
+                    state["prefix_pruned_invalid_geometry"] += 1
+                    combination_cache[signature] = (None, None)
+                    continue
+                cheap_metrics = _free_cheap_complete_metrics(
+                    polygons,
+                    matches,
+                    transforms,
+                    source_area,
+                    perimeter_context,
+                    candidate_cache=candidate_cache,
+                )
+                combination_cache[signature] = (
+                    transforms, cheap_metrics
+                )
+            else:
+                transforms, cheap_metrics = cached
+                state["cheap_cache_hit_count"] += 1
+            if transforms is None or cheap_metrics is None:
+                continue
+            partial_count = sum(
+                1
+                for match in matches
+                if not _sim_is_full_match(match)
+            )
+            topology = _free_topology_name(
+                edge_count, edge_count - partial_count
+            )
+            item = {
+                "matches": matches,
+                "match_signature": signature,
+                "transforms": transforms,
+                "partial_count": partial_count,
+                "topology": topology,
+                "cheap_metrics": cheap_metrics,
+                "pass_name": pass_definition["name"],
+            }
+            _free_add_to_cheap_beam(beams, item)
+            local["cheap_complete"] += 1
+            state["cheap_complete_count"] += 1
+            state["complete_matching_set_count"] += 1
+            counts = state["matching_topology_counts"]
+            counts[topology] = counts.get(topology, 0) + 1
+            if local["cheap_complete"] % 128 == 0:
+                local["trees"] = (
+                    state["trees_considered"] - tree_before
+                )
+                local["tree_rounds"] = (
+                    state["tree_round_robin_rounds"]
+                    - rounds_before
+                )
+                local["beam_size"] = sum(
+                    len(beam) for beam in beams.values()
+                )
+                _free_pass_progress(
+                    pass_definition["name"],
+                    pass_started,
+                    local,
+                    best_physical,
+                )
+
+        local["trees"] = state["trees_considered"] - tree_before
+        local["tree_rounds"] = (
+            state["tree_round_robin_rounds"] - rounds_before
+        )
+        exact_beam = _free_merge_cheap_beams(beams)
+        local["beam_size"] = len(exact_beam)
+        enumeration_completed = not _free_deadline_reached(
+            (pass_started, cheap_budget)
+        )
+        pass_best = None
+        exact_completed = True
+        for item in exact_beam:
+            if _free_deadline_reached((pass_started, pass_budget)):
+                exact_completed = False
+                break
+            total_elapsed = max(
+                0, ticks_diff(ticks_ms(), state["started_ms"])
+            )
+            if total_elapsed >= total_budget:
+                state["timed_out"] = True
+                exact_completed = False
+                break
+            signature = item["match_signature"]
+            if signature in exact_cache:
+                proposal = exact_cache[signature]
+            else:
+                proposal = _free_exact_proposal(
+                    item,
+                    pieces,
+                    polygons,
+                    piece_cache,
+                    source_area,
+                    perimeter_context,
+                    state,
+                )
+                exact_cache[signature] = proposal
+                state["exact_evaluated_count"] += 1
+                local["exact_evaluated"] += 1
+            if proposal is None:
+                continue
+            _free_update_top(top, proposal)
+            if (
+                best_invalid is None
+                or _free_proposal_rank(proposal)
+                < _free_proposal_rank(best_invalid)
+            ):
+                best_invalid = proposal
+            if proposal["physical_valid"]:
+                state["physical_valid_count"] += 1
+                local["physical_valid"] += 1
+                if (
+                    pass_best is None
+                    or _free_proposal_rank(proposal)
+                    < _free_proposal_rank(pass_best)
+                ):
+                    pass_best = proposal
+                if (
+                    best_physical is None
+                    or _free_proposal_rank(proposal)
+                    < _free_proposal_rank(best_physical)
+                ):
+                    best_physical = proposal
+                    state["best_cost"] = proposal["metrics"]["cost"]
+                    update_plan_debug(
+                        stage="free_rect_physical",
+                        best_score=state["best_cost"],
+                        nodes=state["cheap_complete_count"],
+                    )
+                if proposal.get("strong", False):
+                    if strong_found_ms is None:
+                        strong_found_ms = ticks_ms()
+                        strong_initial_cost = proposal["metrics"]["cost"]
+            if strong_found_ms is not None:
+                grace = max(
+                    0,
+                    int(
+                        getattr(
+                            cfg,
+                            "FREE_RECT_STRONG_SOLUTION_GRACE_MS",
+                            400,
+                        )
+                    ),
+                )
+                if ticks_diff(ticks_ms(), strong_found_ms) >= grace:
+                    improvement = (
+                        strong_initial_cost
+                        - best_physical["metrics"]["cost"]
+                    ) / max(EPS, strong_initial_cost)
+                    minimum_improvement = float(
+                        getattr(
+                            cfg,
+                            "FREE_RECT_STRONG_IMPROVEMENT_RATIO",
+                            0.03,
+                        )
+                    )
+                    if improvement < minimum_improvement:
+                        state["strong_solution_early_exit"] = True
+                        break
+                    # A material improvement earns one new grace window.  If
+                    # the cost then plateaus, the same rule exits promptly.
+                    strong_found_ms = ticks_ms()
+                    strong_initial_cost = best_physical["metrics"]["cost"]
+            if local["exact_evaluated"] % 8 == 0:
+                _free_pass_progress(
+                    pass_definition["name"],
+                    pass_started,
+                    local,
+                    best_physical,
+                )
+
+        reason = "completed"
+        if state["timed_out"]:
+            reason = "global_timeout"
+        elif state["strong_solution_early_exit"]:
+            reason = "strong_solution"
+        elif (
+            best_physical is not None
+            and best_physical.get("strong", False)
+        ):
+            reason = "strong_solution"
+        elif not enumeration_completed or not exact_completed:
+            reason = "budget"
+        _free_pass_progress(
+            pass_definition["name"],
+            pass_started,
+            local,
+            best_physical,
+            force=True,
+        )
+        print(
+            "FREE_PASS_END,name={},reason={},cheap_complete={},"
+            "exact_evaluated={},physical_valid={}".format(
+                pass_definition["name"],
+                reason,
+                local["cheap_complete"],
+                local["exact_evaluated"],
+                local["physical_valid"],
+            )
+        )
+        state["pass_stats"].append(
+            {
+                "name": pass_definition["name"],
+                "reason": reason,
+                "budget_ms": pass_budget,
+                "candidate_count": len(candidates),
+                "trees": local["trees"],
+                "tree_rounds": local["tree_rounds"],
+                "cheap_complete": local["cheap_complete"],
+                "beam_size": local["beam_size"],
+                "exact_evaluated": local["exact_evaluated"],
+                "physical_valid": local["physical_valid"],
+            }
+        )
+        if best_physical is not None and (
+            state["strong_solution_early_exit"]
+            or best_physical.get("strong", False)
+            or (enumeration_completed and exact_completed)
+        ):
+            break
+        if state["timed_out"]:
+            break
+
+    candidates = sorted(all_candidates)
+    if best_physical is not None:
+        return _free_finalize_physical_result(
+            best_physical,
+            state,
+            source_area,
+            candidates,
+        )
+    state["best_invalid_proposal"] = best_invalid
+    return _free_invalid_result(
+        "no_physical_rectangle_candidate",
+        state,
+        source_area,
+        candidates,
+        top=top,
+    )
+
+
 def _free_base_stats(state, source_area, candidates):
     full_count = sum(
         1 for candidate in candidates
@@ -2451,6 +4090,46 @@ def _free_base_stats(state, source_area, candidates):
         "candidate_count": len(candidates),
         "full_candidate_count": full_count,
         "partial_candidate_count": len(candidates) - full_count,
+        "raw_candidate_count": state.get("raw_candidate_count", 0),
+        "shortlisted_candidate_count": state.get(
+            "shortlisted_candidate_count", len(candidates)
+        ),
+        "candidate_pair_group_count": state.get(
+            "candidate_pair_group_count", 0
+        ),
+        "trees_considered": state.get("trees_considered", 0),
+        "tree_schedule_count": state.get(
+            "tree_schedule_count", 0
+        ),
+        "tree_round_robin_rounds": state.get(
+            "tree_round_robin_rounds", 0
+        ),
+        "cheap_complete_count": state.get(
+            "cheap_complete_count", 0
+        ),
+        "exact_evaluated_count": state.get(
+            "exact_evaluated_count", 0
+        ),
+        "cheap_cache_hit_count": state.get(
+            "cheap_cache_hit_count", 0
+        ),
+        "physical_valid_count": state.get(
+            "physical_valid_count", 0
+        ),
+        "tree_pose_optimizer_skipped_count": state.get(
+            "tree_pose_optimizer_skipped_count", 0
+        ),
+        "closed_graph_pose_optimizer_count": state.get(
+            "closed_graph_pose_optimizer_count", 0
+        ),
+        "interval_reuse_reject_count": state.get(
+            "interval_reuse_reject_count", 0
+        ),
+        "strong_solution_early_exit": bool(
+            state.get("strong_solution_early_exit", False)
+        ),
+        "selected_pass": state.get("selected_pass"),
+        "pass_stats": list(state.get("pass_stats", ())),
         "prefix_count": state["prefix_count"],
         "enumerated_prefix_count": state["prefix_count"],
         "max_depth": state["max_depth"],
@@ -2526,15 +4205,80 @@ def _free_invalid_result(
         _free_top_record(proposal)
         for proposal in (top or [])
     ]
+    best_invalid = state.get("best_invalid_proposal")
+    debug_invalid_enabled = bool(
+        getattr(cfg, "FREE_RECT_ALLOW_INVALID_DEBUG_PROPOSAL", False)
+    )
+    stats["invalid_debug_proposal_enabled"] = debug_invalid_enabled
+    stats["invalid_debug_proposal"] = (
+        _free_top_record(best_invalid)
+        if debug_invalid_enabled and best_invalid is not None
+        else None
+    )
+    if best_invalid is not None:
+        best_metrics = best_invalid["metrics"]
+        stats.update(
+            {
+                "best_invalid_cost": best_metrics["cost"],
+                "best_invalid_area_error": best_metrics[
+                    "area_prior_error"
+                ],
+                "best_invalid_gap_ratio": best_metrics[
+                    "fill_gap_ratio"
+                ],
+                "best_invalid_overlap_ratio": best_metrics[
+                    "overlap_ratio"
+                ],
+                "best_invalid_outer_missing": best_metrics[
+                    "outer_piece_missing_count"
+                ],
+                "best_invalid_failures": best_invalid.get(
+                    "physical_failures", ()
+                ),
+            }
+        )
     PERF_STATS.add_stage("plan_ms", elapsed_ms=elapsed_ms)
     print(
         "FREE_PLAN_INVALID,reason={},candidates={},max_depth={},"
-        "complete_sets={},timed_out={}".format(
+        "complete_sets={},timed_out={},best_invalid_cost={},"
+        "best_invalid_area_error={},best_invalid_gap_ratio={},"
+        "best_invalid_overlap_ratio={},best_invalid_outer_missing={}".format(
             str(reason).replace(",", ";"),
             len(candidates),
             state["max_depth"],
             state["complete_matching_set_count"],
             1 if state["timed_out"] else 0,
+            (
+                "{:.6f}".format(best_invalid["metrics"]["cost"])
+                if best_invalid is not None
+                else "na"
+            ),
+            (
+                "{:.4f}".format(
+                    best_invalid["metrics"]["area_prior_error"]
+                )
+                if best_invalid is not None
+                else "na"
+            ),
+            (
+                "{:.4f}".format(
+                    best_invalid["metrics"]["fill_gap_ratio"]
+                )
+                if best_invalid is not None
+                else "na"
+            ),
+            (
+                "{:.4f}".format(
+                    best_invalid["metrics"]["overlap_ratio"]
+                )
+                if best_invalid is not None
+                else "na"
+            ),
+            (
+                best_invalid["metrics"]["outer_piece_missing_count"]
+                if best_invalid is not None
+                else "na"
+            ),
         )
     )
     return PlanResult(
@@ -2572,6 +4316,22 @@ def _free_new_state(started_ms):
         "best_cost": None,
         "best_aspect_ratio": None,
         "best_perimeter_error_ratio": None,
+        "raw_candidate_count": 0,
+        "shortlisted_candidate_count": 0,
+        "candidate_pair_group_count": 0,
+        "trees_considered": 0,
+        "tree_schedule_count": 0,
+        "tree_round_robin_rounds": 0,
+        "cheap_complete_count": 0,
+        "cheap_cache_hit_count": 0,
+        "exact_evaluated_count": 0,
+        "physical_valid_count": 0,
+        "tree_pose_optimizer_skipped_count": 0,
+        "closed_graph_pose_optimizer_count": 0,
+        "interval_reuse_reject_count": 0,
+        "strong_solution_early_exit": False,
+        "selected_pass": None,
+        "pass_stats": [],
     }
 
 
@@ -2688,6 +4448,62 @@ def _plan_simulator_free_rectangle(
             )
         )
 
+    minimum_observed_edge = float(
+        getattr(cfg, "FREE_RECT_MIN_OBSERVED_EDGE_MM", 17.5)
+    )
+    unresolved_edges = []
+    for piece_index, polygon in enumerate(polygons):
+        for edge_index, edge in enumerate(_free_edges(polygon)):
+            length = _free_distance(edge[0], edge[1])
+            if length + EPS < minimum_observed_edge:
+                unresolved_edges.append(
+                    (piece_index, edge_index, length)
+                )
+    if unresolved_edges:
+        print(
+            "FREE_INPUT_REJECT,reason=short_edge_unresolved,"
+            "minimum_mm={:.2f},edges={}".format(
+                minimum_observed_edge,
+                "|".join(
+                    "P{}-E{}:{:.2f}".format(
+                        piece_index + 1,
+                        edge_index,
+                        length,
+                    )
+                    for piece_index, edge_index, length
+                    in unresolved_edges
+                ),
+            )
+        )
+        return _free_invalid_result(
+            "short_edge_unresolved",
+            state,
+            source_area,
+            candidates,
+        )
+
+    print(
+        "FREE_PLAN_START,pieces={},source_area_mm2={:.1f},"
+        "search=staged_tree_beam,total_time_limit_ms={}".format(
+            len(pieces),
+            source_area,
+            int(
+                getattr(
+                    cfg, "FREE_RECT_TOTAL_PLAN_TIME_MS", 10000
+                )
+            ),
+        )
+    )
+    update_plan_debug(stage="free_rect_staged_start")
+    return _free_plan_staged_generic(
+        pieces,
+        polygons,
+        source_area,
+        state,
+    )
+
+    # Legacy exhaustive implementation retained below for desktop A/B source
+    # inspection only.  The staged return above is authoritative.
     candidates = _free_rect_candidate_matchings(pieces)
     full_count = sum(
         1 for candidate in candidates

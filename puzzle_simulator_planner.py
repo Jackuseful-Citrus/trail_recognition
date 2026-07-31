@@ -201,6 +201,50 @@ def _sim_align_edge(source_a, source_b, target_a, target_b):
     )
 
 
+def _sim_align_segment_midpoint(
+    source_a, source_b, target_a, target_b
+):
+    """Rigidly align opposite segment directions around their midpoints.
+
+    Unlike endpoint propagation this shares a measured length mismatch equally
+    between both seam endpoints and never scales either source polygon.
+    """
+    source_angle = math.atan2(
+        source_b[1] - source_a[1],
+        source_b[0] - source_a[0],
+    )
+    target_angle = math.atan2(
+        target_b[1] - target_a[1],
+        target_b[0] - target_a[0],
+    )
+    angle = target_angle - source_angle
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    source_midpoint = (
+        0.5 * (source_a[0] + source_b[0]),
+        0.5 * (source_a[1] + source_b[1]),
+    )
+    target_midpoint = (
+        0.5 * (target_a[0] + target_b[0]),
+        0.5 * (target_a[1] + target_b[1]),
+    )
+    mapped_x = (
+        cosine * source_midpoint[0]
+        - sine * source_midpoint[1]
+    )
+    mapped_y = (
+        sine * source_midpoint[0]
+        + cosine * source_midpoint[1]
+    )
+    return (
+        cosine,
+        sine,
+        target_midpoint[0] - mapped_x,
+        target_midpoint[1] - mapped_y,
+        normalize_angle_deg(math.degrees(angle)),
+    )
+
+
 def _sim_solve_linear(matrix, vector):
     size = len(vector)
     augmented = [

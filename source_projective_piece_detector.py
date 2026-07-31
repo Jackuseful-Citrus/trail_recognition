@@ -169,6 +169,176 @@ def _boundary_inside_ratio(points, rows):
     return float(inside) / len(points)
 
 
+def _source_polygon_min_edge_mm(polygon):
+    if polygon is None or len(polygon) < 2:
+        return 0.0
+    return min(
+        math.sqrt(
+            (polygon[(index + 1) % len(polygon)][0] - point[0]) ** 2
+            + (polygon[(index + 1) % len(polygon)][1] - point[1]) ** 2
+        )
+        for index, point in enumerate(polygon)
+    )
+
+
+def _source_point_segment_distance(point, start, end):
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    squared = dx * dx + dy * dy
+    if squared <= 1e-12:
+        return math.sqrt(
+            (point[0] - start[0]) ** 2
+            + (point[1] - start[1]) ** 2
+        )
+    ratio = (
+        (point[0] - start[0]) * dx
+        + (point[1] - start[1]) * dy
+    ) / squared
+    ratio = max(0.0, min(1.0, ratio))
+    projected = (start[0] + ratio * dx, start[1] + ratio * dy)
+    return math.sqrt(
+        (point[0] - projected[0]) ** 2
+        + (point[1] - projected[1]) ** 2
+    )
+
+
+def _source_polygon_fit_rms_mm(boundary_mm, polygon):
+    if not boundary_mm or polygon is None:
+        return float("inf")
+    stride = max(1, len(boundary_mm) // 160)
+    squared = []
+    for point in boundary_mm[::stride]:
+        distance = min(
+            _source_point_segment_distance(
+                point,
+                polygon[index],
+                polygon[(index + 1) % len(polygon)],
+            )
+            for index in range(len(polygon))
+        )
+        squared.append(distance * distance)
+    return math.sqrt(sum(squared) / max(1, len(squared)))
+
+
+def _source_fit_polygon_candidate(
+    boundary_mm, tolerance_mm, fit_diagnostics=None
+):
+    polygon = _ordered_contour_polygon(
+        boundary_mm,
+        fit_diagnostics,
+        tolerance_mm=tolerance_mm,
+    )
+    if (
+        cfg.FORCE_CONVEX_CONTOURS
+        or (
+            polygon is not None
+            and len(_convex_hull_points(polygon)) == len(polygon)
+        )
+    ):
+        stable = _ordered_contour_polygon(
+            _convex_hull_points(boundary_mm),
+            tolerance_mm=tolerance_mm,
+        )
+        if stable is not None:
+            polygon = stable
+    return polygon
+
+
+def _source_refit_short_edge(boundary_mm, initial_polygon):
+    minimum_required = float(
+        getattr(cfg, "FREE_RECT_MIN_OBSERVED_EDGE_MM", 17.5)
+    )
+    initial_minimum = _source_polygon_min_edge_mm(initial_polygon)
+    record = {
+        "initial_vertices": (
+            len(initial_polygon) if initial_polygon is not None else 0
+        ),
+        "initial_min_edge_mm": initial_minimum,
+        "final_vertices": (
+            len(initial_polygon) if initial_polygon is not None else 0
+        ),
+        "final_min_edge_mm": initial_minimum,
+        "method": "normal",
+    }
+    if initial_polygon is None or initial_minimum >= minimum_required:
+        return initial_polygon, record
+
+    initial_area = polygon_area(initial_polygon)
+    contour_area = polygon_area(boundary_mm)
+    reference_area = (
+        contour_area if contour_area > 1e-9 else initial_area
+    )
+    baseline_rms = _source_polygon_fit_rms_mm(
+        boundary_mm, initial_polygon
+    )
+    maximum_area_change = float(
+        getattr(
+            cfg,
+            "SOURCE_PROJECTIVE_REFIT_MAX_AREA_CHANGE_RATIO",
+            0.10,
+        )
+    )
+    maximum_rms = max(
+        float(
+            getattr(
+                cfg, "SOURCE_PROJECTIVE_REFIT_MAX_RMS_MM", 3.5
+            )
+        ),
+        baseline_rms * 1.50,
+    )
+    base_tolerance = max(0.05, float(cfg.CONTOUR_DP_TOLERANCE_MM))
+    candidates = []
+    multipliers = tuple(
+        getattr(
+            cfg,
+            "SOURCE_PROJECTIVE_REFIT_DP_MULTIPLIERS",
+            (1.20, 1.40),
+        )
+    )
+    for retry_index, multiplier in enumerate(multipliers, 1):
+        polygon = _source_fit_polygon_candidate(
+            boundary_mm,
+            base_tolerance * float(multiplier),
+        )
+        if polygon is None:
+            continue
+        minimum_edge = _source_polygon_min_edge_mm(polygon)
+        if minimum_edge < minimum_required:
+            continue
+        area_change = abs(
+            polygon_area(polygon) - reference_area
+        ) / max(1e-9, reference_area)
+        residual = _source_polygon_fit_rms_mm(
+            boundary_mm, polygon
+        )
+        if area_change > maximum_area_change or residual > maximum_rms:
+            continue
+        candidates.append(
+            (
+                area_change,
+                len(polygon),
+                residual,
+                retry_index,
+                polygon,
+                minimum_edge,
+            )
+        )
+    if not candidates:
+        # A short edge is valid in the fixed Figure 2 template (the
+        # MIDDLE_LEFT piece has a real 10 mm edge).  Keep the measured
+        # polygon so the planner can try the fixed template first.  The
+        # generic FreeRect path has its own fail-closed short-edge gate after
+        # that fixed-template check.
+        record["method"] = "unresolved_kept"
+        return initial_polygon, record
+    candidates.sort(key=lambda item: item[:4])
+    selected = candidates[0]
+    record["final_vertices"] = len(selected[4])
+    record["final_min_edge_mm"] = selected[5]
+    record["method"] = "dp_retry_{}".format(selected[3])
+    return selected[4], record
+
+
 def _empty_diagnostics(gray_image, mapper, divider, generation, reason):
     diagnostics = {
         "rectified": gray_image,
@@ -355,7 +525,8 @@ def detect_pieces_from_source_projective_image(
     polygon_failure_rects = []
     boundary_failure_reasons = {}
     raw_rects = []
-    for blob in blobs:
+    polygon_refits = []
+    for blob_index, blob in enumerate(blobs):
         rect = tuple(_blob_value(blob, "rect", None))
         raw_rects.append(rect)
         if mask_mode == "bbox_filter" and _touches_roi_boundary(
@@ -450,27 +621,39 @@ def detect_pieces_from_source_projective_image(
             continue
         fit_started = PERF_STATS.mark()
         fit_diagnostics = {}
-        polygon_mm = _ordered_contour_polygon(
-            boundary_mm, fit_diagnostics
+        polygon_mm = _source_fit_polygon_candidate(
+            boundary_mm,
+            cfg.CONTOUR_DP_TOLERANCE_MM,
+            fit_diagnostics,
         )
-        if (
-            cfg.FORCE_CONVEX_CONTOURS
-            or (
-                polygon_mm is not None
-                and len(_convex_hull_points(polygon_mm)) == len(polygon_mm)
+        polygon_mm, refit_record = _source_refit_short_edge(
+            boundary_mm, polygon_mm
+        )
+        refit_record["piece"] = "B{}".format(blob_index + 1)
+        polygon_refits.append(refit_record)
+        print(
+            "SOURCE_POLYGON_REFIT,piece={},initial_vertices={},"
+            "initial_min_edge_mm={:.2f},final_vertices={},"
+            "final_min_edge_mm={:.2f},method={}".format(
+                refit_record["piece"],
+                refit_record["initial_vertices"],
+                refit_record["initial_min_edge_mm"],
+                refit_record["final_vertices"],
+                refit_record["final_min_edge_mm"],
+                refit_record["method"],
             )
-        ):
-            stable_polygon = _ordered_contour_polygon(
-                _convex_hull_points(boundary_mm)
-            )
-            if stable_polygon is not None:
-                polygon_mm = stable_polygon
+        )
         PERF_STATS.add_stage("polygon_fit_mm_ms", fit_started)
         if polygon_mm is None:
             rejected["polygon"] += 1
             polygon_failure_rects.append(rect)
-            trace_failures["fit_invalid"] = (
-                trace_failures.get("fit_invalid", 0) + 1
+            failure_reason = (
+                "short_edge_unresolved"
+                if refit_record["method"] == "rejected"
+                else "fit_invalid"
+            )
+            trace_failures[failure_reason] = (
+                trace_failures.get(failure_reason, 0) + 1
             )
             continue
         area_mm2 = polygon_area(polygon_mm)
@@ -564,6 +747,15 @@ def detect_pieces_from_source_projective_image(
             "boundary_fallback_ordered_ok": 0,
             "boundary_failure_reason": boundary_failure_reasons,
             "polygon_failure_rects": polygon_failure_rects,
+            "source_polygon_refits": polygon_refits,
+            "short_edge_unresolved_count": sum(
+                1
+                for record in polygon_refits
+                if record["method"] in (
+                    "rejected",
+                    "unresolved_kept",
+                )
+            ),
             "polygon_reverse_retry_count": 0,
             "polygon_unrefined_retry_count": 0,
             "boundary_steps": boundary_steps,
