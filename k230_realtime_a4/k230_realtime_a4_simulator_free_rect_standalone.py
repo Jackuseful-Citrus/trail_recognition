@@ -237,6 +237,18 @@ FREE_RECT_PREFERRED_ASPECT_MIN = 1.33
 FREE_RECT_PREFERRED_ASPECT_MAX = 1.67
 FREE_RECT_OUTER_EDGE_TOLERANCE_MM = 5.0
 FREE_RECT_PARTIAL_COUNT_PENALTY = 1.0
+# Exposed-boundary estimator. Selected seam fractions are reused directly;
+# this small tolerance scan only discovers closing contacts that are not part
+# of the spanning-tree match set. It is O(E^2) over at most 20 piece edges and
+# does not construct a polygon union.
+FREE_RECT_PERIMETER_SEAM_DISTANCE_MM = 5.0
+FREE_RECT_PERIMETER_SEAM_ANGLE_DEG = 12.0
+FREE_RECT_PERIMETER_MIN_CONTACT_MM = 4.0
+# Reject an assembly before the expensive pose/area stages when its exposed
+# boundary is far longer than any preferred-aspect rectangle with the same
+# source area. The deliberately wide gate tolerates contour and area noise;
+# the continuous score below performs the fine ranking.
+FREE_RECT_MAX_PERIMETER_EXCESS_RATIO = 0.18
 
 # Complete-proposal cost weights.
 FREE_RECT_WEIGHT_OVERLAP = 10.0
@@ -247,6 +259,7 @@ FREE_RECT_WEIGHT_DIMENSION_RANGE = 3.0
 FREE_RECT_WEIGHT_OUTER_PIECE = 2.0
 FREE_RECT_WEIGHT_SEAM = 1.0
 FREE_RECT_WEIGHT_CLOSURE = 1.0
+FREE_RECT_WEIGHT_PERIMETER = 12.0
 
 # Equivalent target directions are compared only after geometric ranking.
 FREE_RECT_MOTION_ROTATION_WEIGHT_MM_PER_DEG = 0.10
@@ -257,6 +270,7 @@ FREE_RECT_TARGET_MARGIN_MM = 10.0
 FREE_RECT_WARN_OVERLAP_RATIO = 0.03
 FREE_RECT_WARN_FILL_GAP_RATIO = 0.08
 FREE_RECT_WARN_HULL_GAP_RATIO = 0.08
+FREE_RECT_WARN_PERIMETER_ERROR_RATIO = 0.08
 # Low-overhead planner heartbeat. The shared default stays off so desktop
 # benchmarks and non-realtime entrypoints remain quiet; the realtime CanMV
 # profile enables it. Time is sampled only at existing search batch/exitpoint
@@ -513,6 +527,10 @@ cfg.FREE_RECT_PREFERRED_ASPECT_MIN = FREE_RECT_PREFERRED_ASPECT_MIN
 cfg.FREE_RECT_PREFERRED_ASPECT_MAX = FREE_RECT_PREFERRED_ASPECT_MAX
 cfg.FREE_RECT_OUTER_EDGE_TOLERANCE_MM = FREE_RECT_OUTER_EDGE_TOLERANCE_MM
 cfg.FREE_RECT_PARTIAL_COUNT_PENALTY = FREE_RECT_PARTIAL_COUNT_PENALTY
+cfg.FREE_RECT_PERIMETER_SEAM_DISTANCE_MM = FREE_RECT_PERIMETER_SEAM_DISTANCE_MM
+cfg.FREE_RECT_PERIMETER_SEAM_ANGLE_DEG = FREE_RECT_PERIMETER_SEAM_ANGLE_DEG
+cfg.FREE_RECT_PERIMETER_MIN_CONTACT_MM = FREE_RECT_PERIMETER_MIN_CONTACT_MM
+cfg.FREE_RECT_MAX_PERIMETER_EXCESS_RATIO = FREE_RECT_MAX_PERIMETER_EXCESS_RATIO
 cfg.FREE_RECT_WEIGHT_OVERLAP = FREE_RECT_WEIGHT_OVERLAP
 cfg.FREE_RECT_WEIGHT_FILL_GAP = FREE_RECT_WEIGHT_FILL_GAP
 cfg.FREE_RECT_WEIGHT_HULL_GAP = FREE_RECT_WEIGHT_HULL_GAP
@@ -521,11 +539,13 @@ cfg.FREE_RECT_WEIGHT_DIMENSION_RANGE = FREE_RECT_WEIGHT_DIMENSION_RANGE
 cfg.FREE_RECT_WEIGHT_OUTER_PIECE = FREE_RECT_WEIGHT_OUTER_PIECE
 cfg.FREE_RECT_WEIGHT_SEAM = FREE_RECT_WEIGHT_SEAM
 cfg.FREE_RECT_WEIGHT_CLOSURE = FREE_RECT_WEIGHT_CLOSURE
+cfg.FREE_RECT_WEIGHT_PERIMETER = FREE_RECT_WEIGHT_PERIMETER
 cfg.FREE_RECT_MOTION_ROTATION_WEIGHT_MM_PER_DEG = FREE_RECT_MOTION_ROTATION_WEIGHT_MM_PER_DEG
 cfg.FREE_RECT_TARGET_MARGIN_MM = FREE_RECT_TARGET_MARGIN_MM
 cfg.FREE_RECT_WARN_OVERLAP_RATIO = FREE_RECT_WARN_OVERLAP_RATIO
 cfg.FREE_RECT_WARN_FILL_GAP_RATIO = FREE_RECT_WARN_FILL_GAP_RATIO
 cfg.FREE_RECT_WARN_HULL_GAP_RATIO = FREE_RECT_WARN_HULL_GAP_RATIO
+cfg.FREE_RECT_WARN_PERIMETER_ERROR_RATIO = FREE_RECT_WARN_PERIMETER_ERROR_RATIO
 cfg.ENABLE_PLAN_DEBUG = ENABLE_PLAN_DEBUG
 cfg.PLAN_DEBUG_INTERVAL_MS = PLAN_DEBUG_INTERVAL_MS
 cfg.GEOMETRY_EPSILON_MM = GEOMETRY_EPSILON_MM
@@ -2737,6 +2757,352 @@ def _free_edges(polygon):
     ]
 
 
+def _free_signed_area_twice(polygon):
+    total = 0.0
+    for index, point in enumerate(polygon):
+        following = polygon[(index + 1) % len(polygon)]
+        total += (
+            point[0] * following[1]
+            - following[0] * point[1]
+        )
+    return total
+
+
+def _free_area_equivalent_perimeter(area_mm2, aspect_ratio):
+    """Return the perimeter of a rectangle with the given area/aspect."""
+    aspect_ratio = max(1.0, float(aspect_ratio))
+    root_area = math.sqrt(max(EPS, float(area_mm2)))
+    root_aspect = math.sqrt(aspect_ratio)
+    return 2.0 * root_area * (
+        root_aspect + 1.0 / root_aspect
+    )
+
+
+def _free_perimeter_context(polygons, source_area_mm2):
+    """Cache source-edge facts reused by every assembly perimeter check."""
+    edge_lengths = []
+    winding_signs = []
+    source_perimeter = 0.0
+    for polygon in polygons:
+        lengths = []
+        for edge in _free_edges(polygon):
+            length = _free_distance(edge[0], edge[1])
+            lengths.append(length)
+            source_perimeter += length
+        edge_lengths.append(lengths)
+        winding_signs.append(
+            1.0
+            if _free_signed_area_twice(polygon) >= 0.0
+            else -1.0
+        )
+
+    aspect_minimum = max(
+        1.0,
+        float(
+            getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MIN", 1.33)
+        ),
+    )
+    aspect_maximum = max(
+        1.0,
+        float(
+            getattr(cfg, "FREE_RECT_PREFERRED_ASPECT_MAX", 1.67)
+        ),
+    )
+    if aspect_minimum > aspect_maximum:
+        aspect_minimum, aspect_maximum = (
+            aspect_maximum,
+            aspect_minimum,
+        )
+    expected_minimum = _free_area_equivalent_perimeter(
+        source_area_mm2, aspect_minimum
+    )
+    expected_maximum = _free_area_equivalent_perimeter(
+        source_area_mm2, aspect_maximum
+    )
+    if expected_minimum > expected_maximum:
+        expected_minimum, expected_maximum = (
+            expected_maximum,
+            expected_minimum,
+        )
+    return {
+        "edge_lengths": edge_lengths,
+        "winding_signs": winding_signs,
+        "source_perimeter_mm": source_perimeter,
+        "expected_perimeter_min_mm": expected_minimum,
+        "expected_perimeter_max_mm": expected_maximum,
+    }
+
+
+def _free_add_centered_coverage(
+    coverage,
+    key,
+    lower,
+    upper,
+    shared_length,
+):
+    first = float(lower)
+    second = float(upper)
+    lower = min(first, second)
+    upper = max(first, second)
+    available = max(0.0, upper - lower)
+    used = min(available, max(0.0, float(shared_length)))
+    if used <= EPS:
+        return
+    middle = 0.5 * (lower + upper)
+    coverage.setdefault(key, []).append(
+        (middle - 0.5 * used, middle + 0.5 * used)
+    )
+
+
+def _free_merged_interval_length(intervals):
+    if not intervals:
+        return 0.0
+    intervals = sorted(intervals)
+    lower, upper = intervals[0]
+    total = 0.0
+    for next_lower, next_upper in intervals[1:]:
+        if next_lower <= upper + EPS:
+            upper = max(upper, next_upper)
+        else:
+            total += max(0.0, upper - lower)
+            lower, upper = next_lower, next_upper
+    return total + max(0.0, upper - lower)
+
+
+def _free_exposed_perimeter_metrics(
+    polygons,
+    matches,
+    transforms,
+    source_area_mm2,
+    context=None,
+):
+    """Estimate assembled exposed boundary without a polygon union.
+
+    Selected seam fractions seed one-dimensional coverage on their two source
+    edges.  A tiny all-edge scan then finds extra closing seams implied by the
+    assembled poses (for example, the fourth side of a cyclic four-piece
+    topology).  Coverage intervals are merged per physical edge before they
+    are subtracted from the immutable sum of piece perimeters.
+    """
+    if context is None:
+        context = _free_perimeter_context(
+            polygons, source_area_mm2
+        )
+    assembled = [
+        transform_polygon(polygon, transform)
+        for polygon, transform in zip(polygons, transforms)
+    ]
+    coverage = {}
+    selected_pairs = set()
+    selected_shared_mm = 0.0
+    edge_lengths = context["edge_lengths"]
+    for match in matches:
+        _, i, edge_i, j, edge_j, ia0, ia1, ja0, ja1 = match
+        length_a = edge_lengths[i][edge_i]
+        length_b = edge_lengths[j][edge_j]
+        lower_a = min(ia0, ia1) * length_a
+        upper_a = max(ia0, ia1) * length_a
+        lower_b = min(ja0, ja1) * length_b
+        upper_b = max(ja0, ja1) * length_b
+        shared = min(upper_a - lower_a, upper_b - lower_b)
+        _free_add_centered_coverage(
+            coverage,
+            (i, edge_i),
+            lower_a,
+            upper_a,
+            shared,
+        )
+        _free_add_centered_coverage(
+            coverage,
+            (j, edge_j),
+            lower_b,
+            upper_b,
+            shared,
+        )
+        selected_shared_mm += max(0.0, shared)
+        selected_pairs.add(
+            tuple(sorted(((i, edge_i), (j, edge_j))))
+        )
+
+    indexed_edges = []
+    for piece_index, polygon in enumerate(assembled):
+        winding = context["winding_signs"][piece_index]
+        for edge_index, edge in enumerate(_free_edges(polygon)):
+            a, b = edge
+            length = edge_lengths[piece_index][edge_index]
+            if length <= EPS:
+                continue
+            indexed_edges.append(
+                (
+                    piece_index,
+                    edge_index,
+                    a,
+                    b,
+                    length,
+                    (b[0] - a[0]) / length,
+                    (b[1] - a[1]) / length,
+                    winding,
+                )
+            )
+
+    distance_tolerance = max(
+        0.0,
+        float(
+            getattr(
+                cfg,
+                "FREE_RECT_PERIMETER_SEAM_DISTANCE_MM",
+                5.0,
+            )
+        ),
+    )
+    angle_tolerance = max(
+        0.0,
+        min(
+            89.0,
+            float(
+                getattr(
+                    cfg,
+                    "FREE_RECT_PERIMETER_SEAM_ANGLE_DEG",
+                    12.0,
+                )
+            ),
+        ),
+    )
+    minimum_contact = max(
+        EPS,
+        float(
+            getattr(
+                cfg,
+                "FREE_RECT_PERIMETER_MIN_CONTACT_MM",
+                4.0,
+            )
+        ),
+    )
+    parallel_cosine = math.cos(math.radians(angle_tolerance))
+    additional_contact_count = 0
+    additional_shared_mm = 0.0
+    for left in range(len(indexed_edges)):
+        (
+            i,
+            edge_i,
+            a,
+            b,
+            length_a,
+            ax,
+            ay,
+            winding_a,
+        ) = indexed_edges[left]
+        for right in range(left + 1, len(indexed_edges)):
+            (
+                j,
+                edge_j,
+                c,
+                d,
+                length_b,
+                bx,
+                by,
+                winding_b,
+            ) = indexed_edges[right]
+            if i == j:
+                continue
+            pair = tuple(sorted(((i, edge_i), (j, edge_j))))
+            if pair in selected_pairs:
+                continue
+            # Canonicalize both contours to the same winding. Adjacent
+            # physical boundaries must then run in opposite directions.
+            if (
+                (ax * bx + ay * by) * winding_a * winding_b
+                > -parallel_cosine
+            ):
+                continue
+            normal_ax = -ay
+            normal_ay = ax
+            normal_bx = -by
+            normal_by = bx
+            line_distances = (
+                abs(
+                    (c[0] - a[0]) * normal_ax
+                    + (c[1] - a[1]) * normal_ay
+                ),
+                abs(
+                    (d[0] - a[0]) * normal_ax
+                    + (d[1] - a[1]) * normal_ay
+                ),
+                abs(
+                    (a[0] - c[0]) * normal_bx
+                    + (a[1] - c[1]) * normal_by
+                ),
+                abs(
+                    (b[0] - c[0]) * normal_bx
+                    + (b[1] - c[1]) * normal_by
+                ),
+            )
+            if max(line_distances) > distance_tolerance:
+                continue
+            projected_b = (
+                (c[0] - a[0]) * ax + (c[1] - a[1]) * ay,
+                (d[0] - a[0]) * ax + (d[1] - a[1]) * ay,
+            )
+            lower_a = max(0.0, min(projected_b))
+            upper_a = min(length_a, max(projected_b))
+            projected_a = (
+                (a[0] - c[0]) * bx + (a[1] - c[1]) * by,
+                (b[0] - c[0]) * bx + (b[1] - c[1]) * by,
+            )
+            lower_b = max(0.0, min(projected_a))
+            upper_b = min(length_b, max(projected_a))
+            shared = min(
+                upper_a - lower_a, upper_b - lower_b
+            )
+            if shared < minimum_contact:
+                continue
+            _free_add_centered_coverage(
+                coverage,
+                (i, edge_i),
+                lower_a,
+                upper_a,
+                shared,
+            )
+            _free_add_centered_coverage(
+                coverage,
+                (j, edge_j),
+                lower_b,
+                upper_b,
+                shared,
+            )
+            additional_contact_count += 1
+            additional_shared_mm += shared
+
+    covered_perimeter = sum(
+        _free_merged_interval_length(intervals)
+        for intervals in coverage.values()
+    )
+    exposed_perimeter = max(
+        0.0,
+        context["source_perimeter_mm"] - covered_perimeter,
+    )
+    expected_minimum = context["expected_perimeter_min_mm"]
+    expected_maximum = context["expected_perimeter_max_mm"]
+    deficit = max(0.0, expected_minimum - exposed_perimeter)
+    excess = max(0.0, exposed_perimeter - expected_maximum)
+    deficit_ratio = deficit / max(EPS, expected_minimum)
+    excess_ratio = excess / max(EPS, expected_maximum)
+    return {
+        "source_perimeter_mm": context["source_perimeter_mm"],
+        "covered_perimeter_mm": covered_perimeter,
+        "internal_seam_length_mm": 0.5 * covered_perimeter,
+        "selected_shared_length_mm": selected_shared_mm,
+        "additional_shared_length_mm": additional_shared_mm,
+        "additional_contact_count": additional_contact_count,
+        "exposed_perimeter_mm": exposed_perimeter,
+        "expected_perimeter_min_mm": expected_minimum,
+        "expected_perimeter_max_mm": expected_maximum,
+        "perimeter_deficit_ratio": deficit_ratio,
+        "perimeter_excess_ratio": excess_ratio,
+        "perimeter_error_ratio": deficit_ratio + excess_ratio,
+    }
+
+
 def _free_finite(value):
     value = float(value)
     return value == value and abs(value) < 1e300
@@ -4080,6 +4446,9 @@ def _free_seam_metrics(polygons, matches, transforms):
                 "piece_b_index": j,
                 "edge_b_index": edge_j,
                 "partial": partial,
+                "matched_length_a_mm": length_a,
+                "matched_length_b_mm": length_b,
+                "covered_length_mm": min(length_a, length_b),
                 "length_error_mm": length_error,
                 "relative_length_error": relative_error,
                 "endpoint_angle_error": endpoint_error,
@@ -4212,6 +4581,7 @@ def _free_complete_metrics(
     matches,
     transforms,
     source_area_mm2,
+    perimeter=None,
 ):
     assembled = [
         transform_polygon(polygon, transform)
@@ -4286,6 +4656,13 @@ def _free_complete_metrics(
     seam = _free_seam_metrics(
         polygons, matches, transforms
     )
+    if perimeter is None:
+        perimeter = _free_exposed_perimeter_metrics(
+            polygons,
+            matches,
+            transforms,
+            source_area_mm2,
+        )
     source_area = max(EPS, source_area_mm2)
     metrics = {
         "source_area_mm2": source_area_mm2,
@@ -4319,6 +4696,42 @@ def _free_complete_metrics(
         "partial_ratio": seam["partial_ratio"],
         "endpoint_angle_error": seam[
             "endpoint_angle_error"
+        ],
+        "source_perimeter_mm": perimeter[
+            "source_perimeter_mm"
+        ],
+        "covered_perimeter_mm": perimeter[
+            "covered_perimeter_mm"
+        ],
+        "internal_seam_length_mm": perimeter[
+            "internal_seam_length_mm"
+        ],
+        "selected_shared_length_mm": perimeter[
+            "selected_shared_length_mm"
+        ],
+        "additional_shared_length_mm": perimeter[
+            "additional_shared_length_mm"
+        ],
+        "additional_contact_count": perimeter[
+            "additional_contact_count"
+        ],
+        "exposed_perimeter_mm": perimeter[
+            "exposed_perimeter_mm"
+        ],
+        "expected_perimeter_min_mm": perimeter[
+            "expected_perimeter_min_mm"
+        ],
+        "expected_perimeter_max_mm": perimeter[
+            "expected_perimeter_max_mm"
+        ],
+        "perimeter_deficit_ratio": perimeter[
+            "perimeter_deficit_ratio"
+        ],
+        "perimeter_excess_ratio": perimeter[
+            "perimeter_excess_ratio"
+        ],
+        "perimeter_error_ratio": perimeter[
+            "perimeter_error_ratio"
         ],
     }
     cost = (
@@ -4354,6 +4767,10 @@ def _free_complete_metrics(
             getattr(cfg, "FREE_RECT_WEIGHT_CLOSURE", 1.0)
         )
         * metrics["closure_cost"]
+        + float(
+            getattr(cfg, "FREE_RECT_WEIGHT_PERIMETER", 12.0)
+        )
+        * metrics["perimeter_error_ratio"]
     )
     metrics["cost"] = cost
     return {
@@ -4584,6 +5001,24 @@ def _free_top_record(proposal):
         "outer_piece_missing_ratio": metrics[
             "outer_piece_missing_ratio"
         ],
+        "exposed_perimeter_mm": metrics[
+            "exposed_perimeter_mm"
+        ],
+        "expected_perimeter_min_mm": metrics[
+            "expected_perimeter_min_mm"
+        ],
+        "expected_perimeter_max_mm": metrics[
+            "expected_perimeter_max_mm"
+        ],
+        "perimeter_excess_ratio": metrics[
+            "perimeter_excess_ratio"
+        ],
+        "perimeter_error_ratio": metrics[
+            "perimeter_error_ratio"
+        ],
+        "additional_contact_count": metrics[
+            "additional_contact_count"
+        ],
         "seam_cost": metrics["seam_cost"],
         "closure_cost": metrics["closure_cost"],
         "selected_partial_match_count": proposal[
@@ -4635,9 +5070,12 @@ def _free_progress(state, force=False):
     best_aspect = state.get("best_aspect_ratio")
     print(
         "FREE_PLAN_PROGRESS,elapsed_ms={},complete_sets={},"
-        "best_cost={},best_aspect={}".format(
+        "perimeter_passed={},perimeter_rejected={},"
+        "best_cost={},best_aspect={},best_perimeter_error={}".format(
             elapsed,
             state["complete_matching_set_count"],
+            state["perimeter_prefilter_passed_count"],
+            state["perimeter_prefilter_rejected_count"],
             (
                 "{:.6f}".format(best_cost)
                 if best_cost is not None
@@ -4646,6 +5084,13 @@ def _free_progress(state, force=False):
             (
                 "{:.3f}".format(best_aspect)
                 if best_aspect is not None
+                else "na"
+            ),
+            (
+                "{:.3f}".format(
+                    state["best_perimeter_error_ratio"]
+                )
+                if state["best_perimeter_error_ratio"] is not None
                 else "na"
             ),
         )
@@ -4685,6 +5130,15 @@ def _free_base_stats(state, source_area, candidates):
         ],
         "target_fit_complete_count": state[
             "target_fit_complete_count"
+        ],
+        "perimeter_prefilter_passed_count": state[
+            "perimeter_prefilter_passed_count"
+        ],
+        "perimeter_prefilter_rejected_count": state[
+            "perimeter_prefilter_rejected_count"
+        ],
+        "perimeter_postfit_rejected_count": state[
+            "perimeter_postfit_rejected_count"
         ],
         "matching_topology_counts": dict(
             state["matching_topology_counts"]
@@ -4763,6 +5217,9 @@ def _free_new_state(started_ms):
         "pose_optimization_count": 0,
         "geometrically_valid_complete_count": 0,
         "target_fit_complete_count": 0,
+        "perimeter_prefilter_passed_count": 0,
+        "perimeter_prefilter_rejected_count": 0,
+        "perimeter_postfit_rejected_count": 0,
         "matching_topology_counts": {},
         "prefix_pruned_candidate_reuse": 0,
         "prefix_pruned_edge_reuse": 0,
@@ -4776,6 +5233,7 @@ def _free_new_state(started_ms):
         "stop": False,
         "best_cost": None,
         "best_aspect_ratio": None,
+        "best_perimeter_error_ratio": None,
     }
 
 
@@ -4900,7 +5358,8 @@ def _plan_simulator_free_rectangle(
     print(
         "FREE_PLAN_START,pieces={},source_area_mm2={:.1f},"
         "candidates={},full={},partial={},time_limit_ms={},"
-        "preferred_aspect={:.2f}|{:.2f}".format(
+        "preferred_aspect={:.2f}|{:.2f},"
+        "perimeter_max_excess={:.3f}".format(
             len(pieces),
             source_area,
             len(candidates),
@@ -4921,6 +5380,13 @@ def _plan_simulator_free_rectangle(
                     cfg, "FREE_RECT_PREFERRED_ASPECT_MAX", 1.67
                 )
             ),
+            float(
+                getattr(
+                    cfg,
+                    "FREE_RECT_MAX_PERIMETER_EXCESS_RATIO",
+                    0.18,
+                )
+            ),
         )
     )
     if len(pieces) > 1 and not candidates:
@@ -4935,6 +5401,19 @@ def _plan_simulator_free_rectangle(
     top = []
     best = None
     edge_count = max(0, len(polygons) - 1)
+    perimeter_context = _free_perimeter_context(
+        polygons, source_area
+    )
+    maximum_perimeter_excess = max(
+        0.0,
+        float(
+            getattr(
+                cfg,
+                "FREE_RECT_MAX_PERIMETER_EXCESS_RATIO",
+                0.18,
+            )
+        ),
+    )
     for matches in _free_rect_matching_sets(
         candidates, polygons, state
     ):
@@ -4943,6 +5422,21 @@ def _plan_simulator_free_rectangle(
         )
         if initial is None:
             continue
+        initial_perimeter = _free_exposed_perimeter_metrics(
+            polygons,
+            matches,
+            initial,
+            source_area,
+            context=perimeter_context,
+        )
+        if (
+            initial_perimeter["perimeter_excess_ratio"]
+            > maximum_perimeter_excess
+        ):
+            state["perimeter_prefilter_rejected_count"] += 1
+            _free_progress(state)
+            continue
+        state["perimeter_prefilter_passed_count"] += 1
         try:
             optimized = _sim_optimize_pose_graph(
                 polygons, matches, initial
@@ -4958,11 +5452,26 @@ def _plan_simulator_free_rectangle(
             )
         ):
             continue
+        optimized_perimeter = _free_exposed_perimeter_metrics(
+            polygons,
+            matches,
+            optimized,
+            source_area,
+            context=perimeter_context,
+        )
+        if (
+            optimized_perimeter["perimeter_excess_ratio"]
+            > maximum_perimeter_excess
+        ):
+            state["perimeter_postfit_rejected_count"] += 1
+            _free_progress(state)
+            continue
         completed = _free_complete_metrics(
             polygons,
             matches,
             optimized,
             source_area,
+            perimeter=optimized_perimeter,
         )
         if completed is None:
             continue
@@ -5007,6 +5516,9 @@ def _plan_simulator_free_rectangle(
             state["best_aspect_ratio"] = proposal["metrics"][
                 "aspect_ratio"
             ]
+            state["best_perimeter_error_ratio"] = proposal[
+                "metrics"
+            ]["perimeter_error_ratio"]
             update_plan_debug(
                 stage="free_rect_complete",
                 best_score=state["best_cost"],
@@ -5025,7 +5537,17 @@ def _plan_simulator_free_rectangle(
         elif state["complete_matching_set_count"] == 0:
             reason = "no complete connected matching set"
         elif state["geometrically_valid_complete_count"] == 0:
-            reason = "all complete candidates geometrically invalid"
+            if (
+                state["perimeter_prefilter_rejected_count"]
+                + state["perimeter_postfit_rejected_count"]
+                > 0
+            ):
+                reason = (
+                    "all complete candidates rejected by geometry or "
+                    "exposed perimeter"
+                )
+            else:
+                reason = "all complete candidates geometrically invalid"
         else:
             reason = "no complete proposal fits A4 lower target region"
         return _free_invalid_result(
@@ -5060,6 +5582,14 @@ def _plan_simulator_free_rectangle(
         warnings.append("aspect_range")
     if metrics["outer_piece_missing_ratio"] > 0.0:
         warnings.append("outer_piece")
+    if metrics["perimeter_error_ratio"] > float(
+        getattr(
+            cfg,
+            "FREE_RECT_WARN_PERIMETER_ERROR_RATIO",
+            0.08,
+        )
+    ):
+        warnings.append("exposed_perimeter")
     if state["timed_out"]:
         warnings.append("timed_out_best_so_far")
     if state["limit_hit"]:
@@ -5107,6 +5637,42 @@ def _plan_simulator_free_rectangle(
             "outer_piece_evidence": metrics[
                 "outer_piece_evidence"
             ],
+            "source_perimeter_mm": metrics[
+                "source_perimeter_mm"
+            ],
+            "covered_perimeter_mm": metrics[
+                "covered_perimeter_mm"
+            ],
+            "internal_seam_length_mm": metrics[
+                "internal_seam_length_mm"
+            ],
+            "selected_shared_length_mm": metrics[
+                "selected_shared_length_mm"
+            ],
+            "additional_shared_length_mm": metrics[
+                "additional_shared_length_mm"
+            ],
+            "additional_contact_count": metrics[
+                "additional_contact_count"
+            ],
+            "exposed_perimeter_mm": metrics[
+                "exposed_perimeter_mm"
+            ],
+            "expected_perimeter_min_mm": metrics[
+                "expected_perimeter_min_mm"
+            ],
+            "expected_perimeter_max_mm": metrics[
+                "expected_perimeter_max_mm"
+            ],
+            "perimeter_deficit_ratio": metrics[
+                "perimeter_deficit_ratio"
+            ],
+            "perimeter_excess_ratio": metrics[
+                "perimeter_excess_ratio"
+            ],
+            "perimeter_error_ratio": metrics[
+                "perimeter_error_ratio"
+            ],
             "seam_cost": metrics["seam_cost"],
             "closure_error_mm": metrics["closure_error_mm"],
             "closure_cost": metrics["closure_cost"],
@@ -5134,7 +5700,10 @@ def _plan_simulator_free_rectangle(
         "aspect={:.3f},aspect_preferred={},"
         "rect_area_mm2={:.1f},overlap_mm2={:.1f},gap_mm2={:.1f},"
         "hull_gap_mm2={:.1f},area_error={:.6f},"
-        "outer_missing={:.3f},selected_partial={}".format(
+        "outer_missing={:.3f},exposed_perimeter_mm={:.1f},"
+        "expected_perimeter_mm={:.1f}|{:.1f},"
+        "perimeter_error={:.3f},additional_contacts={},"
+        "perimeter_rejected={}|{},selected_partial={}".format(
             1 if state["timed_out"] else 0,
             state["complete_matching_set_count"],
             metrics["cost"],
@@ -5148,6 +5717,13 @@ def _plan_simulator_free_rectangle(
             metrics["hull_gap_mm2"],
             metrics["area_prior_error"],
             metrics["outer_piece_missing_ratio"],
+            metrics["exposed_perimeter_mm"],
+            metrics["expected_perimeter_min_mm"],
+            metrics["expected_perimeter_max_mm"],
+            metrics["perimeter_error_ratio"],
+            metrics["additional_contact_count"],
+            state["perimeter_prefilter_rejected_count"],
+            state["perimeter_postfit_rejected_count"],
             best["partial_count"],
         )
     )

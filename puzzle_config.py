@@ -232,6 +232,18 @@ FREE_RECT_PREFERRED_ASPECT_MIN = 1.33
 FREE_RECT_PREFERRED_ASPECT_MAX = 1.67
 FREE_RECT_OUTER_EDGE_TOLERANCE_MM = 5.0
 FREE_RECT_PARTIAL_COUNT_PENALTY = 1.0
+# Exposed-boundary estimator. Selected seam fractions are reused directly;
+# this small tolerance scan only discovers closing contacts that are not part
+# of the spanning-tree match set. It is O(E^2) over at most 20 piece edges and
+# does not construct a polygon union.
+FREE_RECT_PERIMETER_SEAM_DISTANCE_MM = 5.0
+FREE_RECT_PERIMETER_SEAM_ANGLE_DEG = 12.0
+FREE_RECT_PERIMETER_MIN_CONTACT_MM = 4.0
+# Reject an assembly before the expensive pose/area stages when its exposed
+# boundary is far longer than any preferred-aspect rectangle with the same
+# source area. The deliberately wide gate tolerates contour and area noise;
+# the continuous score below performs the fine ranking.
+FREE_RECT_MAX_PERIMETER_EXCESS_RATIO = 0.18
 
 # Complete-proposal cost weights.
 FREE_RECT_WEIGHT_OVERLAP = 10.0
@@ -242,6 +254,7 @@ FREE_RECT_WEIGHT_DIMENSION_RANGE = 3.0
 FREE_RECT_WEIGHT_OUTER_PIECE = 2.0
 FREE_RECT_WEIGHT_SEAM = 1.0
 FREE_RECT_WEIGHT_CLOSURE = 1.0
+FREE_RECT_WEIGHT_PERIMETER = 12.0
 
 # Equivalent target directions are compared only after geometric ranking.
 FREE_RECT_MOTION_ROTATION_WEIGHT_MM_PER_DEG = 0.10
@@ -252,6 +265,7 @@ FREE_RECT_TARGET_MARGIN_MM = 10.0
 FREE_RECT_WARN_OVERLAP_RATIO = 0.03
 FREE_RECT_WARN_FILL_GAP_RATIO = 0.08
 FREE_RECT_WARN_HULL_GAP_RATIO = 0.08
+FREE_RECT_WARN_PERIMETER_ERROR_RATIO = 0.08
 # Low-overhead planner heartbeat. The shared default stays off so desktop
 # benchmarks and non-realtime entrypoints remain quiet; the realtime CanMV
 # profile enables it. Time is sampled only at existing search batch/exitpoint

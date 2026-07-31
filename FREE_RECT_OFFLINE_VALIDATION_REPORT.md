@@ -23,15 +23,24 @@ plan_simulator_free_rectangle(pieces, validation="publish_best")
 
 - full/partial 候选保留 shortlist；
 - 1～4 片连通生成树搜索；
-- 8000 ms 时间预算和 6000 个完整 matching set 上限；
+- 默认 8000 ms（实时配置 20000 ms）时间预算和 6000 个完整 matching set
+  上限；
 - top-5 完整方案；
 - publish-best 结果语义；
+- 基于现有 seam 分数区间的外露周长判据；
 - 自由尺寸 metrics、cost、A4 下半区目标姿态和日志。
 
-搜索 prefix 只硬拒绝候选/物理边复用、非连通扩展、无效刚体几何和
-超过 170 mm 的灾难性跨度。Overlap、gap、outside 和矩形尺寸不参与
-prefix hard reject。每个完整方案先生成刚体姿态并进行 pose graph
-optimization，之后才计算 overlap、gap、hull gap 和最小面积矩形。
+搜索 prefix 硬拒绝候选/物理边复用、非连通扩展、无效刚体几何和超过
+170 mm 的灾难性跨度。完整 matching set 生成初始刚体姿态后，会先用
+`Σ碎片周长 - Σ各物理边已覆盖区间` 估计拼合外露周长；外露周长若比
+同面积、允许长宽比矩形的最大周长高 18% 以上，不进入昂贵的 pose graph
+和面积计算。Overlap、gap、outside 和矩形尺寸仍不参与 prefix hard
+reject。
+
+周长计算不做 polygon union。选中 seam 已有的两侧边索引和分数区间直接
+作为覆盖区间；另外只在最多 20 条变换后碎片边之间做一次 O(E²) 共线
+接触扫描，补齐生成树未记录的闭环接缝。每条物理边上的区间先合并再扣
+除，避免 partial/T-junction 或重复接触被重复计数。
 
 完整方案 cost 为：
 
@@ -44,7 +53,11 @@ optimization，之后才计算 overlap、gap、hull gap 和最小面积矩形。
 + 2 * outer_piece_missing_ratio
 + 1 * seam_cost
 + 1 * closure_cost
++ 12 * perimeter_error_ratio
 ```
+
+其中 `perimeter_error_ratio` 是外露周长超出同面积、允许长宽比矩形周长
+区间的相对误差；区间内为 0。
 
 最终只做旋转和平移，不缩放碎片。目标矩形长边水平放置，中心为现有
 `TARGET_CENTER_MM`；在等价方向中用运动距离和旋转量选择机械代价较低
@@ -135,6 +148,8 @@ Overlap、gap 和 outside 仍计算并写入结果，但仅供诊断，不否决
 - 90×50、100×60、110×70、120×90；
 - 1、2、3、4 片；
 - full seam 与 partial/T-junction seam；
+- 选中 seam 与闭环补充 seam 的覆盖区间合并；
+- 开链错误拼法的外露周长预筛；
 - 任意初始旋转和平移；
 - 不缩放和 S/T/R 几何一致性；
 - ±1～2 mm 顶点噪声；
@@ -146,10 +161,10 @@ Overlap、gap 和 outside 仍计算并写入结果，但仅供诊断，不否决
 - 同一输入连续 5 次的结果、统计和日志确定性；
 - MicroPython 依赖检查、语法编译和 standalone 构建。
 
-本次保留路径的专项测试共 52 passed：固定模板与 free-rect planning
-9 项、CanMV 原生碎片识别 13 项、最终 source-clear 判定 4 项、A4 与
-运行状态 26 项。其中包含 `border_blobs=1` 时固定模板仍绕过通用输入
-门限的回归用例。
+当前维护路径共 77 passed：planner/识别/source-clear/debug/protocol 49
+项，A4 实时运行状态 28 项。free-rect planner 自身 14 项，其中新增真实
+日志几何回归：6000 个 complete set 中周长预筛拒绝 5914 个，只运行 86
+次 pose optimization，并找到带 1 条闭环补充接缝的方案。
 
 ## Standalone
 
@@ -165,10 +180,10 @@ python k230_realtime_a4/build_standalone.py
 
 SHA-256：
 
-`009cdc7f25ab7d638e30198240a64eec3cbafec1dd4e6612f35bc953d4f29efb`
+`974eb3ab1500543e7ce8a26d5320017cad167f1e8ce14ec8efb062663c2729b9`
 
 生成文件已通过 Python 语法编译和 import AST 检查，不包含 NumPy、
-OpenCV 或 dataclasses 依赖。文件大小为 379132 bytes、11409 行；旧识别
+OpenCV 或 dataclasses 依赖。文件大小为 466745 bytes、13828 行；旧识别
 和 planning 入口的函数级审计计数均为 0。
 
 板端验证应在 CanMV IDE 中上传并运行新的 free standalone，不执行任何
@@ -186,7 +201,10 @@ OPERATION,piece_id=...,template_role=...,source_x=...,source_y=...,target_x=...,
 
 若四片未匹配图 2，预期打印
 `FREE_FIXED_TEMPLATE_CHECK,matched=0,...action=FALLBACK_TO_ENUMERATION`
-并进入原来的 `FREE_PLAN_START` 路径。若该回退路径在 8000 ms 到期但
+并进入原来的 `FREE_PLAN_START` 路径。通用路径的 `FREE_PLAN_PROGRESS`
+会额外显示 `perimeter_passed`/`perimeter_rejected`，最终结果显示
+`exposed_perimeter_mm`、期望周长区间、误差与闭环补充接缝数。若该回退
+路径在配置时间预算到期但
 已有完整方案，预期
 `FREE_PLAN_RESULT,valid=1,timed_out=1`。若到期前没有完整方案，预期
 `FREE_PLAN_INVALID,reason=no complete candidate before timeout,...`。

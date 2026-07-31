@@ -281,6 +281,65 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             "prefix_pruned_overlap", result.plan_stats
         )
 
+    def test_exposed_perimeter_merges_selected_and_closing_seams(self):
+        quadrants = [
+            [(0, 0), (50, 0), (50, 30), (0, 30)],
+            [(50, 0), (100, 0), (100, 30), (50, 30)],
+            [(0, 30), (50, 30), (50, 60), (0, 60)],
+            [(50, 30), (100, 30), (100, 60), (50, 60)],
+        ]
+        matches = (
+            (0.0, 0, 1, 1, 3, 0.0, 1.0, 0.0, 1.0),
+            (0.0, 0, 2, 2, 0, 0.0, 1.0, 0.0, 1.0),
+            (0.0, 2, 1, 3, 3, 0.0, 1.0, 0.0, 1.0),
+        )
+        identity = [(1.0, 0.0, 0.0, 0.0, 0.0)] * 4
+        metrics = free_planner._free_exposed_perimeter_metrics(
+            quadrants,
+            matches,
+            identity,
+            6000.0,
+        )
+        self.assertAlmostEqual(
+            metrics["source_perimeter_mm"], 640.0, places=6
+        )
+        self.assertAlmostEqual(
+            metrics["selected_shared_length_mm"], 110.0, places=6
+        )
+        self.assertAlmostEqual(
+            metrics["additional_shared_length_mm"], 50.0, places=6
+        )
+        self.assertEqual(metrics["additional_contact_count"], 1)
+        self.assertAlmostEqual(
+            metrics["exposed_perimeter_mm"], 320.0, places=6
+        )
+        self.assertEqual(metrics["perimeter_error_ratio"], 0.0)
+
+        local_piece = [(0, 0), (50, 0), (50, 30), (0, 30)]
+        chain_polygons = [local_piece] * 4
+        chain_matches = (
+            (0.0, 0, 1, 1, 3, 0.0, 1.0, 0.0, 1.0),
+            (0.0, 1, 1, 2, 3, 0.0, 1.0, 0.0, 1.0),
+            (0.0, 2, 1, 3, 3, 0.0, 1.0, 0.0, 1.0),
+        )
+        chain_transforms = [
+            (1.0, 0.0, 50.0 * index, 0.0, 0.0)
+            for index in range(4)
+        ]
+        chain = free_planner._free_exposed_perimeter_metrics(
+            chain_polygons,
+            chain_matches,
+            chain_transforms,
+            6000.0,
+        )
+        self.assertAlmostEqual(
+            chain["exposed_perimeter_mm"], 460.0, places=6
+        )
+        self.assertGreater(
+            chain["perimeter_excess_ratio"],
+            cfg.FREE_RECT_MAX_PERIMETER_EXCESS_RATIO,
+        )
+
     def test_exact_figure2_skips_enumeration_and_uses_fixed_targets(self):
         pieces = _make_pieces(
             [
@@ -539,7 +598,9 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             for piece_id, area, center, polygon in rows
         ]
         cfg.FREE_RECT_MAX_PLAN_TIME_MS = 0
-        cfg.FREE_RECT_MAX_COMPLETE_SETS = 54
+        # The exposed-perimeter prefilter cheaply skips the early open chains;
+        # retain enough matching sets to reach a closed, preferred-aspect set.
+        cfg.FREE_RECT_MAX_COMPLETE_SETS = 3000
         with contextlib.redirect_stdout(io.StringIO()):
             result = plan_simulator_free_rectangle(pieces)
         self.assertTrue(result.valid, result.reason)
@@ -552,6 +613,89 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             result.plan_stats["aspect_ratio"],
             cfg.FREE_RECT_PREFERRED_ASPECT_MAX,
         )
+
+    def test_logged_open_chain_is_filtered_before_pose_optimization(self):
+        rows = [
+            (
+                "P1",
+                2912.5,
+                (61.02, 91.52),
+                [
+                    (28.36, 46.09),
+                    (57.68, 135.23),
+                    (100.69, 116.97),
+                    (42.96, 40.28),
+                ],
+            ),
+            (
+                "P2",
+                1358.3,
+                (100.20, 61.17),
+                [
+                    (67.95, 49.13),
+                    (98.64, 81.44),
+                    (131.52, 71.70),
+                    (123.19, 55.77),
+                    (81.54, 41.16),
+                ],
+            ),
+            (
+                "P3",
+                1131.5,
+                (134.39, 104.45),
+                [
+                    (105.99, 94.24),
+                    (142.05, 128.36),
+                    (157.39, 119.51),
+                    (138.43, 82.55),
+                ],
+            ),
+            (
+                "P4",
+                515.9,
+                (102.00, 19.77),
+                [
+                    (78.48, 21.25),
+                    (121.00, 33.20),
+                    (106.53, 4.87),
+                ],
+            ),
+        ]
+        pieces = [
+            PieceObservation(
+                piece_id,
+                [],
+                polygon,
+                centroid_mm=center,
+                area_mm2=area,
+            )
+            for piece_id, area, center, polygon in rows
+        ]
+        cfg.FREE_RECT_MAX_PLAN_TIME_MS = 0
+        cfg.FREE_RECT_MAX_COMPLETE_SETS = 6000
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = plan_simulator_free_rectangle(
+                pieces,
+                fixed_template_evaluation=(None, "logged generic input"),
+            )
+        self.assertTrue(result.valid, result.reason)
+        stats = result.plan_stats
+        self.assertGreater(
+            stats["perimeter_prefilter_rejected_count"], 5000
+        )
+        self.assertLess(stats["pose_optimization_count"], 150)
+        self.assertGreater(stats["additional_contact_count"], 0)
+        self.assertLessEqual(stats["perimeter_error_ratio"], 0.02)
+        self.assertGreaterEqual(
+            stats["exposed_perimeter_mm"],
+            stats["expected_perimeter_min_mm"],
+        )
+        self.assertLessEqual(
+            stats["exposed_perimeter_mm"],
+            stats["expected_perimeter_max_mm"],
+        )
+        self.assertLess(stats["long_side_mm"], 105.0)
+        self.assertLess(stats["short_side_mm"], 70.0)
 
     def test_timeout_returns_best_so_far(self):
         pieces = _make_pieces(
