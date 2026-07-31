@@ -39,6 +39,47 @@ from puzzle_simulator_planner import (
 
 
 MODE = "simulator_free_rect_publish_best"
+FIGURE2_DIRECT_MODE = "simulator_free_rect_figure2_direct"
+FIGURE2_TEMPLATE_ORDER = (
+    "TOP_LEFT",
+    "RIGHT_TRIANGLE",
+    "MIDDLE_LEFT",
+    "BOTTOM_LEFT",
+)
+FIGURE2_TEMPLATE_POLYGONS = {
+    "TOP_LEFT": (
+        (0.0, 0.0),
+        (20.0, 0.0),
+        (36.0, 12.0),
+        (0.0, 20.0),
+    ),
+    "RIGHT_TRIANGLE": (
+        (20.0, 0.0),
+        (100.0, 0.0),
+        (100.0, 60.0),
+    ),
+    "MIDDLE_LEFT": (
+        (0.0, 20.0),
+        (36.0, 12.0),
+        (76.0, 42.0),
+        (0.0, 30.0),
+    ),
+    "BOTTOM_LEFT": (
+        (0.0, 30.0),
+        (76.0, 42.0),
+        (100.0, 60.0),
+        (0.0, 60.0),
+    ),
+}
+FIGURE2_TEMPLATE_AREA_RATIOS = {
+    "TOP_LEFT": 0.08,
+    "RIGHT_TRIANGLE": 0.40,
+    "MIDDLE_LEFT": 0.18,
+    "BOTTOM_LEFT": 0.34,
+}
+FIGURE2_RECT_WIDTH_MM = 100.0
+FIGURE2_RECT_HEIGHT_MM = 60.0
+FIGURE2_RECT_AREA_MM2 = 6000.0
 
 
 def _free_distance(a, b):
@@ -85,6 +126,456 @@ def _free_polygon_valid(polygon):
         ):
             return False
     return polygon_area(polygon) > EPS
+
+
+def _free_figure2_layout_polygons(layout):
+    if layout == "NORMAL":
+        return FIGURE2_TEMPLATE_POLYGONS
+    return {
+        role: tuple(
+            (
+                FIGURE2_RECT_WIDTH_MM - point[0],
+                point[1],
+            )
+            for point in FIGURE2_TEMPLATE_POLYGONS[role]
+        )
+        for role in FIGURE2_TEMPLATE_ORDER
+    }
+
+
+def _free_figure2_fit(observed, template, scale):
+    """Fit one known contour with rotation and translation only.
+
+    ``scale`` normalizes small A4 calibration size error for similarity
+    measurement.  It is deliberately not included in the returned motion.
+    """
+    if len(observed) != len(template):
+        return None
+    count = len(template)
+    observed_center = (
+        sum(float(point[0]) for point in observed) / count,
+        sum(float(point[1]) for point in observed) / count,
+    )
+    template_center = (
+        sum(float(point[0]) for point in template) / count,
+        sum(float(point[1]) for point in template) / count,
+    )
+    centered_observed = [
+        (
+            (float(point[0]) - observed_center[0]) * scale,
+            (float(point[1]) - observed_center[1]) * scale,
+        )
+        for point in observed
+    ]
+    centered_template = [
+        (
+            float(point[0]) - template_center[0],
+            float(point[1]) - template_center[1],
+        )
+        for point in template
+    ]
+    best = None
+    for direction in (1, -1):
+        for offset in range(count):
+            ordered = [
+                centered_observed[
+                    (offset + direction * index) % count
+                ]
+                for index in range(count)
+            ]
+            dot = 0.0
+            cross = 0.0
+            for source, target in zip(
+                ordered, centered_template
+            ):
+                dot += (
+                    source[0] * target[0]
+                    + source[1] * target[1]
+                )
+                cross += (
+                    source[0] * target[1]
+                    - source[1] * target[0]
+                )
+            angle = math.atan2(cross, dot)
+            cosine = math.cos(angle)
+            sine = math.sin(angle)
+            squared = []
+            for source, target in zip(
+                ordered, centered_template
+            ):
+                dx = (
+                    cosine * source[0]
+                    - sine * source[1]
+                    - target[0]
+                )
+                dy = (
+                    sine * source[0]
+                    + cosine * source[1]
+                    - target[1]
+                )
+                squared.append(dx * dx + dy * dy)
+            rms_mm = math.sqrt(sum(squared) / count)
+            max_mm = math.sqrt(max(squared))
+            key = (rms_mm, max_mm, direction, offset)
+            if best is None or key < best["key"]:
+                best = {
+                    "key": key,
+                    "rms_mm": rms_mm,
+                    "max_mm": max_mm,
+                    "rotation_deg": normalize_angle_deg(
+                        math.degrees(angle)
+                    ),
+                    "direction": direction,
+                    "offset": offset,
+                }
+    return best
+
+
+def _free_figure2_assignment(pieces, source_area):
+    if len(pieces) != 4:
+        return None, "piece_count_not_four", None
+    indexed = list(enumerate(pieces))
+    triangles = [
+        item for item in indexed
+        if len(item[1].polygon_mm) == 3
+    ]
+    quads = [
+        item for item in indexed
+        if len(item[1].polygon_mm) == 4
+    ]
+    if len(triangles) != 1 or len(quads) != 3:
+        return None, "expected_one_triangle_three_quads", None
+    quads.sort(
+        key=lambda item: (
+            float(item[1].area_mm2),
+            str(getattr(item[1], "piece_id", "")),
+            item[0],
+        )
+    )
+    assignment = {
+        "TOP_LEFT": quads[0],
+        "RIGHT_TRIANGLE": triangles[0],
+        "MIDDLE_LEFT": quads[1],
+        "BOTTOM_LEFT": quads[2],
+    }
+    ratio_errors = {}
+    for role in FIGURE2_TEMPLATE_ORDER:
+        ratio_errors[role] = abs(
+            float(assignment[role][1].area_mm2)
+            / source_area
+            - FIGURE2_TEMPLATE_AREA_RATIOS[role]
+        )
+    maximum = max(ratio_errors.values())
+    tolerance = float(
+        getattr(
+            cfg,
+            "FREE_RECT_FIGURE2_AREA_RATIO_TOLERANCE",
+            0.06,
+        )
+    )
+    if maximum > tolerance:
+        return (
+            None,
+            "area_ratio_error_{:.4f}_over_{:.4f}".format(
+                maximum, tolerance
+            ),
+            ratio_errors,
+        )
+    return assignment, None, ratio_errors
+
+
+def _free_figure2_match(pieces, source_area):
+    if not bool(
+        getattr(cfg, "FREE_RECT_FIGURE2_DIRECT_ENABLED", True)
+    ):
+        return None, "disabled"
+    assignment, reason, ratio_errors = (
+        _free_figure2_assignment(pieces, source_area)
+    )
+    if assignment is None:
+        return None, reason
+    scale = math.sqrt(FIGURE2_RECT_AREA_MM2 / source_area)
+    layouts = []
+    for layout in ("NORMAL", "MIRROR_X"):
+        templates = _free_figure2_layout_polygons(layout)
+        fits = {}
+        for role in FIGURE2_TEMPLATE_ORDER:
+            fits[role] = _free_figure2_fit(
+                assignment[role][1].polygon_mm,
+                templates[role],
+                scale,
+            )
+        maximum_rms = max(
+            fits[role]["rms_mm"]
+            for role in FIGURE2_TEMPLATE_ORDER
+        )
+        maximum_vertex = max(
+            fits[role]["max_mm"]
+            for role in FIGURE2_TEMPLATE_ORDER
+        )
+        total_rms = sum(
+            fits[role]["rms_mm"]
+            for role in FIGURE2_TEMPLATE_ORDER
+        )
+        layouts.append(
+            {
+                "layout": layout,
+                "templates": templates,
+                "fits": fits,
+                "maximum_rms_mm": maximum_rms,
+                "maximum_vertex_mm": maximum_vertex,
+                "total_rms_mm": total_rms,
+            }
+        )
+    layouts.sort(
+        key=lambda item: (
+            item["maximum_rms_mm"],
+            item["maximum_vertex_mm"],
+            item["total_rms_mm"],
+            item["layout"],
+        )
+    )
+    match = layouts[0]
+    rms_tolerance = float(
+        getattr(
+            cfg,
+            "FREE_RECT_FIGURE2_RMS_TOLERANCE_MM",
+            6.0,
+        )
+    )
+    vertex_tolerance = float(
+        getattr(
+            cfg,
+            "FREE_RECT_FIGURE2_MAX_VERTEX_TOLERANCE_MM",
+            10.0,
+        )
+    )
+    if (
+        match["maximum_rms_mm"] > rms_tolerance
+        or match["maximum_vertex_mm"] > vertex_tolerance
+    ):
+        return (
+            None,
+            "shape_error_rms_{:.2f}_max_{:.2f}".format(
+                match["maximum_rms_mm"],
+                match["maximum_vertex_mm"],
+            ),
+        )
+    match["assignment"] = assignment
+    match["area_ratio_errors"] = ratio_errors
+    match["global_similarity_scale"] = scale
+    return match, None
+
+
+def _free_figure2_direct_result(
+    pieces,
+    source_area,
+    match,
+    state,
+):
+    origin_x = (
+        float(cfg.TARGET_CENTER_MM[0])
+        - 0.5 * FIGURE2_RECT_WIDTH_MM
+    )
+    origin_y = (
+        float(cfg.TARGET_CENTER_MM[1])
+        - 0.5 * FIGURE2_RECT_HEIGHT_MM
+    )
+    target_rect = (
+        origin_x,
+        origin_y,
+        origin_x + FIGURE2_RECT_WIDTH_MM,
+        origin_y + FIGURE2_RECT_HEIGHT_MM,
+    )
+    target_rectangle_polygon = (
+        (target_rect[0], target_rect[1]),
+        (target_rect[2], target_rect[1]),
+        (target_rect[2], target_rect[3]),
+        (target_rect[0], target_rect[3]),
+    )
+    operations = []
+    target_polygons = {}
+    target_list = []
+    fit_records = []
+    maximum_fit_error = 0.0
+    for role in FIGURE2_TEMPLATE_ORDER:
+        _index, piece = match["assignment"][role]
+        fit = match["fits"][role]
+        template = match["templates"][role]
+        local_center = polygon_centroid(template)
+        target_center = (
+            origin_x + local_center[0],
+            origin_y + local_center[1],
+        )
+        source_center = piece.centroid_mm
+        angle_deg = normalize_angle_deg(
+            fit["rotation_deg"]
+        )
+        angle = math.radians(angle_deg)
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        transform = (
+            cosine,
+            sine,
+            target_center[0]
+            - (
+                cosine * source_center[0]
+                - sine * source_center[1]
+            ),
+            target_center[1]
+            - (
+                sine * source_center[0]
+                + cosine * source_center[1]
+            ),
+            angle_deg,
+        )
+        target_polygon = transform_polygon(
+            piece.polygon_mm, transform
+        )
+        piece_id = getattr(
+            piece, "piece_id", None
+        ) or "P{}".format(_index + 1)
+        target_polygons[piece_id] = target_polygon
+        target_list.append(target_polygon)
+        operations.append(
+            {
+                "piece_id": piece_id,
+                "template_role": role,
+                "source_center_mm": source_center,
+                "target_center_mm": target_center,
+                "rotation_deg": angle_deg,
+                "rotation_ambiguous": bool(
+                    getattr(piece, "rotation_ambiguous", False)
+                ),
+                "confidence": float(
+                    getattr(piece, "confidence", 1.0)
+                ),
+            }
+        )
+        fit_records.append(
+            {
+                "template_role": role,
+                "piece_id": piece_id,
+                "area_ratio_error": match[
+                    "area_ratio_errors"
+                ][role],
+                "rms_mm": fit["rms_mm"],
+                "max_vertex_mm": fit["max_mm"],
+                "rotation_deg": angle_deg,
+            }
+        )
+        maximum_fit_error = max(
+            maximum_fit_error, fit["max_mm"]
+        )
+        print(
+            "FREE_FIXED_TEMPLATE_PIECE,role={},piece_id={},"
+            "source_x={:.2f},source_y={:.2f},target_x={:.2f},"
+            "target_y={:.2f},rotation_deg={:.2f},"
+            "fit_rms_mm={:.2f},fit_max_mm={:.2f}".format(
+                role,
+                piece_id,
+                source_center[0],
+                source_center[1],
+                target_center[0],
+                target_center[1],
+                angle_deg,
+                fit["rms_mm"],
+                fit["max_mm"],
+            )
+        )
+
+    overlap_mm2 = 0.0
+    for left in range(len(target_list)):
+        for right in range(left + 1, len(target_list)):
+            overlap_mm2 += polygon_overlap_area(
+                target_list[left], target_list[right]
+            )
+    inside_area = sum(
+        polygon_overlap_area(
+            polygon, target_rectangle_polygon
+        )
+        for polygon in target_list
+    )
+    outside_mm2 = max(0.0, source_area - inside_area)
+    covered_inside_mm2 = max(
+        0.0, inside_area - overlap_mm2
+    )
+    fill_gap_mm2 = max(
+        0.0,
+        FIGURE2_RECT_AREA_MM2 - covered_inside_mm2,
+    )
+    elapsed_ms = max(
+        0, ticks_diff(ticks_ms(), state["started_ms"])
+    )
+    stats = _free_base_stats(state, source_area, [])
+    stats.update(
+        {
+            "engine": "simulator-free-rectangle-figure2-direct-k230",
+            "plan_ms": elapsed_ms,
+            "fixed_template_matched": True,
+            "fixed_template_layout": match["layout"],
+            "enumeration_skipped": True,
+            "safety_gates_applied": False,
+            "global_similarity_scale": match[
+                "global_similarity_scale"
+            ],
+            "maximum_template_rms_mm": match[
+                "maximum_rms_mm"
+            ],
+            "maximum_template_vertex_mm": match[
+                "maximum_vertex_mm"
+            ],
+            "maximum_area_ratio_error": max(
+                match["area_ratio_errors"].values()
+            ),
+            "template_fits": fit_records,
+            "long_side_mm": FIGURE2_RECT_WIDTH_MM,
+            "short_side_mm": FIGURE2_RECT_HEIGHT_MM,
+            "actual_width_mm": FIGURE2_RECT_WIDTH_MM,
+            "actual_height_mm": FIGURE2_RECT_HEIGHT_MM,
+            "rect_area_mm2": FIGURE2_RECT_AREA_MM2,
+            "overlap_mm2": overlap_mm2,
+            "fill_gap_mm2": fill_gap_mm2,
+            "outside_mm2": outside_mm2,
+            "selected_match_count": 0,
+            "selected_partial_match_count": 0,
+            "selected_topology": "fixed_figure2_direct",
+            "top_k": [],
+        }
+    )
+    PERF_STATS.add_stage("plan_ms", elapsed_ms=elapsed_ms)
+    print(
+        "FREE_FIXED_TEMPLATE_BYPASS,enumeration=SKIPPED,"
+        "safety_gates=SKIPPED,target_mm=100.0x60.0,"
+        "target_center={:.1f}:{:.1f}".format(
+            float(cfg.TARGET_CENTER_MM[0]),
+            float(cfg.TARGET_CENTER_MM[1]),
+        )
+    )
+    print(
+        "FREE_FIXED_TEMPLATE_RESULT,valid=1,mode={},layout={},"
+        "nodes=0,operations=4,plan_ms={}".format(
+            FIGURE2_DIRECT_MODE,
+            match["layout"],
+            elapsed_ms,
+        )
+    )
+    return PlanResult(
+        valid=True,
+        reason="fixed Figure 2 template direct plan",
+        score=match["maximum_rms_mm"],
+        operations=operations,
+        target_polygons=target_polygons,
+        target_rect=target_rect,
+        search_nodes=0,
+        mode=FIGURE2_DIRECT_MODE,
+        max_vertex_error_mm=maximum_fit_error,
+        fill_gap_mm2=fill_gap_mm2,
+        overlap_mm2=overlap_mm2,
+        outside_mm2=outside_mm2,
+        seams=[],
+        plan_stats=stats,
+    )
 
 
 def _free_raw_candidate_matchings(pieces):
@@ -1404,6 +1895,38 @@ def _plan_simulator_free_rectangle(pieces, validation):
                 candidates,
             )
     del identity_transforms, initial_connected, input_span
+
+    if len(pieces) == 4:
+        fixed_match, fixed_reason = _free_figure2_match(
+            pieces, source_area
+        )
+        if fixed_match is not None:
+            print(
+                "FREE_FIXED_TEMPLATE_CHECK,matched=1,layout={},"
+                "max_area_ratio_error={:.4f},"
+                "max_fit_rms_mm={:.2f},max_fit_vertex_mm={:.2f}".format(
+                    fixed_match["layout"],
+                    max(
+                        fixed_match[
+                            "area_ratio_errors"
+                        ].values()
+                    ),
+                    fixed_match["maximum_rms_mm"],
+                    fixed_match["maximum_vertex_mm"],
+                )
+            )
+            return _free_figure2_direct_result(
+                pieces,
+                source_area,
+                fixed_match,
+                state,
+            )
+        print(
+            "FREE_FIXED_TEMPLATE_CHECK,matched=0,reason={},"
+            "action=FALLBACK_TO_ENUMERATION".format(
+                str(fixed_reason).replace(",", ";")
+            )
+        )
 
     candidates = _free_rect_candidate_matchings(pieces)
     full_count = sum(

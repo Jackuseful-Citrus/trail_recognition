@@ -280,7 +280,93 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             "prefix_pruned_overlap", result.plan_stats
         )
 
-    def test_frame_33_fixture_keeps_fixed_baseline_and_free_proposal(self):
+    def test_exact_figure2_skips_enumeration_and_uses_fixed_targets(self):
+        pieces = _make_pieces(
+            [
+                free_planner.FIGURE2_TEMPLATE_POLYGONS[role]
+                for role in free_planner.FIGURE2_TEMPLATE_ORDER
+            ]
+        )
+        original_candidates = (
+            free_planner._free_rect_candidate_matchings
+        )
+
+        def enumeration_must_not_run(_pieces):
+            raise AssertionError("enumeration unexpectedly ran")
+
+        free_planner._free_rect_candidate_matchings = (
+            enumeration_must_not_run
+        )
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                result = plan_simulator_free_rectangle(pieces)
+        finally:
+            free_planner._free_rect_candidate_matchings = (
+                original_candidates
+            )
+
+        self.assertTrue(result.valid, result.reason)
+        self.assertEqual(
+            result.mode, free_planner.FIGURE2_DIRECT_MODE
+        )
+        self.assertEqual(result.search_nodes, 0)
+        self.assertEqual(
+            result.plan_stats["fixed_template_layout"], "NORMAL"
+        )
+        self.assertTrue(
+            result.plan_stats["fixed_template_matched"]
+        )
+        self.assertTrue(result.plan_stats["enumeration_skipped"])
+        self.assertFalse(
+            result.plan_stats["safety_gates_applied"]
+        )
+        self.assertEqual(
+            result.plan_stats["complete_matching_set_count"], 0
+        )
+        self.assertEqual(
+            result.plan_stats["pose_optimization_count"], 0
+        )
+        self.assertEqual(
+            [operation["template_role"] for operation in result.operations],
+            list(free_planner.FIGURE2_TEMPLATE_ORDER),
+        )
+        expected_centers = {
+            "TOP_LEFT": (68.6666666667, 204.0),
+            "RIGHT_TRIANGLE": (128.3333333333, 215.0),
+            "MIDDLE_LEFT": (88.1111111111, 221.7777777778),
+            "BOTTOM_LEFT": (95.0392156863, 243.4117647059),
+        }
+        for operation in result.operations:
+            expected = expected_centers[
+                operation["template_role"]
+            ]
+            self.assertAlmostEqual(
+                operation["target_center_mm"][0],
+                expected[0],
+                places=6,
+            )
+            self.assertAlmostEqual(
+                operation["target_center_mm"][1],
+                expected[1],
+                places=6,
+            )
+        log = output.getvalue()
+        self.assertIn(
+            "FREE_FIXED_TEMPLATE_CHECK,matched=1,layout=NORMAL",
+            log,
+        )
+        self.assertIn(
+            "FREE_FIXED_TEMPLATE_BYPASS,enumeration=SKIPPED,"
+            "safety_gates=SKIPPED",
+            log,
+        )
+        self.assertIn(
+            "FREE_FIXED_TEMPLATE_RESULT,valid=1", log
+        )
+        self.assertNotIn("FREE_PLAN_START", log)
+
+    def test_frame_33_fixture_keeps_fixed_baseline_and_uses_direct_plan(self):
         payload, pieces = _load_frame_33()
         baseline = payload["current_fixed_baseline"]
         fixed = plan_simulator_rectangle(
@@ -308,19 +394,39 @@ class FreeRectanglePlannerTests(unittest.TestCase):
         )
 
         cfg.FREE_RECT_MAX_COMPLETE_SETS = 400
-        free = plan_simulator_free_rectangle(pieces)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            free = plan_simulator_free_rectangle(pieces)
         self.assertTrue(free.valid, free.reason)
-        self.assertGreater(
+        self.assertEqual(
+            free.mode, free_planner.FIGURE2_DIRECT_MODE
+        )
+        self.assertEqual(
+            free.plan_stats["fixed_template_layout"], "MIRROR_X"
+        )
+        self.assertEqual(
             free.plan_stats["complete_matching_set_count"], 0
         )
-        self.assertGreater(
+        self.assertEqual(
             free.plan_stats["pose_optimization_count"], 0
         )
-        self.assertNotIn(
-            "prefix_pruned_overlap", free.plan_stats
+        self.assertEqual(free.search_nodes, 0)
+        self.assertTrue(free.plan_stats["enumeration_skipped"])
+        self.assertFalse(
+            free.plan_stats["safety_gates_applied"]
         )
-        self.assertTrue(free.operations)
-        self.assertTrue(free.plan_stats["top_k"])
+        self.assertEqual(len(free.operations), 4)
+        self.assertEqual(free.plan_stats["top_k"], [])
+        self.assertIn(
+            "FREE_FIXED_TEMPLATE_CHECK,matched=1,"
+            "layout=MIRROR_X",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "FREE_FIXED_TEMPLATE_BYPASS,enumeration=SKIPPED,"
+            "safety_gates=SKIPPED",
+            output.getvalue(),
+        )
 
     def test_timeout_returns_best_so_far(self):
         pieces = _make_pieces(
@@ -461,6 +567,14 @@ class FreeRectanglePlannerTests(unittest.TestCase):
             )
             self.assertIn(
                 "def plan_simulator_free_rectangle", bundle
+            )
+            self.assertIn(
+                "FREE_FIXED_TEMPLATE_BYPASS,"
+                "enumeration=SKIPPED",
+                bundle,
+            )
+            self.assertIn(
+                "template_role={}", bundle
             )
             bundle_tree = ast.parse(bundle)
             bundle_imports = set()

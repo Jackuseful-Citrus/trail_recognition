@@ -2,8 +2,8 @@
 
 ## 审计基线
 
-- 审计时工作树干净，分支为 `main`，HEAD 为
-  `e3fc85ba738562952138872d0a68aa8d14f20889`。
+- 固定图 2 快捷路径修改前，分支为 `main`，HEAD 为
+  `6ed8027c0efe8288826ad1dbedcf1bb9118a20c8`。
 - `ad768d8` 修改了固定 simulator Planner、配置、测试和当时的
   standalone；当前 HEAD 的 `puzzle_simulator_planner.py` 已不再包含该
   commit 中的 prefix gate/branch-limit 实现。
@@ -52,6 +52,29 @@ optimization，之后才计算 overlap、gap、hull gap 和最小面积矩形。
 `TARGET_CENTER_MM`；在等价方向中用运动距离和旋转量选择机械代价较低
 且能放入 A4 下半安全区的姿态。
 
+### 固定图 2 四片直接路径
+
+free-rect 在通用候选生成之前，先识别题目图 2 的四块固定碎片。识别
+使用固定的面积占比（8%、40%、18%、34%）、一个三角形加三个四边形
+的拓扑，以及各轮廓的刚体拟合误差。现场轮廓存在镜像手性，因此保存
+两套常量模板：
+
+- `NORMAL`：题图方向；
+- `MIRROR_X`：水平镜像方向。
+
+这里的面积和轮廓阈值只负责判断“是不是这套固定碎片”，不是最终方案
+安全门限。匹配后直接使用预存的 100×60 mm 目标矩形和四个固定目标
+中心，逐片计算当前中心到目标中心的刚体旋转和平移，不运行：
+
+- edge candidate 生成；
+- matching-set 枚举；
+- pose graph optimization；
+- overlap/gap/outside 最终 safety gate。
+
+命中结果的 `search_nodes`、`candidate_count`、
+`complete_matching_set_count` 和 `pose_optimization_count` 均为 0。
+Overlap、gap 和 outside 仍计算并写入结果，但仅供诊断，不否决输出。
+
 ## frame 33 回归 fixture
 
 正式 fixture：
@@ -70,38 +93,46 @@ optimization，之后才计算 overlap、gap、hull gap 和最小面积矩形。
 | overlap | 183.5939 mm² |
 | fixed-target fill gap | 402.5354 mm² |
 
-自由尺寸默认预算结果：
+自由尺寸固定图 2 直接路径结果：
 
 | 项目 | 结果 |
 |---|---:|
 | valid | true |
-| complete sets | 6000 |
-| pose optimizations | 6000 |
-| selected topology | 2 full + 1 partial |
-| free cost | 1.3624939271 |
-| inferred size | 106.6039 × 60.5837 mm |
-| overlap | 183.5939 mm² |
-| free MBR fill gap | 604.4566 mm² |
-| hull gap | 315.9 mm² |
+| template layout | `MIRROR_X` |
+| max area-ratio error | 0.0099 |
+| max template RMS | 2.44 mm |
+| max template vertex error | 3.46 mm |
+| candidates / complete sets | 0 / 0 |
+| pose optimizations | 0 |
+| target size | 100 × 60 mm |
+| target center | (105, 225) mm |
+| safety gates | skipped |
 
-该 fixture 在自由路径上产生完整 matching sets 和 best proposal；
-`plan_stats` 中没有 prefix-overlap prune。
+该 fixture 的四片目标中心由 `MIRROR_X` 常量模板直接给出：
+
+| 固定角色 | fixture piece | target center (mm) |
+|---|---|---:|
+| TOP_LEFT | P4 | (141.33, 204.00) |
+| RIGHT_TRIANGLE | P1 | (81.67, 215.00) |
+| MIDDLE_LEFT | P3 | (121.89, 221.78) |
+| BOTTOM_LEFT | P2 | (114.96, 243.41) |
 
 ## CPython A/B
 
-同一 frame 33 fixture，各运行 3 次，取墙钟中位数：
+同一 frame 33 fixture，固定图 2 直接路径运行 20 次的墙钟中位数为
+0.42 ms（本机范围 0.39～1.09 ms）：
 
-| Planner | valid | 中位耗时 | complete sets | polygon intersections | AABB rejects |
+| Planner | valid | 中位耗时 | candidates | complete sets | pose optimizations |
 |---|---:|---:|---:|---:|---:|
-| 固定 `simulator` | true | 50.7 ms | 320 | 1,393 | 537 |
-| `simulator_free_rect` | true | 5,909.1 ms | 6,000 | 24,881 | 11,119 |
+| 固定 `simulator` 历史基线 | true | 50.7 ms | 80 | 320 | 1 |
+| `simulator_free_rect` 图 2 直接路径 | true | 0.42 ms | 0 | 0 | 0 |
 
-自由模式按要求优化并完整评分每个完整方案，因此明显慢于只对最终
-固定目标 best 做全局优化的现有路径。
+因此，已知图 2 四片不再受 8000 ms 搜索预算影响，也不会因枚举数量过
+多而在时间到期前漏解。非图 2 输入仍回退到原有自由尺寸枚举路径。
 
 ## 测试
 
-新增 8 个自由尺寸专项测试，覆盖：
+自由尺寸专项测试覆盖：
 
 - 90×50、100×60、110×70、120×90；
 - 1、2、3、4 片；
@@ -110,21 +141,17 @@ optimization，之后才计算 overlap、gap、hull gap 和最小面积矩形。
 - 不缩放和 S/T/R 几何一致性；
 - ±1～2 mm 顶点噪声；
 - frame 33 fixture 与固定输出快照；
+- 图 2 `NORMAL`/`MIRROR_X` 模板识别；
+- 用会主动抛错的 candidate generator 证明命中时没有进入枚举；
+- 固定目标中心、模板角色、0 搜索节点和 safety gate 跳过标记；
 - timeout best-so-far 与 timeout-before-complete；
 - 同一输入连续 5 次的结果、统计和日志确定性；
 - MicroPython 依赖检查、语法编译和 standalone 构建。
 
-按各 legacy 测试所需工作目录分组运行的总结果为：
-
-- 108 passed；
-- 4 skipped；
-- 1 个既有 legacy 归档测试失败。
-
-唯一失败为
-`legacy/test_k230_a4_recognition_test.py::test_standalone_contains_only_a4_runtime`，
-原因是归档 builder 读取已经不存在的
-`legacy/puzzle_config.py`。该失败在本任务修改前已存在，且不属于当前
-runtime/standalone 构建路径。当前相关回归集为 106 passed、4 skipped。
+本次相关专项集为 16 passed。按 fixture 所需目录分组运行的 root
+`legacy/test_final_check.py` 与 `legacy/test_puzzle_*.py` 测试为
+107 passed；从 repo root 直接执行时有 8 个用例因相对 fixture 路径
+失败，将这 8 个用例从 `legacy/` 工作目录重跑后全部通过。
 
 ## Standalone
 
@@ -141,7 +168,7 @@ python k230_realtime_a4/build_standalone.py \
 
 SHA-256：
 
-`82561d05279dc56300d5bfe84be04cb810095b4d311aad9407bacd1adcd42004`
+`3bc52ff358173c28af636ff531ce09db431698f2916b92b454923cc6babb4641`
 
 生成文件已通过 Python 语法编译和 import AST 检查，不包含 NumPy、
 OpenCV 或 dataclasses 依赖。固定 standalone 未被覆盖，其 SHA-256
@@ -152,13 +179,17 @@ OpenCV 或 dataclasses 依赖。固定 standalone 未被覆盖，其 SHA-256
 
 ```text
 START_REALTIME_A4,...planner=simulator_free_rect,...
-FREE_PLAN_START,pieces=...,source_area_mm2=...,candidates=...,full=...,partial=...
-FREE_PLAN_PROGRESS,elapsed_ms=...,complete_sets=...,best_cost=...
-FREE_PLAN_RESULT,valid=1,timed_out=...,complete_sets=...,cost=...,long_mm=...,short_mm=...
-OPERATION,piece_id=...,source_x=...,source_y=...,target_x=...,target_y=...,rotation_deg=...
+FREE_FIXED_TEMPLATE_CHECK,matched=1,layout=MIRROR_X,...
+FREE_FIXED_TEMPLATE_PIECE,role=...,piece_id=...,source_x=...,target_x=...,rotation_deg=...
+FREE_FIXED_TEMPLATE_BYPASS,enumeration=SKIPPED,safety_gates=SKIPPED,target_mm=100.0x60.0,...
+FREE_FIXED_TEMPLATE_RESULT,valid=1,mode=simulator_free_rect_figure2_direct,...nodes=0,...
+OPERATION,piece_id=...,template_role=...,source_x=...,source_y=...,target_x=...,target_y=...,rotation_deg=...
 ```
 
-若 8000 ms 到期但已有完整方案，预期
+若四片未匹配图 2，预期打印
+`FREE_FIXED_TEMPLATE_CHECK,matched=0,...action=FALLBACK_TO_ENUMERATION`
+并进入原来的 `FREE_PLAN_START` 路径。若该回退路径在 8000 ms 到期但
+已有完整方案，预期
 `FREE_PLAN_RESULT,valid=1,timed_out=1`。若到期前没有完整方案，预期
 `FREE_PLAN_INVALID,reason=no complete candidate before timeout,...`。
 
@@ -167,7 +198,7 @@ OPERATION,piece_id=...,source_x=...,source_y=...,target_x=...,target_y=...,rotat
 - 同一条长物理边目前不能被多个互不重叠的 partial 区间复用；严格的
   physical-edge reuse gate 会拒绝这种拓扑。
 - 尚未加入扑克牌图案或 seam 视觉匹配。
-- K230 上的真实搜索吞吐尚未测量。CPython 默认完整搜索约 5.9 秒，
-  因而板端很可能依赖 8000 ms timeout 的 best-so-far；必须现场测量
-  complete-set/pose-optimization 吞吐后再决定是否调整独立预算或搜索
-  排序。
+- K230 上尚需用真实相机复核 `NORMAL`/`MIRROR_X` 手性、旋转角正负号
+  和四个固定目标中心；这不影响离线证明“命中后没有枚举”。
+- 未匹配固定图 2 的通用 free-rect 输入仍可能依赖 8000 ms timeout 的
+  best-so-far。

@@ -969,10 +969,11 @@ def _print_all_plan_operations(plan):
         source = operation["source_center_mm"]
         target = operation["target_center_mm"]
         print(
-            "OPERATION,piece_id={},source_x={:.2f},"
+            "OPERATION,piece_id={},template_role={},source_x={:.2f},"
             "source_y={:.2f},target_x={:.2f},"
             "target_y={:.2f},rotation_deg={:.2f}".format(
                 operation["piece_id"],
+                operation.get("template_role", "none"),
                 source[0],
                 source[1],
                 target[0],
@@ -1496,7 +1497,6 @@ def main():
                 ),
             )
         )
-
         while True:
             os.exitpoint()
             if _stop_requested(start_ms, frame_index):

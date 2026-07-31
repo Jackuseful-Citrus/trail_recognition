@@ -234,6 +234,14 @@ FREE_RECT_MAX_SPAN_MM = 170.0
 FREE_RECT_TOP_K = 5
 FREE_RECT_PROGRESS_INTERVAL_MS = 1000
 
+# Fixed Figure 2 fast path.  These thresholds only decide whether the four
+# observed contours belong to the known cut set; once matched, no assembly
+# enumeration or final safety gate is run.
+FREE_RECT_FIGURE2_DIRECT_ENABLED = True
+FREE_RECT_FIGURE2_AREA_RATIO_TOLERANCE = 0.06
+FREE_RECT_FIGURE2_RMS_TOLERANCE_MM = 6.0
+FREE_RECT_FIGURE2_MAX_VERTEX_TOLERANCE_MM = 10.0
+
 # Soft physical priors for the on-site rectangle. None of these is a prefix
 # rejection gate.
 FREE_RECT_LONG_SIDE_MIN_MM = 90.0
