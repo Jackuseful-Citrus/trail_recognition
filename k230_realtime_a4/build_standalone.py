@@ -18,7 +18,11 @@ NO_UART_OUTPUT = (
 )
 DEBUG_OUTPUT = (
     HERE
-    / "k230_realtime_a4_recognition_debug_standalone.py"
+    / "k230_realtime_a4_source_projective_recognition_debug_standalone.py"
+)
+SOURCE_PROJECTIVE_NO_UART_OUTPUT = (
+    HERE
+    / "k230_realtime_a4_simulator_free_rect_source_projective_no_uart_standalone.py"
 )
 LOCAL_MODULES = {
     "puzzle_config",
@@ -33,7 +37,22 @@ LOCAL_MODULES = {
     "realtime_a4_config",
     "realtime_a4_free_rect_config",
     "realtime_a4_recognition_debug_config",
+    "realtime_free_rect_source_projective_no_uart_config",
     "puzzle_a4_boundary",
+    "a4_projective_mapper",
+    "source_divider_detector",
+    "source_projective_piece_detector",
+}
+
+# These pre-existing helpers are intentionally equivalent and are overwritten
+# by a later section in the flat standalone namespace.  Any new duplicate is
+# a build error: unlike normal Python modules, concatenated private names are
+# global and can silently change another module's runtime call signature.
+ALLOWED_DUPLICATE_SYMBOLS = {
+    "_cross",
+    "_distance",
+    "_draw_quad",
+    "_print_a4_lock",
 }
 
 
@@ -131,6 +150,32 @@ def _config_block(extra_override_paths=None):
     return "\n".join(lines)
 
 
+def _validate_flat_namespace(source):
+    tree = ast.parse(source)
+    definitions = {}
+    for node in tree.body:
+        if not isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        definitions.setdefault(node.name, []).append(node.lineno)
+    unexpected = {
+        name: lines
+        for name, lines in definitions.items()
+        if len(lines) > 1 and name not in ALLOWED_DUPLICATE_SYMBOLS
+    }
+    if unexpected:
+        details = ", ".join(
+            "{}@{}".format(
+                name, "|".join(str(line) for line in lines)
+            )
+            for name, lines in sorted(unexpected.items())
+        )
+        raise ValueError(
+            "unsafe duplicate standalone symbols: {}".format(details)
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
@@ -146,23 +191,48 @@ def main(argv=None):
         action="store_true",
         help="build a one-file test runtime with UART execution disabled",
     )
+    parser.add_argument(
+        "--source-projective-no-uart",
+        action="store_true",
+        help=(
+            "build the source-projective FreeRect production profile "
+            "with UART execution disabled"
+        ),
+    )
     args = parser.parse_args(argv)
-    if args.recognition_debug and args.no_uart:
+    selected_profiles = sum(
+        int(value)
+        for value in (
+            args.recognition_debug,
+            args.no_uart,
+            args.source_projective_no_uart,
+        )
+    )
+    if selected_profiles > 1:
         parser.error(
-            "--recognition-debug and --no-uart are mutually exclusive"
+            "--recognition-debug, --no-uart, and "
+            "--source-projective-no-uart are mutually exclusive"
         )
     output = args.output or (
         DEBUG_OUTPUT
         if args.recognition_debug
+        else SOURCE_PROJECTIVE_NO_UART_OUTPUT
+        if args.source_projective_no_uart
         else NO_UART_OUTPUT
         if args.no_uart
         else OUTPUT
     )
-    extra_override_paths = (
-        [HERE / "realtime_a4_recognition_debug_config.py"]
-        if args.recognition_debug
-        else []
-    )
+    if args.recognition_debug:
+        extra_override_paths = [
+            HERE / "realtime_a4_recognition_debug_config.py"
+        ]
+    elif args.source_projective_no_uart:
+        extra_override_paths = [
+            HERE
+            / "realtime_free_rect_source_projective_no_uart_config.py"
+        ]
+    else:
+        extra_override_paths = []
     sections = [
         "#!/usr/bin/env python3\n"
         '"""Generated simulator-backed realtime A4 CanMV planner."""\n'
@@ -182,6 +252,9 @@ def main(argv=None):
         _filtered_source(ROOT / "puzzle_realtime_state.py"),
         _filtered_source(ROOT / "puzzle_vision.py"),
         _filtered_source(ROOT / "puzzle_a4_boundary.py"),
+        _filtered_source(ROOT / "a4_projective_mapper.py"),
+        _filtered_source(ROOT / "source_divider_detector.py"),
+        _filtered_source(ROOT / "source_projective_piece_detector.py"),
         _filtered_source(
             ROOT / "k230_puzzle_planner.py",
             omit_main=True,
@@ -190,15 +263,14 @@ def main(argv=None):
         (
             "# Test-build invariant: never import or execute UART support.\n"
             "UART_COMMUNICATION_ENABLED = False"
-            if args.no_uart
+            if args.no_uart or args.source_projective_no_uart
             else ""
         ),
         _filtered_source(HERE / "k230_realtime_a4.py"),
     ])
-    output.write_text(
-        "\n\n".join(sections) + "\n",
-        encoding="utf-8",
-    )
+    bundled_source = "\n\n".join(sections) + "\n"
+    _validate_flat_namespace(bundled_source)
+    output.write_text(bundled_source, encoding="utf-8")
     print(
         "BUILT,output={},bytes={}".format(
             output, output.stat().st_size

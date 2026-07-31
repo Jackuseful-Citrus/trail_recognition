@@ -140,6 +140,7 @@ class PieceObservation:
         "confidence",
         "rotation_ambiguous",
         "centroid_fallback",
+        "calibration_generation",
         "stable",
         "aabb_mm",
         "triangles_mm",
@@ -159,6 +160,7 @@ class PieceObservation:
         confidence=0.0,
         rotation_ambiguous=None,
         centroid_fallback=False,
+        calibration_generation=None,
     ):
         self.piece_id = piece_id
         self.contour_px = contour_px or []
@@ -199,6 +201,7 @@ class PieceObservation:
             else bool(rotation_ambiguous)
         )
         self.centroid_fallback = bool(centroid_fallback)
+        self.calibration_generation = calibration_generation
         self.stable = False
 
 
@@ -1109,6 +1112,7 @@ class PieceTracker:
         self.tracks = []
         self.next_id = 1
         self.last_count = None
+        self.calibration_generation = None
 
     def _new_track(self, observation):
         limit = (
@@ -1150,6 +1154,22 @@ class PieceTracker:
         return track
 
     def update(self, observations):
+        if observations:
+            generations = set(
+                observation.calibration_generation
+                for observation in observations
+            )
+            if len(generations) > 1:
+                self.reset(self.expected_count)
+                return [], False
+            observation_generation = next(iter(generations))
+            if (
+                self.calibration_generation is not None
+                and observation_generation
+                != self.calibration_generation
+            ):
+                self.reset(self.expected_count)
+            self.calibration_generation = observation_generation
         self.last_count = len(observations)
         active = [
             track

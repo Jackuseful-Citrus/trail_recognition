@@ -90,6 +90,9 @@ from puzzle_a4_boundary import (
     detect_a4_boundary,
     project_a4_mm_to_frame,
 )
+from source_projective_piece_detector import (
+    SourceProjectiveRecognition,
+)
 
 
 FINAL_PHASES = (
@@ -98,6 +101,12 @@ FINAL_PHASES = (
 )
 ACTIVE_PLANNER = "simulator_free_rect"
 CYAN = (0, 255, 255)
+
+
+def _source_projective_mode():
+    return getattr(
+        cfg, "PIECE_COORDINATE_MODE", "rectified_raster"
+    ) == "source_projective"
 
 
 def _draw_quad(frame, corners, color, thickness=3):
@@ -160,7 +169,7 @@ def _draw_piece_overlay(
 def _draw_source_raw_contours(
     frame, raw_pieces, corners, diagnostics
 ):
-    """Project rectified raw boundaries back onto the live camera image."""
+    """Draw raw boundaries from rectified or source work coordinates."""
     if corners is None or not raw_pieces:
         return
     work_width = max(
@@ -197,19 +206,27 @@ def _draw_source_raw_contours(
             1,
             int(len(boundary) / float(max_points) + 0.999),
         )
-        projected = []
-        for point in boundary[::step]:
-            point_mm = (
-                float(point[0])
-                * cfg.A4_WIDTH_MM
-                / float(work_width - 1),
-                float(point[1])
-                * cfg.A4_HEIGHT_MM
-                / float(work_height - 1),
-            )
-            projected.append(
-                _a4_mm_to_frame(point_mm, corners)
-            )
+        if (diagnostics or {}).get("backend") == "source_projective":
+            scale_x = float(cfg.FRAME_WIDTH - 1) / float(work_width - 1)
+            scale_y = float(cfg.FRAME_HEIGHT - 1) / float(work_height - 1)
+            projected = [
+                (float(point[0]) * scale_x, float(point[1]) * scale_y)
+                for point in boundary[::step]
+            ]
+        else:
+            projected = []
+            for point in boundary[::step]:
+                point_mm = (
+                    float(point[0])
+                    * cfg.A4_WIDTH_MM
+                    / float(work_width - 1),
+                    float(point[1])
+                    * cfg.A4_HEIGHT_MM
+                    / float(work_height - 1),
+                )
+                projected.append(
+                    _a4_mm_to_frame(point_mm, corners)
+                )
         _draw_polyline(
             frame, projected, CYAN, thickness=1
         )
@@ -476,7 +493,7 @@ def _draw_gray_work_thumbnail(
     raw_pieces=None,
     diagnostics=None,
 ):
-    """Draw a rectified A4-only grayscale image at the top-right."""
+    """Draw the exact grayscale raster consumed by piece recognition."""
     if (
         not cfg.SHOW_GRAY_WORK_THUMBNAIL
         or gray_image is None
@@ -502,6 +519,66 @@ def _draw_gray_work_thumbnail(
             y_scale=scale,
             alpha=256,
         )
+        source_projective = (
+            (diagnostics or {}).get("backend")
+            == "source_projective"
+        )
+        if source_projective:
+            for points, color, thickness in (
+                (
+                    (diagnostics or {}).get(
+                        "a4_corners_source_px", ()
+                    ),
+                    GREEN,
+                    2,
+                ),
+                (
+                    (diagnostics or {}).get(
+                        "source_polygon_px", ()
+                    ),
+                    YELLOW,
+                    1,
+                ),
+            ):
+                if points:
+                    _draw_polyline(
+                        canvas,
+                        [
+                            (
+                                x + float(point[0]) * scale,
+                                y + float(point[1]) * scale,
+                            )
+                            for point in points
+                        ],
+                        color,
+                        thickness=thickness,
+                    )
+            divider_left = (diagnostics or {}).get(
+                "divider_left_px"
+            )
+            divider_right = (diagnostics or {}).get(
+                "divider_right_px"
+            )
+            if divider_left is not None and divider_right is not None:
+                canvas.draw_line(
+                    int(x + divider_left[0] * scale),
+                    int(y + divider_left[1] * scale),
+                    int(x + divider_right[0] * scale),
+                    int(y + divider_right[1] * scale),
+                    color=GRAY,
+                    thickness=1,
+                )
+            for rect in (diagnostics or {}).get(
+                "raw_blob_rects", ()
+            ):
+                _draw_box(
+                    canvas,
+                    int(x + rect[0] * scale),
+                    int(y + rect[1] * scale),
+                    max(1, int(rect[2] * scale)),
+                    max(1, int(rect[3] * scale)),
+                    WHITE,
+                )
         if getattr(
             cfg, "DEBUG_DRAW_RECTIFIED_CONTOURS", False
         ):
@@ -515,12 +592,11 @@ def _draw_gray_work_thumbnail(
                     )
                 ),
             )
-            pixels_per_mm_x = float(
-                gray_image.width() - 1
-            ) / cfg.A4_WIDTH_MM
-            pixels_per_mm_y = float(
-                gray_image.height() - 1
-            ) / cfg.A4_HEIGHT_MM
+            pixels_per_mm_x = float(gray_image.width() - 1) / cfg.A4_WIDTH_MM
+            pixels_per_mm_y = float(gray_image.height() - 1) / cfg.A4_HEIGHT_MM
+            work_corners = (diagnostics or {}).get(
+                "a4_corners_source_px", ()
+            )
             for index, piece in enumerate(raw_pieces or ()):
                 raw_boundary = piece.contour_px
                 if raw_boundary:
@@ -545,37 +621,49 @@ def _draw_gray_work_thumbnail(
                         CYAN,
                         thickness=1,
                     )
-                fitted_points = [
-                    (
-                        x
-                        + float(point[0])
-                        * pixels_per_mm_x
-                        * scale,
-                        y
-                        + float(point[1])
-                        * pixels_per_mm_y
-                        * scale,
+                if source_projective and work_corners:
+                    fitted_source = [
+                        project_a4_mm_to_frame(point, work_corners)
+                        for point in piece.polygon_mm
+                    ]
+                    fitted_points = [
+                        (x + point[0] * scale, y + point[1] * scale)
+                        for point in fitted_source
+                        if point is not None
+                    ]
+                    center_source = project_a4_mm_to_frame(
+                        piece.centroid_mm, work_corners
                     )
-                    for point in piece.polygon_mm
-                ]
+                    center_x = (
+                        x + center_source[0] * scale
+                        if center_source is not None
+                        else x
+                    )
+                    center_y = (
+                        y + center_source[1] * scale
+                        if center_source is not None
+                        else y
+                    )
+                else:
+                    fitted_points = [
+                        (
+                            x + float(point[0]) * pixels_per_mm_x * scale,
+                            y + float(point[1]) * pixels_per_mm_y * scale,
+                        )
+                        for point in piece.polygon_mm
+                    ]
+                    center_x = (
+                        x + piece.centroid_mm[0] * pixels_per_mm_x * scale
+                    )
+                    center_y = (
+                        y + piece.centroid_mm[1] * pixels_per_mm_y * scale
+                    )
                 color = COLORS[index % len(COLORS)]
                 _draw_polyline(
                     canvas,
                     fitted_points,
                     color,
                     thickness=2,
-                )
-                center_x = (
-                    x
-                    + piece.centroid_mm[0]
-                    * pixels_per_mm_x
-                    * scale
-                )
-                center_y = (
-                    y
-                    + piece.centroid_mm[1]
-                    * pixels_per_mm_y
-                    * scale
                 )
                 _draw_text(
                     canvas,
@@ -739,6 +827,9 @@ def _manual_a4_state():
         "divider_slope_mm": 0.0,
         "divider_confidence": 0.0,
         "divider_detected": False,
+        "lock_spread_px": 0.0,
+        "calibration_generation": 1,
+        "relock_required": False,
     }
 
 
@@ -1067,7 +1158,44 @@ def _detect_frame_pieces(
     collect_sanity=False,
     work_width=None,
     work_height=None,
+    source_recognizer=None,
+    calibration_generation=0,
 ):
+    if _source_projective_mode():
+        work_width = int(cfg.SOURCE_PROJECTIVE_WORK_WIDTH)
+        work_height = int(cfg.SOURCE_PROJECTIVE_WORK_HEIGHT)
+        resize_started = PERF_STATS.mark()
+        piece_gray = frame.to_grayscale(
+            x_size=work_width,
+            y_size=work_height,
+        )
+        PERF_STATS.add_stage("source_resize_ms", resize_started)
+        scale_x = float(work_width - 1) / float(cfg.FRAME_WIDTH - 1)
+        scale_y = float(work_height - 1) / float(cfg.FRAME_HEIGHT - 1)
+        work_corners = [
+            (
+                float(point[0]) * scale_x,
+                float(point[1]) * scale_y,
+            )
+            for point in corners_px
+        ]
+        if source_recognizer is None:
+            source_recognizer = SourceProjectiveRecognition()
+        pieces, diagnostics = source_recognizer.detect(
+            piece_gray,
+            work_corners,
+            calibration_generation,
+            threshold=threshold,
+            collect_sanity=collect_sanity,
+        )
+        diagnostics["projection_closure"] = {
+            "max_px": 0.0,
+            "mean_px": 0.0,
+            "samples": 0,
+        }
+        diagnostics["recognition_width"] = work_width
+        diagnostics["recognition_height"] = work_height
+        return pieces, diagnostics
     work_width = int(
         cfg.REALTIME_PIECE_WORK_WIDTH
         if work_width is None
@@ -1311,9 +1439,9 @@ def _print_piece_diagnostics(
 ):
     sanity = diagnostics.get("gray_sanity")
     if sanity is not None:
-        native = sanity["native"]
-        upper = sanity["upper"]
-        lower = sanity["lower"]
+        native = sanity.get("native", {})
+        upper = sanity.get("upper", {})
+        lower = sanity.get("lower", {})
         upper_bbox = upper.get("bright_bbox")
         lower_bbox = lower.get("bright_bbox")
         print(
@@ -1522,6 +1650,55 @@ def _print_piece_diagnostics(
             samples,
         )
     )
+    if diagnostics.get("backend") == "source_projective":
+        map_sanity = diagnostics.get("map_sanity", {})
+        corners_text = "|".join(
+            "{:.1f}:{:.1f}".format(point[0], point[1])
+            for point in diagnostics.get(
+                "a4_corners_source_px", ()
+            )
+        ) or "none"
+        print(
+            "SOURCE_PROJECTIVE_A4,frame={},generation={},corners={},"
+            "condition={:.3f},lock_spread_px={:.2f}".format(
+                frame_index,
+                diagnostics.get("generation", 0),
+                corners_text,
+                diagnostics.get("condition_metric", 0.0),
+                diagnostics.get("a4_lock_spread_px", 0.0),
+            )
+        )
+        print(
+            "SOURCE_PIECE_DETECT,frame={},generation={},work={}x{},"
+            "threshold={},raw_blobs={},accepted={},vertices={},"
+            "areas_mm2={},rotation_corr_calls={}".format(
+                frame_index,
+                diagnostics.get("generation", 0),
+                diagnostics.get("recognition_width", 0),
+                diagnostics.get("recognition_height", 0),
+                int(diagnostics.get("threshold", 0)),
+                diagnostics.get("raw_contours", 0),
+                len(pieces),
+                "|".join(
+                    str(len(piece.polygon_mm)) for piece in pieces
+                ) or "none",
+                "|".join(
+                    "{:.0f}".format(piece.area_mm2)
+                    for piece in pieces
+                ) or "none",
+                diagnostics.get("rotation_corr_calls", 0),
+            )
+        )
+        print(
+            "SOURCE_MAP_SANITY,frame={},corner_error_mm={:.6f},"
+            "roundtrip_max_px={:.6f},nonfinite={},condition={:.3f}".format(
+                frame_index,
+                map_sanity.get("corner_error_mm", 0.0),
+                map_sanity.get("roundtrip_max_px", 0.0),
+                map_sanity.get("nonfinite", 0),
+                diagnostics.get("condition_metric", 0.0),
+            )
+        )
 
 
 def _report_performance(frame_index):
@@ -1673,8 +1850,14 @@ def main():
     )
     _audit_runtime_api()
     auto_calibrate_a4 = bool(cfg.AUTO_CALIBRATE_A4)
+    source_projective = _source_projective_mode()
     boundary_tracker = (
-        A4BoundaryTracker() if auto_calibrate_a4 else None
+        A4BoundaryTracker(continuous=source_projective)
+        if auto_calibrate_a4
+        else None
+    )
+    source_recognizer = (
+        SourceProjectiveRecognition() if source_projective else None
     )
     a4_state = (
         boundary_tracker.state()
@@ -1793,10 +1976,26 @@ def main():
                 cfg.A4_REFINE_WIDTH,
                 cfg.A4_REFINE_HEIGHT,
                 int(cfg.A4_FULL_RES_REFINE_ENABLED),
-                cfg.REALTIME_PIECE_WORK_WIDTH,
-                cfg.REALTIME_PIECE_WORK_HEIGHT,
-                cfg.REALTIME_PIECE_FINAL_WIDTH,
-                cfg.REALTIME_PIECE_FINAL_HEIGHT,
+                (
+                    cfg.SOURCE_PROJECTIVE_WORK_WIDTH
+                    if source_projective
+                    else cfg.REALTIME_PIECE_WORK_WIDTH
+                ),
+                (
+                    cfg.SOURCE_PROJECTIVE_WORK_HEIGHT
+                    if source_projective
+                    else cfg.REALTIME_PIECE_WORK_HEIGHT
+                ),
+                (
+                    cfg.SOURCE_PROJECTIVE_FINAL_WIDTH
+                    if source_projective
+                    else cfg.REALTIME_PIECE_FINAL_WIDTH
+                ),
+                (
+                    cfg.SOURCE_PROJECTIVE_FINAL_HEIGHT
+                    if source_projective
+                    else cfg.REALTIME_PIECE_FINAL_HEIGHT
+                ),
                 cfg.A4_DETECT_INTERVAL_ACQUIRE,
                 cfg.PIECE_DETECT_EVERY_N_FRAMES,
                 int(cfg.DEBUG_SHOW_CAMERA),
@@ -1867,9 +2066,42 @@ def main():
                     else "schematic"
                 ),
                 (
-                    "automatic_initial_lock_frozen"
+                    (
+                        "automatic_continuous_relock"
+                        if source_projective
+                        else "automatic_initial_lock_frozen"
+                    )
                     if auto_calibrate_a4
                     else "manual_fixed"
+                ),
+            )
+        )
+        print(
+            "RECOGNITION_COORDINATES,piece_coordinate_mode={},"
+            "source_work={}x{},image_rectification={},"
+            "coordinate_projective_mapping={},"
+            "divider_detection={}".format(
+                getattr(
+                    cfg,
+                    "PIECE_COORDINATE_MODE",
+                    "rectified_raster",
+                ),
+                (
+                    cfg.SOURCE_PROJECTIVE_WORK_WIDTH
+                    if source_projective
+                    else cfg.REALTIME_PIECE_WORK_WIDTH
+                ),
+                (
+                    cfg.SOURCE_PROJECTIVE_WORK_HEIGHT
+                    if source_projective
+                    else cfg.REALTIME_PIECE_WORK_HEIGHT
+                ),
+                0 if source_projective else 1,
+                1 if source_projective else 0,
+                (
+                    "source_midband"
+                    if source_projective
+                    else "rectified_strip"
                 ),
             )
         )
@@ -1924,13 +2156,15 @@ def main():
                         phase,
                         cfg.A4_DETECT_INTERVAL_ACQUIRE,
                         a4_state["locked"],
+                        (
+                            cfg.A4_TRACK_EVERY_N_FRAMES
+                            if source_projective
+                            else None
+                        ),
                     )
                     boundary_due = (
                         boundary_interval is not None
-                        and (
-                            not a4_state["locked"]
-                            or frame_index % boundary_interval == 0
-                        )
+                        and frame_index % boundary_interval == 0
                     )
                     if boundary_due:
                         a4_started = PERF_STATS.mark()
@@ -2006,7 +2240,14 @@ def main():
                         last_boundary_diagnostics = (
                             boundary_diagnostics
                         )
-                        if phase in FINAL_PHASES:
+                        if (
+                            phase in FINAL_PHASES
+                            or (
+                                source_projective
+                                and a4_state.get("corners_px")
+                                is not None
+                            )
+                        ):
                             candidate = _preserve_corner_labels(
                                 candidate,
                                 a4_state["corners_px"],
@@ -2014,7 +2255,7 @@ def main():
                         a4_state = boundary_tracker.update(
                             candidate
                         )
-                        if a4_state["locked"]:
+                        if a4_state["locked"] and not source_projective:
                             a4_state = boundary_tracker.freeze()
                         PERF_STATS.add_stage(
                             "a4_detect_ms", a4_started
@@ -2068,6 +2309,10 @@ def main():
                                     else None
                                 ),
                                 collect_sanity=collect_gray_sanity,
+                                source_recognizer=source_recognizer,
+                                calibration_generation=a4_state.get(
+                                    "calibration_generation", 0
+                                ),
                             )
                         )
                         retry_used = False
@@ -2127,6 +2372,10 @@ def main():
                                     else None
                                 ),
                                 collect_sanity=collect_gray_sanity,
+                                source_recognizer=source_recognizer,
+                                calibration_generation=a4_state.get(
+                                    "calibration_generation", 0
+                                ),
                             )
                             if len(retry_pieces) > len(pieces):
                                 pieces = retry_pieces
@@ -2134,6 +2383,9 @@ def main():
                                     retry_diagnostics
                                 )
                                 retry_used = True
+                        piece_diagnostics["a4_lock_spread_px"] = (
+                            a4_state.get("lock_spread_px", 0.0)
+                        )
                         last_piece_diagnostics = piece_diagnostics
                         if piece_diagnostics.get(
                             "divider_strip_detected", False
@@ -2151,6 +2403,16 @@ def main():
                                     )
                                 ),
                                 "frame": frame_index,
+                                "confidence": float(
+                                    piece_diagnostics.get(
+                                        "divider_confidence", 0.0
+                                    )
+                                ),
+                                "residual_px": float(
+                                    piece_diagnostics.get(
+                                        "divider_residual_px", 0.0
+                                    )
+                                ),
                             }
                             if (
                                 confirmed_divider is None
@@ -2180,6 +2442,74 @@ def main():
                                     )
                                 )
                             confirmed_divider = next_divider
+                        elif source_projective:
+                            confirmed_divider = None
+                        if source_projective:
+                            half_state = piece_diagnostics.get(
+                                "source_half", {}
+                            )
+                            print(
+                                "SOURCE_DIVIDER,frame={},generation={},"
+                                "detected={},coverage={:.2f},contrast={:.1f},"
+                                "residual_px={:.2f},mean_y_mm={:.2f},"
+                                "slope_mm={:.2f},confidence={:.2f},held={}".format(
+                                    frame_index,
+                                    a4_state.get(
+                                        "calibration_generation", 0
+                                    ),
+                                    int(
+                                        piece_diagnostics.get(
+                                            "divider_detected", False
+                                        )
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_coverage", 0.0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_contrast", 0.0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_residual_px", 0.0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_y_mm", cfg.DIVIDER_Y_MM
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_slope_mm", 0.0
+                                    ),
+                                    piece_diagnostics.get(
+                                        "divider_confidence", 0.0
+                                    ),
+                                    int(
+                                        bool(
+                                            source_recognizer
+                                            and source_recognizer.divider
+                                            and source_recognizer.divider.get(
+                                                "held", False
+                                            )
+                                        )
+                                    ),
+                                )
+                            )
+                            print(
+                                "SOURCE_HALF,side={},bright_a={},bright_b={},"
+                                "confidence={:.2f},reason={}".format(
+                                    piece_diagnostics.get(
+                                        "source_half_selected",
+                                        half_state.get("side", "none"),
+                                    )
+                                    or "none",
+                                    half_state.get("bright_top", 0),
+                                    half_state.get("bright_bottom", 0),
+                                    half_state.get("confidence", 0.0),
+                                    half_state.get(
+                                        "reason",
+                                        piece_diagnostics.get(
+                                            "reason", "unknown"
+                                        ),
+                                    ),
+                                )
+                            )
                         last_piece_gray = piece_diagnostics.get(
                             "rectified"
                         )
@@ -2205,8 +2535,36 @@ def main():
                             ).get("polygon", 0)
                             > 0
                         )
+                        recognition_prerequisite_missing = (
+                            source_projective
+                            and (
+                                not piece_diagnostics.get(
+                                    "divider_detected", False
+                                )
+                                or not piece_diagnostics.get(
+                                    "source_half_selected"
+                                )
+                                or (
+                                    getattr(
+                                        cfg,
+                                        "SOURCE_PROJECTIVE_REQUIRED_SOURCE_HALF",
+                                        None,
+                                    )
+                                    is not None
+                                    and piece_diagnostics.get(
+                                        "source_half_selected"
+                                    )
+                                    != getattr(
+                                        cfg,
+                                        "SOURCE_PROJECTIVE_REQUIRED_SOURCE_HALF",
+                                        None,
+                                    )
+                                )
+                            )
+                        )
                         if (
-                            not polygon_fit_incomplete
+                            not recognition_prerequisite_missing
+                            and not polygon_fit_incomplete
                             and not consensus_state["ready"]
                         ):
                             consensus_state = (
@@ -2230,7 +2588,31 @@ def main():
                                 piece_tracker.reset(
                                     tracker_expected_count
                                 )
-                        if polygon_fit_incomplete:
+                        if recognition_prerequisite_missing:
+                            tracker_stable = False
+                            stable = False
+                            pieces = last_pieces
+                            required_source_half = getattr(
+                                cfg,
+                                "SOURCE_PROJECTIVE_REQUIRED_SOURCE_HALF",
+                                None,
+                            )
+                            if (
+                                required_source_half is not None
+                                and piece_diagnostics.get(
+                                    "source_half_selected"
+                                )
+                                != required_source_half
+                            ):
+                                pending_reason = (
+                                    "source_half_not_normalized"
+                                )
+                            else:
+                                pending_reason = piece_diagnostics.get(
+                                    "reason",
+                                    "source_prerequisite_missing",
+                                )
+                        elif polygon_fit_incomplete:
                             tracker_stable = False
                             stable = False
                             if (
@@ -2416,7 +2798,11 @@ def main():
                     else:
                         pieces = last_pieces
                         stable = last_piece_stable
-                    if stable and not final_refinement_done:
+                    if (
+                        stable
+                        and not final_refinement_done
+                        and not source_projective
+                    ):
                         fixed_before_refine, _fixed_reason = (
                             match_fixed_figure2_piece_set(pieces)
                         )
@@ -2444,7 +2830,11 @@ def main():
                                     ),
                                 )
                             )
-                    if stable and not final_refinement_done:
+                    if (
+                        stable
+                        and not final_refinement_done
+                        and not source_projective
+                    ):
                         coarse_pieces = pieces
                         refined_pieces, refined_diagnostics = (
                             _detect_frame_pieces(
@@ -2466,6 +2856,10 @@ def main():
                                 ),
                                 work_height=(
                                     cfg.REALTIME_PIECE_FINAL_HEIGHT
+                                ),
+                                source_recognizer=source_recognizer,
+                                calibration_generation=a4_state.get(
+                                    "calibration_generation", 0
                                 ),
                             )
                         )
@@ -2671,6 +3065,33 @@ def main():
                     bad_count_detections = 0
                     piece_detection_count = 0
                     last_piece_diagnostic_signature = None
+                    last_piece_diagnostics = {}
+                    last_input_integrity_signature = None
+                    active_plan = None
+                    active_plan_key = None
+                    last_failed_plan_key = None
+                    if source_recognizer is not None:
+                        source_recognizer.reset(
+                            a4_state.get(
+                                "calibration_generation", 0
+                            )
+                        )
+                    last_pieces = []
+                    last_raw_pieces = []
+                    last_piece_gray = None
+                    last_piece_gray_frame = -1
+                    confirmed_divider = None
+                    debug_hold_announced = False
+                    pending_reason = "a4_relock"
+                    print(
+                        "A4_RELOCK_REQUIRED,frame={},generation={},"
+                        "tracker_reset=1,count_consensus_reset=1".format(
+                            frame_index,
+                            a4_state.get(
+                                "calibration_generation", 0
+                            ),
+                        )
+                    )
 
             if phase == "ACQUIRE":
                 debug_hold_active = (
@@ -3005,7 +3426,9 @@ def main():
                             else:
                                 print(
                                     "PROTOCAL_EXECUTION_SKIPPED,"
-                                    "reason=ide_debug_import_failed"
+                                    "reason={}".format(
+                                        UART_IMPORT_ERROR
+                                    )
                                 )
                             phase = "WAIT_FINAL_CHECK"
                             motion_detector = _new_motion_detector(
@@ -3062,7 +3485,10 @@ def main():
                         "A4_SEARCH,frame={},rects={},dark_blobs={},"
                         "candidates={},full_refine={}|{},"
                         "valid_frames={},missed={},"
-                        "divider_rescues={},rejected={}".format(
+                        "divider_rescues={},blob_corners={}|{},"
+                        "blob_fallbacks={},blob_attempt_errors={},"
+                        "rect_error={},blob_error={},"
+                        "rejected={},candidate_detail={}".format(
                             frame_index,
                             boundary_diagnostics.get("raw_rects", 0),
                             boundary_diagnostics.get(
@@ -3083,11 +3509,47 @@ def main():
                                 "divider_rescued_internal_edge", 0
                             ),
                             "|".join(
+                                str(value)
+                                for value in boundary_diagnostics.get(
+                                    "dark_blob_contour_corner_counts", ()
+                                )
+                            )
+                            or "none",
+                            "|".join(
+                                str(value)
+                                for value in boundary_diagnostics.get(
+                                    "dark_blob_min_corner_counts", ()
+                                )
+                            )
+                            or "none",
+                            "|".join(
+                                boundary_diagnostics.get(
+                                    "dark_blob_fallback_sources", ()
+                                )
+                            )
+                            or "none",
+                            "|".join(
+                                boundary_diagnostics.get(
+                                    "dark_blob_attempt_errors", ()
+                                )
+                            )
+                            or "none",
+                            boundary_diagnostics.get("rect_error", "")
+                            or "none",
+                            boundary_diagnostics.get("blob_error", "")
+                            or "none",
+                            "|".join(
                                 "{}:{}".format(name, count)
                                 for name, count in sorted(
                                     boundary_diagnostics.get(
                                         "rejected", {}
                                     ).items()
+                                )
+                            )
+                            or "none",
+                            "|".join(
+                                boundary_diagnostics.get(
+                                    "candidate_rejections", ()
                                 )
                             )
                             or "none",

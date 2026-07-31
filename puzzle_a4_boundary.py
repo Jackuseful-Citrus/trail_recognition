@@ -544,9 +544,40 @@ def _physical_corner_order(gray_image, image_corners, ratio):
     return [tl, tr, br, bl], "portrait_top_top"
 
 
-def _reject(diagnostics, reason):
+def _corner_debug_text(points):
+    if points is None:
+        return "none"
+    try:
+        values = []
+        for point in list(points)[:6]:
+            try:
+                values.append(
+                    "{:.0f}:{:.0f}".format(
+                        float(point[0]), float(point[1])
+                    )
+                )
+            except Exception:
+                values.append(str(point).replace(",", ":"))
+        return "{}@{}".format(len(points), "/".join(values))
+    except Exception:
+        return str(points).replace(",", ":")
+
+
+def _reject(
+    diagnostics, reason, source="unknown", corners=None, detail=""
+):
     rejected = diagnostics["rejected"]
     rejected[reason] = rejected.get(reason, 0) + 1
+    records = diagnostics.get("candidate_rejections")
+    if records is not None and len(records) < 12:
+        records.append(
+            "{}:{}:{}:{}".format(
+                source,
+                reason,
+                _corner_debug_text(corners),
+                detail or "na",
+            )
+        )
     return None
 
 
@@ -557,9 +588,12 @@ def _score_candidate(
     source,
     diagnostics,
 ):
+    raw_corners = corners
     corners = order_a4_corners(corners)
     if corners is None:
-        return _reject(diagnostics, "corners")
+        return _reject(
+            diagnostics, "corners", source, raw_corners
+        )
 
     edge_margin = cfg.A4_MIN_IMAGE_EDGE_MARGIN_PX
     if any(
@@ -569,7 +603,9 @@ def _score_candidate(
         or point[1] >= gray_image.height() - 1 - edge_margin
         for point in corners
     ):
-        return _reject(diagnostics, "touches_edge")
+        return _reject(
+            diagnostics, "touches_edge", source, corners
+        )
 
     width = 0.5 * (
         _distance(corners[0], corners[1])
@@ -580,13 +616,25 @@ def _score_candidate(
         + _distance(corners[1], corners[2])
     )
     if min(width, height) < cfg.A4_MIN_SIDE_PX or height <= 1.0:
-        return _reject(diagnostics, "side")
+        return _reject(
+            diagnostics,
+            "side",
+            source,
+            corners,
+            "w{:.1f}_h{:.1f}".format(width, height),
+        )
     ratio = width / height
     if (
         ratio < cfg.A4_MIN_WIDTH_HEIGHT_RATIO
         or ratio > cfg.A4_MAX_WIDTH_HEIGHT_RATIO
     ):
-        return _reject(diagnostics, "aspect")
+        return _reject(
+            diagnostics,
+            "aspect",
+            source,
+            corners,
+            "ratio{:.3f}".format(ratio),
+        )
 
     frame_area = float(gray_image.width() * gray_image.height())
     area_ratio = _polygon_area(corners) / frame_area
@@ -594,7 +642,13 @@ def _score_candidate(
         area_ratio < cfg.A4_MIN_FRAME_AREA_RATIO
         or area_ratio > cfg.A4_MAX_FRAME_AREA_RATIO
     ):
-        return _reject(diagnostics, "area")
+        return _reject(
+            diagnostics,
+            "area",
+            source,
+            corners,
+            "ratio{:.3f}".format(area_ratio),
+        )
 
     center_x = sum(point[0] for point in corners) * 0.25
     center_y = sum(point[1] for point in corners) * 0.25
@@ -608,11 +662,23 @@ def _score_candidate(
         offset_x * offset_x + offset_y * offset_y
     )
     if center_offset > cfg.A4_MAX_CENTER_OFFSET_RATIO:
-        return _reject(diagnostics, "center")
+        return _reject(
+            diagnostics,
+            "center",
+            source,
+            corners,
+            "offset{:.3f}".format(center_offset),
+        )
 
     inside_gray = _inside_gray(gray_image, corners)
     if inside_gray > cfg.A4_MAX_INSIDE_GRAY:
-        return _reject(diagnostics, "brightness")
+        return _reject(
+            diagnostics,
+            "brightness",
+            source,
+            corners,
+            "inside{:.1f}".format(inside_gray),
+        )
 
     portrait_error = abs(
         math.log(
@@ -635,7 +701,12 @@ def _score_candidate(
     )
     edge_probe = _internal_edge_probe(gray_image, corners)
     if edge_probe["internal"] and not divider["detected"]:
-        return _reject(diagnostics, "internal_edge")
+        return _reject(
+            diagnostics,
+            "internal_edge",
+            source,
+            corners,
+        )
     if edge_probe["internal"]:
         # A slightly inset min_corners/find_rects edge can leave dark paper on
         # both sides and look internal.  A continuous centre divider across
@@ -651,7 +722,16 @@ def _score_candidate(
             if divider.get("line_found", False)
             else "divider"
         )
-        return _reject(diagnostics, reason)
+        return _reject(
+            diagnostics,
+            reason,
+            source,
+            corners,
+            "coverage{:.2f}_slope{:.2f}".format(
+                divider.get("coverage", 0.0),
+                divider.get("slope_mm", 0.0),
+            ),
+        )
     physical_corners = list(physical_corners)
     darkness_loss = inside_gray / 255.0
     magnitude_bonus = min(0.20, float(magnitude) / 80000.0)
@@ -732,26 +812,93 @@ def _dark_blob_candidates(gray_image, diagnostics):
         )
         diagnostics["raw_dark_blobs"] = len(blobs)
         for blob in blobs:
+            attempts = []
             contour_corners = getattr(blob, "corners", None)
-            if contour_corners is None:
-                raw_corners = blob.min_corners()
-                blob_source = "dark_blob_min_box"
-            else:
+            if contour_corners is not None:
                 raw_corners = (
                     contour_corners()
                     if callable(contour_corners)
                     else contour_corners
                 )
-                blob_source = "dark_blob_contour"
-            candidate = _score_candidate(
-                gray_image,
-                raw_corners,
-                float(blob.pixels()),
-                blob_source,
-                diagnostics,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
+                attempts.append(
+                    ("dark_blob_contour", raw_corners)
+                )
+                diagnostics["dark_blob_contour_corner_counts"].append(
+                    len(raw_corners) if raw_corners is not None else 0
+                )
+            minimum_corners = getattr(blob, "min_corners", None)
+            if minimum_corners is not None:
+                raw_minimum = (
+                    minimum_corners()
+                    if callable(minimum_corners)
+                    else minimum_corners
+                )
+                diagnostics["dark_blob_min_corner_counts"].append(
+                    len(raw_minimum) if raw_minimum is not None else 0
+                )
+                if not attempts or raw_minimum != attempts[0][1]:
+                    attempts.append(
+                        ("dark_blob_min_box", raw_minimum)
+                    )
+            blob_rect = getattr(blob, "rect", None)
+            if blob_rect is not None:
+                rect = blob_rect() if callable(blob_rect) else blob_rect
+                if rect is not None and len(rect) >= 4:
+                    rect_x = float(rect[0])
+                    rect_y = float(rect[1])
+                    rect_width = float(rect[2])
+                    rect_height = float(rect[3])
+                    raw_rect_box = [
+                        (rect_x, rect_y),
+                        (rect_x + rect_width - 1.0, rect_y),
+                        (
+                            rect_x + rect_width - 1.0,
+                            rect_y + rect_height - 1.0,
+                        ),
+                        (rect_x, rect_y + rect_height - 1.0),
+                    ]
+                    diagnostics["dark_blob_rects"].append(
+                        tuple(rect[:4])
+                    )
+                    if all(
+                        raw_rect_box != existing[1]
+                        for existing in attempts
+                    ):
+                        attempts.append(
+                            ("dark_blob_rect_box", raw_rect_box)
+                        )
+            for attempt_index, (blob_source, raw_corners) in enumerate(
+                attempts
+            ):
+                try:
+                    candidate = _score_candidate(
+                        gray_image,
+                        raw_corners,
+                        float(blob.pixels()),
+                        blob_source,
+                        diagnostics,
+                    )
+                except Exception as exc:
+                    if "IDE interrupt" in str(exc):
+                        raise
+                    diagnostics["dark_blob_attempt_errors"].append(
+                        "{}:{}".format(
+                            blob_source,
+                            str(exc).replace(",", ";"),
+                        )
+                    )
+                    continue
+                if candidate is not None:
+                    if attempt_index > 0:
+                        diagnostics["dark_blob_fallback_sources"].append(
+                            blob_source
+                        )
+                        if blob_source == "dark_blob_min_box":
+                            diagnostics[
+                                "dark_blob_min_corner_fallbacks"
+                            ] += 1
+                    candidates.append(candidate)
+                    break
     except Exception as exc:
         if "IDE interrupt" in str(exc):
             raise
@@ -768,6 +915,13 @@ def detect_a4_boundary(gray_image, source_frame_size):
         "blob_error": "",
         "valid_candidates": 0,
         "divider_rescued_internal_edge": 0,
+        "dark_blob_contour_corner_counts": [],
+        "dark_blob_min_corner_counts": [],
+        "dark_blob_min_corner_fallbacks": 0,
+        "dark_blob_fallback_sources": [],
+        "dark_blob_rects": [],
+        "dark_blob_attempt_errors": [],
+        "candidate_rejections": [],
         "rejected": {},
     }
     candidates = _rect_candidates(gray_image, diagnostics)
@@ -797,9 +951,10 @@ def detect_a4_boundary(gray_image, source_frame_size):
 
 
 class A4BoundaryTracker:
-    """Confirm the initial A4 boundary, then retain an immutable calibration."""
+    """Confirm an A4 boundary and optionally continue tracking/relocking it."""
 
-    def __init__(self):
+    def __init__(self, continuous=False):
+        self.continuous = bool(continuous)
         self.corners_px = None
         self.confidence = 0.0
         self.source = ""
@@ -814,8 +969,126 @@ class A4BoundaryTracker:
         self.divider_slope_mm = 0.0
         self.divider_confidence = 0.0
         self.divider_detected = False
+        self.candidate_history = []
+        self.lock_spread_px = 0.0
+        self.calibration_generation = 0
+        self.relock_required = False
+
+    def _clear_lock(self):
+        self.corners_px = None
+        self.valid_frames = 0
+        self.locked = False
+        self.confidence = 0.0
+        self.source = ""
+        self.orientation = ""
+        self.motion_px = 0.0
+        self.relock_confirm_count = 0
+        self.divider_y_mm = cfg.DIVIDER_Y_MM
+        self.divider_slope_mm = 0.0
+        self.divider_confidence = 0.0
+        self.divider_detected = False
+        self.candidate_history = []
+        self.lock_spread_px = 0.0
+
+    def _continuous_update(self, candidate):
+        if candidate is None:
+            self.missed_frames += 1
+            if not self.locked:
+                self._clear_lock()
+            elif self.missed_frames > cfg.A4_HOLD_MISSED_FRAMES:
+                self._clear_lock()
+                self.relock_required = True
+            return self.state()
+
+        detected = [
+            (float(point[0]), float(point[1]))
+            for point in candidate["corners_px"]
+        ]
+        self.missed_frames = 0
+        self.confidence = candidate["confidence"]
+        self.source = candidate["source"]
+        self.orientation = candidate.get("orientation", "")
+        if not self.locked:
+            self.candidate_history.append(detected)
+            required = max(1, int(cfg.A4_LOCK_REQUIRED_FRAMES))
+            if len(self.candidate_history) > required:
+                self.candidate_history.pop(0)
+            median_corners = []
+            for corner_index in range(4):
+                xs = sorted(
+                    sample[corner_index][0]
+                    for sample in self.candidate_history
+                )
+                ys = sorted(
+                    sample[corner_index][1]
+                    for sample in self.candidate_history
+                )
+                middle = len(xs) // 2
+                if len(xs) % 2:
+                    median_corners.append((xs[middle], ys[middle]))
+                else:
+                    median_corners.append(
+                        (
+                            0.5 * (xs[middle - 1] + xs[middle]),
+                            0.5 * (ys[middle - 1] + ys[middle]),
+                        )
+                    )
+            self.lock_spread_px = max(
+                _distance(sample[index], median_corners[index])
+                for sample in self.candidate_history
+                for index in range(4)
+            )
+            maximum_spread = float(
+                getattr(cfg, "A4_LOCK_MAX_SPREAD_PX", 4.0)
+            )
+            if self.lock_spread_px > maximum_spread:
+                self.candidate_history = [detected]
+                median_corners = detected
+                self.lock_spread_px = 0.0
+            self.corners_px = median_corners
+            self.valid_frames = len(self.candidate_history)
+            self.motion_px = self.lock_spread_px
+            if self.valid_frames >= required:
+                self.locked = True
+                self.calibration_generation += 1
+                self.relock_required = False
+                self.relock_confirm_count = 0
+            return self.state()
+
+        distances = [
+            _distance(current, observed)
+            for current, observed in zip(self.corners_px, detected)
+        ]
+        self.motion_px = max(distances)
+        if self.motion_px <= cfg.A4_LOCK_DEADBAND_PX:
+            self.relock_confirm_count = 0
+        elif self.motion_px <= cfg.A4_RELOCK_MOTION_PX:
+            alpha = float(cfg.A4_SLOW_SMOOTH_ALPHA)
+            self.corners_px = [
+                (
+                    current[0] + alpha * (observed[0] - current[0]),
+                    current[1] + alpha * (observed[1] - current[1]),
+                )
+                for current, observed in zip(self.corners_px, detected)
+            ]
+            self.relock_confirm_count = 0
+        else:
+            self.relock_confirm_count += 1
+            if (
+                self.relock_confirm_count
+                >= int(cfg.A4_RELOCK_CONFIRM_FRAMES)
+            ):
+                self._clear_lock()
+                self.candidate_history = [detected]
+                self.corners_px = detected
+                self.valid_frames = 1
+                self.relock_required = True
+                self.motion_px = max(distances)
+        return self.state()
 
     def update(self, candidate):
+        if self.continuous:
+            return self._continuous_update(candidate)
         if self.frozen:
             return self.state()
         if candidate is None:
@@ -942,6 +1215,8 @@ class A4BoundaryTracker:
 
     def freeze(self):
         """Make the first locked calibration immutable until process restart."""
+        if self.continuous:
+            return self.state()
         if self.locked and self.corners_px is not None:
             self.frozen = True
             self.motion_px = 0.0
@@ -965,4 +1240,7 @@ class A4BoundaryTracker:
             "divider_slope_mm": self.divider_slope_mm,
             "divider_confidence": self.divider_confidence,
             "divider_detected": self.divider_detected,
+            "lock_spread_px": self.lock_spread_px,
+            "calibration_generation": self.calibration_generation,
+            "relock_required": self.relock_required,
         }

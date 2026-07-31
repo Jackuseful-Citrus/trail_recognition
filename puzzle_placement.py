@@ -19,6 +19,7 @@ def clone_piece(piece):
         confidence=piece.confidence,
         rotation_ambiguous=piece.rotation_ambiguous,
         centroid_fallback=piece.centroid_fallback,
+        calibration_generation=piece.calibration_generation,
     )
 
 

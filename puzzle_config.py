@@ -17,6 +17,23 @@ CAMERA_GRAYSCALE = False
 CANMV_WORK_WIDTH = 320
 CANMV_WORK_HEIGHT = 448
 
+# Piece-coordinate backends.  The established rectified raster remains the
+# default; recognition diagnostics can opt into source-projective coordinates.
+PIECE_COORDINATE_MODE = "rectified_raster"
+SOURCE_PROJECTIVE_WORK_WIDTH = 640
+SOURCE_PROJECTIVE_WORK_HEIGHT = 384
+SOURCE_PROJECTIVE_FINAL_WIDTH = 640
+SOURCE_PROJECTIVE_FINAL_HEIGHT = 384
+SOURCE_PROJECTIVE_MASK_OUTSIDE_A4 = True
+SOURCE_PROJECTIVE_MASK_DIVIDER = True
+SOURCE_PROJECTIVE_DIVIDER_REQUIRED = True
+SOURCE_PROJECTIVE_DIVIDER_HOLD_MISSES = 2
+SOURCE_PROJECTIVE_A4_RELOCK_ENABLED = True
+SOURCE_PROJECTIVE_GENERATION_GUARD = True
+# Optional production guard. ``None`` keeps recognition diagnostics able to
+# observe either physical half; planner profiles may require a normalized side.
+SOURCE_PROJECTIVE_REQUIRED_SOURCE_HALF = None
+
 # Manual camera calibration, ordered TL, TR, BR, BL in the corrected 800x480
 # camera image. Replace these four points after running the calibration overlay.
 # The defaults are a centred A4-shaped placeholder, not a measured calibration.
@@ -57,6 +74,7 @@ A4_INTERNAL_EDGE_SIMILAR_GRAY_DELTA = 24.0
 A4_INTERNAL_EDGE_DARK_RATIO_MAX = 0.67
 A4_INTERNAL_EDGE_MIN_SAMPLES = 5
 A4_LOCK_REQUIRED_FRAMES = 3
+A4_LOCK_MAX_SPREAD_PX = 4.0
 A4_HOLD_MISSED_FRAMES = 15
 A4_SLOW_SMOOTH_ALPHA = 0.38
 A4_FAST_SMOOTH_ALPHA = 0.82
@@ -88,6 +106,10 @@ DIVIDER_LINE_MIN_COVERAGE = 0.70
 DIVIDER_LINE_MAX_RESIDUAL_PX = 2.5
 DIVIDER_LINE_MAX_SLOPE_MM = 3.0
 DIVIDER_TRACK_ALPHA = 0.35
+SOURCE_DIVIDER_SEARCH_STEP_MM = 0.75
+SOURCE_HALF_SAMPLE_STRIDE = 3
+SOURCE_HALF_MIN_CONFIDENCE = 0.18
+SOURCE_HALF_MIN_BRIGHT_SAMPLES = 8
 
 # White segmentation. Lowering the threshold detects dimmer white pieces but
 # also admits more glare. ``fixed`` is the safe fallback on every frame.

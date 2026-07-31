@@ -30,12 +30,17 @@ def a4_detection_interval(
     phase,
     acquire_interval,
     locked=False,
+    track_locked_interval=None,
 ):
     # The board and camera are fixed.  Once the initial A4 acquisition has
     # locked, keep that exact calibration instead of feeding detector jitter
     # into a different perspective transform every few frames.
     if locked:
-        return None
+        return (
+            None
+            if track_locked_interval is None
+            else max(1, int(track_locked_interval))
+        )
     if phase in ("WAIT_FINAL_CHECK", "COMPLETE"):
         return None
     return max(1, int(acquire_interval))
