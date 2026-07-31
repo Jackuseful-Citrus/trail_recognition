@@ -493,6 +493,33 @@ class DividerAndPieceTests(unittest.TestCase):
             optimized_diagnostics["source_mask_mode"], "bbox_filter"
         )
 
+    def test_bbox_roi_reject_is_not_reported_as_piece_border_contact(self):
+        array, mapper, _pieces = _scene()
+        divider = detect_source_divider(_SourceGrayImage(array), mapper)
+        mask = SourceScanlineMask(mapper, divider, "top")
+        xs = [point[0] for point in mask.source_polygon_px]
+        ys = [point[1] for point in mask.source_polygon_px]
+        roi_x = int(np.floor(min(xs)))
+        roi_y = int(np.floor(min(ys)))
+        blob = _Blob(
+            (roi_x, roi_y + 10, 8, 20),
+            160,
+            (roi_x + 3, roi_y + 19),
+        )
+        _pieces, diagnostics = (
+            detect_pieces_from_source_projective_image(
+                _BoundaryImage(array.copy(), blob),
+                mapper,
+                divider,
+                source_side="top",
+                scanline_mask=mask,
+                generation=1,
+                mask_mode="bbox_filter",
+            )
+        )
+        self.assertEqual(diagnostics["rejected"]["roi_border"], 1)
+        self.assertEqual(diagnostics["rejected"]["border"], 0)
+
     def test_static_scene_freezes_and_reuses_calibration_work(self):
         cfg.SOURCE_PROJECTIVE_FREEZE_DIVIDER = True
         cfg.SOURCE_PROJECTIVE_FREEZE_SOURCE_HALF = True

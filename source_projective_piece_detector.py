@@ -341,6 +341,7 @@ def detect_pieces_from_source_projective_image(
     rejected = {
         "area": 0,
         "border": 0,
+        "roi_border": 0,
         "outside_source": 0,
         "polygon": 0,
         "mapping": 0,
@@ -360,7 +361,11 @@ def detect_pieces_from_source_projective_image(
         if mask_mode == "bbox_filter" and _touches_roi_boundary(
             rect, bbox
         ):
-            rejected["border"] += 1
+            # The unmasked bbox deliberately includes bright table wedges
+            # around the projective source polygon.  Those components reach
+            # the axis-aligned ROI edge and are expected post-filter rejects;
+            # they are not evidence that a source piece touched its boundary.
+            rejected["roi_border"] += 1
             continue
         if _touches_source_boundary(rect, scanline_mask.source_rows):
             rejected["border"] += 1

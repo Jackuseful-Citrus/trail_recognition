@@ -43,11 +43,13 @@ DEBUG_DRAW_SOURCE_RAW_CONTOURS = False
 ENABLE_GRAY_SANITY_DIAGNOSTICS = False
 ENABLE_STAGE_TIMING = False
 
-# The camera, A4 sheet, and source pieces are fixed in this deployment. Three
-# consistent detections retain a temporal guard while reaching planning sooner.
-PIECE_DETECT_EVERY_N_FRAMES = 2
-PIECE_COUNT_SETTLE_DETECTIONS = 3
-REQUIRED_STABLE_FRAMES = 3
+# The camera, A4 sheet, and source pieces are fixed in this deployment. Two
+# consecutive full detections retain an exposure-settling guard without the
+# generic eight-frame tracking window or an idle frame between samples.
+PIECE_DETECT_EVERY_N_FRAMES = 1
+PIECE_COUNT_SETTLE_DETECTIONS = 2
+STABLE_WINDOW_FRAMES = 2
+REQUIRED_STABLE_FRAMES = 2
 
 DISPLAY_EVERY_N_FRAMES = 2
 PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS = 5

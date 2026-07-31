@@ -1012,15 +1012,45 @@ MIN_PIECE_COUNT = 4
 MAX_PIECE_COUNT = 4
 MAX_PIECE_AREA_MM2 = 12000.0
 
-# Figure 2 returns before enumeration. Give only the generic free-plan search
-# a larger K230 budget so it can examine enough complete assemblies for the
-# preferred rectangle aspect ranking to take effect.
-FREE_RECT_MAX_PLAN_TIME_MS = 20000
+# Figure 2 returns before enumeration.  The generic non-100x60 mm path accepts
+# a wider set of measured seams and has twice the former search/tolerance
+# envelope.  Minimum gates are halved; maximum gates and resource limits are
+# doubled.  Soft ranking preferences remain unchanged.
+FREE_RECT_MATCH_REL_TOLERANCE = 0.24
+FREE_RECT_PARTIAL_MIN_RATIO = 0.11
+FREE_RECT_PARTIAL_MAX_RATIO = 0.94
+FREE_RECT_MAX_CANDIDATES = 160
+FREE_RECT_MIN_FULL_SHORTLIST = 48
+FREE_RECT_MIN_PARTIAL_SHORTLIST = 80
+FREE_RECT_MAX_COMPLETE_SETS = 12000
+FREE_RECT_MAX_PLAN_TIME_MS = 40000
+FREE_RECT_MAX_SPAN_MM = 340.0
+
+FREE_RECT_OUTER_EDGE_TOLERANCE_MM = 10.0
+FREE_RECT_PERIMETER_SEAM_DISTANCE_MM = 10.0
+FREE_RECT_PERIMETER_SEAM_ANGLE_DEG = 24.0
+FREE_RECT_PERIMETER_MIN_CONTACT_MM = 2.0
+FREE_RECT_MAX_PERIMETER_EXCESS_RATIO = 0.36
+FREE_RECT_TARGET_MARGIN_MM = 5.0
 cfg.PLANNING_REQUIRED_PIECE_COUNT = PLANNING_REQUIRED_PIECE_COUNT
 cfg.MIN_PIECE_COUNT = MIN_PIECE_COUNT
 cfg.MAX_PIECE_COUNT = MAX_PIECE_COUNT
 cfg.MAX_PIECE_AREA_MM2 = MAX_PIECE_AREA_MM2
+cfg.FREE_RECT_MATCH_REL_TOLERANCE = FREE_RECT_MATCH_REL_TOLERANCE
+cfg.FREE_RECT_PARTIAL_MIN_RATIO = FREE_RECT_PARTIAL_MIN_RATIO
+cfg.FREE_RECT_PARTIAL_MAX_RATIO = FREE_RECT_PARTIAL_MAX_RATIO
+cfg.FREE_RECT_MAX_CANDIDATES = FREE_RECT_MAX_CANDIDATES
+cfg.FREE_RECT_MIN_FULL_SHORTLIST = FREE_RECT_MIN_FULL_SHORTLIST
+cfg.FREE_RECT_MIN_PARTIAL_SHORTLIST = FREE_RECT_MIN_PARTIAL_SHORTLIST
+cfg.FREE_RECT_MAX_COMPLETE_SETS = FREE_RECT_MAX_COMPLETE_SETS
 cfg.FREE_RECT_MAX_PLAN_TIME_MS = FREE_RECT_MAX_PLAN_TIME_MS
+cfg.FREE_RECT_MAX_SPAN_MM = FREE_RECT_MAX_SPAN_MM
+cfg.FREE_RECT_OUTER_EDGE_TOLERANCE_MM = FREE_RECT_OUTER_EDGE_TOLERANCE_MM
+cfg.FREE_RECT_PERIMETER_SEAM_DISTANCE_MM = FREE_RECT_PERIMETER_SEAM_DISTANCE_MM
+cfg.FREE_RECT_PERIMETER_SEAM_ANGLE_DEG = FREE_RECT_PERIMETER_SEAM_ANGLE_DEG
+cfg.FREE_RECT_PERIMETER_MIN_CONTACT_MM = FREE_RECT_PERIMETER_MIN_CONTACT_MM
+cfg.FREE_RECT_MAX_PERIMETER_EXCESS_RATIO = FREE_RECT_MAX_PERIMETER_EXCESS_RATIO
+cfg.FREE_RECT_TARGET_MARGIN_MM = FREE_RECT_TARGET_MARGIN_MM
 """Production overrides for source-projective FreeRect planning without UART."""
 
 
@@ -1065,11 +1095,13 @@ DEBUG_DRAW_SOURCE_RAW_CONTOURS = False
 ENABLE_GRAY_SANITY_DIAGNOSTICS = False
 ENABLE_STAGE_TIMING = False
 
-# The camera, A4 sheet, and source pieces are fixed in this deployment. Three
-# consistent detections retain a temporal guard while reaching planning sooner.
-PIECE_DETECT_EVERY_N_FRAMES = 2
-PIECE_COUNT_SETTLE_DETECTIONS = 3
-REQUIRED_STABLE_FRAMES = 3
+# The camera, A4 sheet, and source pieces are fixed in this deployment. Two
+# consecutive full detections retain an exposure-settling guard without the
+# generic eight-frame tracking window or an idle frame between samples.
+PIECE_DETECT_EVERY_N_FRAMES = 1
+PIECE_COUNT_SETTLE_DETECTIONS = 2
+STABLE_WINDOW_FRAMES = 2
+REQUIRED_STABLE_FRAMES = 2
 
 DISPLAY_EVERY_N_FRAMES = 2
 PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS = 5
@@ -1109,6 +1141,7 @@ cfg.ENABLE_GRAY_SANITY_DIAGNOSTICS = ENABLE_GRAY_SANITY_DIAGNOSTICS
 cfg.ENABLE_STAGE_TIMING = ENABLE_STAGE_TIMING
 cfg.PIECE_DETECT_EVERY_N_FRAMES = PIECE_DETECT_EVERY_N_FRAMES
 cfg.PIECE_COUNT_SETTLE_DETECTIONS = PIECE_COUNT_SETTLE_DETECTIONS
+cfg.STABLE_WINDOW_FRAMES = STABLE_WINDOW_FRAMES
 cfg.REQUIRED_STABLE_FRAMES = REQUIRED_STABLE_FRAMES
 cfg.DISPLAY_EVERY_N_FRAMES = DISPLAY_EVERY_N_FRAMES
 cfg.PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS = PIECE_DIAGNOSTIC_PRINT_EVERY_N_DETECTIONS
@@ -11179,6 +11212,7 @@ def detect_pieces_from_source_projective_image(
     rejected = {
         "area": 0,
         "border": 0,
+        "roi_border": 0,
         "outside_source": 0,
         "polygon": 0,
         "mapping": 0,
@@ -11198,7 +11232,11 @@ def detect_pieces_from_source_projective_image(
         if mask_mode == "bbox_filter" and _touches_roi_boundary(
             rect, bbox
         ):
-            rejected["border"] += 1
+            # The unmasked bbox deliberately includes bright table wedges
+            # around the projective source polygon.  Those components reach
+            # the axis-aligned ROI edge and are expected post-filter rejects;
+            # they are not evidence that a source piece touched its boundary.
+            rejected["roi_border"] += 1
             continue
         if _touches_source_boundary(rect, scanline_mask.source_rows):
             rejected["border"] += 1
